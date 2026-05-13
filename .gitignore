@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Local artifacts (on HPC these live in /scratch — never commit them either way)
+outputs/
+checkpoints/
+cache/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# Hugging Face cache (when running locally without HF_HOME override)
+.huggingface/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Misc
+.claude/
+*.md

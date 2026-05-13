@@ -1,0 +1,49 @@
+# SpecDec-AF GPT-2 Phase 1a defaults.
+# Path strings support ${VAR} / ${VAR:-default} expansion at load time.
+
+paths:
+  cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache"
+  output_dir: "${SCRATCH:-./outputs}/specdec_af/outputs"
+  log_dir: "${SCRATCH:-./outputs}/specdec_af/logs"
+
+model:
+  name: "openai-community/gpt2"
+  n_layers: 12
+  d_model: 768
+
+trace:
+  k: 1
+  ctx_len: 128
+  d_chunk: 9984
+  J: 12
+
+vae:
+  d_latent: 64
+  cond_dim:
+    prefix: 512
+    token_pos: 64
+    block: 64
+    k: 16
+
+corpus:
+  name: "wikitext"
+  config: "wikitext-103-raw-v1"
+  split: "train"
+  streaming: true
+  n_windows: 10000
+  n_calibration_windows: 1000
+
+training:
+  batch_size: 256
+  lr: 1.0e-3
+  epochs: 100
+  beta_max: 1.0
+  beta_anneal_epochs: 30
+  seed: 42
+
+cluster:
+  partition: "gpu"
+  gres: "gpu:v100-pcie:1"
+  time: "04:00:00"
+  mem: "32G"
+  cpus_per_task: 4
