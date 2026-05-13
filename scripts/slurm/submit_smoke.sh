@@ -15,7 +15,7 @@
 set -euo pipefail
 
 ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
-REPO_DIR="${REPO_DIR:-/home/biggs.s/SpecDec-AF-GPT2}"
+REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 
 mkdir -p /home/biggs.s/spdaf-gpt2/SDAF/logs
 
