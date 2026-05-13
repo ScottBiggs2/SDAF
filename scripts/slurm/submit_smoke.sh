@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=specdec-smoke
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:v100-pcie:1
+#SBATCH --gres=gpu:v100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:10:00
-#SBATCH --output=/scratch/biggs.s/specdec_af/logs/smoke-%j.out
-#SBATCH --error=/scratch/biggs.s/specdec_af/logs/smoke-%j.err
+#SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/smoke-%j.out
+#SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/smoke-%j.err
 
 # Phase 0 gate: load GPT-2 small on a cluster GPU, one forward, print device/shape/loss.
 

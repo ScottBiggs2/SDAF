@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda/specdec_af}"
+ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)}"
 PY_VERSION="${PY_VERSION:-3.11}"
 TORCH_CUDA_INDEX="${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu121}"
