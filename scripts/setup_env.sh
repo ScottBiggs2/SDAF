@@ -4,8 +4,8 @@
 #
 # Recommended: run inside an interactive Slurm allocation. Explorer's login-node
 # policy can kill long conda/pip operations.
-srun --partition=short --time=00:015:00 --mem=8G --pty bash
-bash scripts/setup_env.sh
+# srun --partition=short --time=00:015:00 --mem=8G --pty bash
+# bash scripts/setup_env.sh
 
 set -euo pipefail
 
