@@ -10,13 +10,23 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.err
 
-# Phase 5 overfit-a-batch sweep — the gate that resolves option-4-vs-D
-# (see specdec_af_gpt2_impl_plan_v1.md §"Open design decisions").
+# Phase 5 overfit-a-batch sweep — gate that resolves option-4-vs-D, plus
+# diagnostic ablation of whether prefix conditioning is actually being used.
+# See specdec_af_gpt2_impl_plan_v1.md §"Open design decisions".
 #
 # Prereq: cache + chunk_norm_stats.pt from submit_collect.sh.
-# Outputs: ${SCRATCH}/specdec_af/outputs/overfit_sweep/
-#   - results.json — per-mode curves and final metrics
-#   - summary.txt  — final-step table + declared winner
+#
+# Each log step now reports BOTH a `correct-prefix` and a `wrong-prefix` (shuffled)
+# eval pass, with:
+#   - unnormalized terminal-slot MSE (cross-mode comparison)
+#   - top-1 agreement between teacher and student lm_head outputs (terminal items)
+#   - CE(teacher_argmax, student_logits) (terminal items)
+#
+# Outputs under ${SCRATCH}/specdec_af/outputs/overfit_sweep/:
+#   - results.json — full per-step curves for both eval conditions
+#   - summary.txt  — final-step table + declared winner + diagnostic notes
+#   - checkpoints/{option_4,option_d}.pt — full trainable state, loadable via
+#     specdec_af.training.checkpoint.load_vae_checkpoint
 #
 # Wall: ~30 min on v100-pcie for 256 chunks × 1000 steps × 2 modes.
 

@@ -121,18 +121,36 @@ Tie-break favors `option_d`.
 
 Under `${SCRATCH}/specdec_af/outputs/overfit_sweep/`:
 
-| File           | Content                                                    |
-|----------------|------------------------------------------------------------|
-| `results.json` | Per-mode list of `{step, recon_loss, kl, terminal_mse_unnorm}` |
-| `summary.txt`  | Final-step table + declared winner                          |
+| File                              | Content                                                                   |
+|-----------------------------------|---------------------------------------------------------------------------|
+| `results.json`                    | Per-mode list of step-by-step `{train_recon, kl, eval_correct, eval_wrong}` |
+| `summary.txt`                     | Final-step table (corr/wrong terminal MSE, top-1, CE) + winner + notes      |
+| `checkpoints/option_4.pt`         | Full VAE+PE+CA+CN state, loadable via `load_vae_checkpoint`                 |
+| `checkpoints/option_d.pt`         | Same, option_d trained model                                                |
 
 ### How to read the result
 
-The summary's final-step `terminal_mse_unnorm` column is the comparison metric.
-Whichever mode hits the lowest value wins. Two notes:
+The summary now reports both **correct-prefix** and **wrong-prefix** versions of three metrics:
 
-- The `recon` column is in mode-native units (normalized for option_1; raw-σ-amplified for option_4; σ-weighted ≈ normalized for option_d). **Do not compare `recon` across modes** — only `terminal_mse_unnorm`.
-- If the two modes are within ~10% of each other on `terminal_mse_unnorm`, default to **option_d** for architectural-commitment reasons (the model carries no fixed σ anchor for OOD prefixes). See the project's `MEMORY.md` → `project_normalization_decision.md` for why.
+| Column     | What it measures                                                            |
+|------------|----------------------------------------------------------------------------|
+| `tmse_corr` / `tmse_wrong`     | Unnormalized terminal-slot MSE (in raw activation² units). Cross-mode comparable. |
+| `top1_corr` / `top1_wrong`     | Fraction of terminal items where `argmax(lm_head(student_recon))` matches the teacher's argmax. |
+| `ce_corr`  / `ce_wrong`        | `CE(teacher_argmax, student_logits)` over terminal items — soft agreement metric. |
+
+Two questions to answer from this table:
+
+**A. Option 4 vs option D (the original sweep question).**
+Lowest `tmse_corr` wins. Tie-break favors `option_d` if within ~10%. **Caveat:** option_4's training loss surface *is* `tmse_unnorm` in raw space, so option_4 will mechanically win on this metric — the comparison isn't probing the architectural-anchoring concern that motivated option_d (which is OOD-only and not testable in overfit). See `project_normalization_decision` memory.
+
+**B. Is the prefix conditioning actually being used? (the ablation question).**
+Compare `top1_corr` vs `top1_wrong` (or `ce_corr` vs `ce_wrong`) within each mode:
+
+  - **`top1_corr ≈ top1_wrong`** → decoder isn't using prefix conditioning meaningfully. Recon is happening via `z`+`block_id`+`i` only. Probably means the PrefixEncoder is undersized or the prefix path is weak. Consider deepening PrefixEncoder or richer prefix features.
+  - **`top1_corr >> top1_wrong`** → conditioning is informative. Good. Proceed.
+  - **`ce_wrong >> ce_corr`** → same signal, softer. CE picks up smaller margins than top-1 (which is hard).
+
+The point of running this BEFORE Phase 6 is to catch a broken prefix path on cheap compute (~30 min) rather than after a full training run.
 
 ### Local smoke (no HPC, ~30s)
 

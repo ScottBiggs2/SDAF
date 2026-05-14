@@ -123,9 +123,8 @@ def test_backward_every_param_gets_grad():
 def test_overfit_a_batch_smoke_option_d():
     """Short overfit run under option_d on synthetic data: recon trends down.
 
-    This is a smoke. Real Phase-5 gate is 256 chunks × 1000 steps on the HPC
-    cache. Here we use 32 chunks × 50 steps on synthetic data and verify the
-    final-step training loss is substantially below the step-0 loss.
+    Smoke version of the Phase-5 gate. Verifies the model can drive eval-pass
+    recon under correct prefix down substantially in 50 steps on 32 chunks.
     """
     torch.manual_seed(0)
     batch = make_synthetic_batch(n_chunks=32, seed=42, device="cpu")
@@ -133,11 +132,15 @@ def test_overfit_a_batch_smoke_option_d():
     result = run_one_mode(
         "option_d", batch, cn,
         n_steps=50, lr=1e-3, device="cpu", log_every=10, seed=0,
+        lm_head=None, eval_wrong_prefix=True, save_path=None,
     )
-    losses = [h["recon_loss"] for h in result["history"]]
+    losses = [h["eval_correct"]["recon_loss"] for h in result["history"]]
     assert losses[-1] < losses[0] * 0.5, (
         f"option_d recon loss didn't halve: start={losses[0]:.4g}, end={losses[-1]:.4g}"
     )
+    # Every log entry has both correct and wrong eval blocks
+    for h in result["history"]:
+        assert "eval_correct" in h and "eval_wrong" in h
 
 
 def test_overfit_a_batch_smoke_option_4():
@@ -150,8 +153,9 @@ def test_overfit_a_batch_smoke_option_4():
     result = run_one_mode(
         "option_4", batch, cn,
         n_steps=50, lr=1e-3, device="cpu", log_every=10, seed=0,
+        lm_head=None, eval_wrong_prefix=True, save_path=None,
     )
-    losses = [h["recon_loss"] for h in result["history"]]
+    losses = [h["eval_correct"]["recon_loss"] for h in result["history"]]
     assert losses[-1] < losses[0] * 0.5, (
         f"option_4 recon loss didn't halve: start={losses[0]:.4g}, end={losses[-1]:.4g}"
     )
