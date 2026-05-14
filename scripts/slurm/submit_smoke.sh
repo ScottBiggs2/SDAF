@@ -17,7 +17,7 @@ set -euo pipefail
 ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
 REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 
-mkdir -p /home/biggs.s/spdaf-gpt2/SDAF/logs
+mkdir -p /home/biggs.s/sdaf-gpt2/SDAF/logs
 
 if command -v module &>/dev/null; then
   module load anaconda3 || module load miniconda3 || true

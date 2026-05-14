@@ -28,6 +28,6 @@ logs/
 .vscode/
 .idea/
 
-# Misc
+# Misc 
 .claude/
-*.md
+# *.md
