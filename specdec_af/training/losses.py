@@ -109,3 +109,44 @@ def unnormalized_terminal_mse(
 
     sq_err = (recon_raw[is_terminal, s:e] - chunk_raw[is_terminal, s:e]).pow(2)
     return sq_err.mean()
+
+
+def per_block_diagnostics(
+    recon: Tensor,
+    chunk_raw: Tensor,
+    block_ids: Tensor,
+    chunk_norm: ChunkNorm,
+    mu: Tensor,
+    logvar: Tensor,
+    *,
+    mode: Mode,
+    n_layers: int = 12,
+) -> dict[str, Tensor]:
+    """Per-block aggregates for training-loop logging.
+
+    Returns dict with [n_layers] tensors:
+      - ``recon``        — per-block recon loss in mode-native units (NaN if block absent in batch).
+      - ``kl``           — per-block mean KL (sum over latent dim, mean over items).
+      - ``mu_norm``      — per-block mean ``||mu||``.
+      - ``logvar_mean``  — per-block mean ``logvar`` (averaged over both items and latent dim).
+    """
+    device = recon.device
+    nan = float("nan")
+    out = {
+        "recon": torch.full((n_layers,), nan, device=device),
+        "kl": torch.full((n_layers,), nan, device=device),
+        "mu_norm": torch.full((n_layers,), nan, device=device),
+        "logvar_mean": torch.full((n_layers,), nan, device=device),
+    }
+    for b in range(n_layers):
+        m = block_ids == b
+        if not m.any():
+            continue
+        out["recon"][b] = chunk_recon_loss(
+            recon[m], chunk_raw[m], block_ids[m], chunk_norm, mode=mode,
+        ).detach()
+        kl_per_item = -0.5 * (1 + logvar[m] - mu[m].pow(2) - logvar[m].exp()).sum(dim=-1)
+        out["kl"][b] = kl_per_item.mean().detach()
+        out["mu_norm"][b] = mu[m].norm(dim=-1).mean().detach()
+        out["logvar_mean"][b] = logvar[m].mean().detach()
+    return out

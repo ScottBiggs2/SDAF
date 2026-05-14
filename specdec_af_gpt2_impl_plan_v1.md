@@ -203,7 +203,7 @@ If the milestone fails, the diagnostic order is: (i) per-block MSE — is *any* 
 
 ---
 
-## Phase 3 — Cache collection
+## Phase 3 — Cache collection [DONE]
 
 **Goal:** materialize the WikiText window cache. One frozen GPT-2 forward per window, chunks (raw fp16, not normalized) and prefix features written to sharded files.
 
@@ -243,7 +243,7 @@ If the milestone fails, the diagnostic order is: (i) per-block MSE — is *any* 
 
 ---
 
-## Phase 4 — Prefix encoder
+## Phase 4 — Prefix encoder [DONE]
 
 **Goal:** project the per-block prefix feature vector at position T to the 512-d condition slot.
 
@@ -315,6 +315,57 @@ The future CFM stage operates on `Z_trace = concat([z_{0,0}, ..., z_{0,11}]) ∈
 - **KL-vs-recon balancing differs by option.** Option D's loss is ~unit-scale (σ-weighted MSE ≈ MSE-in-normalized-space). β_max = 1.0 is correctly calibrated. Option 4's loss is ~σ²-scale (MSE-in-unnormalized-space dominated by deep blocks). β_max = 1.0 would be drowned out, especially at j=11. Two viable fixes for option 4: (a) divide recon loss by `mean_j(σ_j²)` to bring it back to unit scale (partially undoes the unnormalized-space framing for the optimizer), or (b) use per-block `β_j ∝ mean(σ_j²)` so KL keeps proportional weight per block. Treat as a config knob during the overfit-a-batch sweep; do not pick blind.
 - **Latent stackability** (rev 2) still binds regardless of option. Per-block `||mu||` and `mean(logvar)` logged in Phase 6 — large block-to-block gaps mean the encoder is using `block_embed` to specialize latents per block, which breaks the CFM-stackability premise for Phase 2 (post-milestone).
 - **Equivalence note.** Options 4 and D admit a decoder bijection (`D_D(z) = σ · D_4(z) + μ`) and are therefore representationally identical. If the sweep shows them performing **identically**, the tie-break favors D for architectural-commitment reasons — σ_pop is then absent from the inference path and the model carries no fixed scale anchor for OOD prefixes. See [[project_normalization_decision]].
+
+
+**Options 4 vs D memorization and prefix corruption ablation:**
+```bash
+(base) [biggs.s@explorer-02 SDAF]$ cat logs/overfit-sweep-6792515.out
+=== Slurm context ===
+job=6792515 node=d1009
+GPU 0: Tesla V100-SXM2-32GB (UUID: GPU-2d1af65f-2c1a-5810-2f29-2df771d046d0)
+SCRATCH=/scratch/biggs.s
+=====================
+device=cuda
+modes=['option_4', 'option_d']  n_chunks=256  n_steps=1000  lr=0.001
+loading GPT-2 lm_head for downstream metrics...
+
+== mode: option_4 ==
+  final step 1000:
+    train_recon=0.0002879  kl=4.733
+    correct: terminal_mse=0.002836  top1=1.0000  ce=1.47
+    wrong:   terminal_mse=9.891  top1=0.1786  ce=6.065
+    n_params=69,454,224  wall=16.8s
+
+== mode: option_d ==
+  final step 1000:
+    train_recon=2.592  kl=3.934
+    correct: terminal_mse=1.757  top1=0.9643  ce=1.47
+    wrong:   terminal_mse=4.732  top1=0.5000  ce=3.69
+    n_params=69,454,224  wall=15.6s
+
+Phase 5 overfit-a-batch sweep — summary
+
+n_chunks=256  device=cuda
+wrong_prefix_ablation=True  lm_head_metrics=True
+
+mode         tmse_corr  tmse_wrong  top1_corr top1_wrong   ce_corr  ce_wrong    n_params
+option_4      0.002836       9.891     1.0000     0.1786      1.47     6.065  69,454,224
+option_d         1.757       4.732     0.9643     0.5000      1.47      3.69  69,454,224
+
+winner (lowest correct-prefix terminal MSE; option_d tie-break): option_4
+
+Diagnostic notes:
+  - top1_corr ≈ top1_wrong → decoder is NOT using prefix conditioning.
+  - top1_corr >> top1_wrong → conditioning is informative (good).
+  - ce_wrong >> ce_corr   → same signal, softer measurement.
+
+
+results: /scratch/biggs.s/specdec_af/outputs/overfit_sweep/results.json
+checkpoints: /scratch/biggs.s/specdec_af/outputs/overfit_sweep/checkpoints
+overfit-sweep: DONE
+```
+
+Signals that option 4 is more sensitive to prefix token embeddings and has higher decoded token agreement with true activations than option D. This is a limited memorization/overfitting test, and it is possible that the gap will narrow with more data or more training steps. For now, we should consider this issue open, but there is a +70% chance that option 4 is generally better. An open question is to see if we can reduce the model size - as using a 70M VAE to encode chunks of a 120M model might allow strict memorization, rather than actual learning. We will see in broader scoped training (phase 6 and beyond) how the VAE scales w.r.t the model size. 
 
 ---
 

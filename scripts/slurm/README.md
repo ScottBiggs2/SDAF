@@ -164,6 +164,70 @@ result — only from the HPC run against the real cache.
 
 ---
 
+## Phase 6: full training run
+
+Prereq: Phase 3 outputs (`chunk_norm_stats.pt` + at least 2 shards).
+
+### Default training (option_4, per Phase-5 leading result)
+
+```bash
+sbatch scripts/slurm/submit_train.sh
+```
+
+Trains the chunked CVAE on the full cache. With 10k windows × J=12 = 120k items
+at batch 256, ~470 steps/epoch. The default config runs 100 epochs (~47k steps),
+with β linearly annealed 0 → 1.0 over 30 epochs. Wall: 6–12 h on v100-pcie
+(GPU compute is light; bottleneck is data loading + val passes).
+
+### Mode override (run option_d for direct comparison)
+
+```bash
+MODE=option_d sbatch scripts/slurm/submit_train.sh
+# or, explicit run name:
+MODE=option_d RUN_NAME=k1_optiond_v2 sbatch scripts/slurm/submit_train.sh
+```
+
+Running both modes back-to-back gives the only **fair** comparison of option_4
+vs option_d — at training scale, on held-out data. The Phase-5 overfit sweep
+favored option_4 mechanically (the loss surface is aligned with the metric), but
+that test couldn't probe the architectural-commitment concern. Phase 6 + 7
+together can.
+
+### Artifacts produced
+
+Under `${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/`:
+
+| File                              | Content                                              |
+|-----------------------------------|------------------------------------------------------|
+| `training_log.csv`                | Per-log-step row w/ recon, KL, β, per-block diagnostics |
+| `training_summary.json`           | Final-state summary + `val_history`                  |
+| `checkpoints/final.pt`            | Loadable via `load_vae_checkpoint`                   |
+| `checkpoints/step_NNNNN.pt`       | Periodic snapshots (every 5k steps by default)       |
+
+### Reading the training log
+
+The CSV has these per-block columns (12 each): `recon_b0..b11`, `kl_b0..b11`,
+`mu_norm_b0..b11`, `logvar_mean_b0..b11`. Signals to watch:
+
+- **Per-block recon non-degenerate** — no block stays at the step-0 loss; no block reconstructs near-zero (i.e. memorizing the marginal mean). Failure here means Phase 7 check 3 will fail.
+- **`mu_norm` per block** — large block-to-block gaps mean the encoder is using `block_embed` to specialize latents per block, which breaks CFM-stackability (Phase 2 concern). Should be roughly uniform across blocks.
+- **`logvar_mean` close to 0 across all blocks** indicates healthy KL — posterior is not collapsing to the prior (degenerate AE mode) and not blowing up (unused latent).
+
+### Local smoke (no HPC, ~2 min on CPU)
+
+```bash
+python -m specdec_af.training.train \
+  --config configs/default.yaml \
+  --mode option_4 --run-name smoke \
+  --n-steps 100 --batch-size 32 --num-workers 0 --cpu
+```
+
+Needs a Phase-3 cache (real or smoke-generated). Validates the full training
+loop, CSV logging, and checkpointing. Not a meaningful decision signal — just
+a "does it run" check.
+
+---
+
 ## Hugging Face token
 
 **Not required.** WikiText-103 raw is public. The first job that touches it
