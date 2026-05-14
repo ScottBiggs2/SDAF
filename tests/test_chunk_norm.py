@@ -185,6 +185,32 @@ def test_dual_mode_loss_assembly():
 
 
 # ---------------------------------------------------------------------------
+def test_per_item_methods_consistency():
+    """forward_per_item / invert_per_item agree with forward / invert under gather."""
+    n = 32
+    x = _synthetic_raw_chunks(n)
+    cn = ChunkNorm(n_layers=N_LAYERS)
+    cn.fit([x])
+
+    block_ids = torch.randint(0, N_LAYERS, (n,))
+    # Build [B, d_chunk] by gathering one block per item.
+    flat = torch.stack([x[i, b] for i, b in enumerate(block_ids)])  # [B, d_chunk]
+
+    norm_full = cn(x)  # [B, J, D]
+    norm_gathered = torch.stack([norm_full[i, b] for i, b in enumerate(block_ids)])
+    norm_per_item = cn.forward_per_item(flat, block_ids)
+    torch.testing.assert_close(norm_per_item, norm_gathered, atol=1e-6, rtol=1e-6)
+
+    inv_per_item = cn.invert_per_item(norm_per_item, block_ids)
+    torch.testing.assert_close(inv_per_item, flat, atol=1e-5, rtol=1e-5)
+
+    # loss_weight gather check
+    lw_full = cn.loss_weight()  # [J, D]
+    lw_per_item = cn.loss_weight_per_item(block_ids)
+    lw_gathered = lw_full[block_ids]
+    torch.testing.assert_close(lw_per_item, lw_gathered, atol=0.0, rtol=0.0)
+
+
 def test_state_dict_roundtrip(tmp_path):
     """Save / load preserves mean, std, mask."""
     cn = ChunkNorm(n_layers=N_LAYERS)

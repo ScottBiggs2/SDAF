@@ -154,7 +154,7 @@ If the milestone fails, the diagnostic order is: (i) per-block MSE — is *any* 
 
 ---
 
-## Phase 2 — Chunk packing, indexing, normalization
+## Phase 2 — Chunk packing [DONE], indexing [DONE], normalization [PENDING PHASE 5 RESULTS]
 
 **Goal:** turn the hook dict into block chunks per the schema; provide the inverse; fit and apply per-(block, slot-region) normalization.
 

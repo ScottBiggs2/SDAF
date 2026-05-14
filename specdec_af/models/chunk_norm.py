@@ -87,6 +87,32 @@ class ChunkNorm(nn.Module):
         """
         return self.mask.to(self.std.dtype) / (self.std ** 2)
 
+    # ------------------------------------------------------------------
+    # Per-item variants — used by Phase-5 training where one batch item
+    # corresponds to one block, identified by ``block_ids``.
+    # ------------------------------------------------------------------
+
+    def forward_per_item(self, chunks: Tensor, block_ids: Tensor) -> Tensor:
+        """Normalize ``[B, d_chunk]`` chunks using each item's ``block_ids``.
+
+        Args:
+            chunks: ``[B, d_chunk]`` raw chunks (one block's worth per item).
+            block_ids: ``[B]`` long, block index for each item.
+        """
+        return (chunks - self.mean[block_ids]) / self.std[block_ids]
+
+    def invert_per_item(self, chunks_norm: Tensor, block_ids: Tensor) -> Tensor:
+        """Inverse of :meth:`forward_per_item`."""
+        return chunks_norm * self.std[block_ids] + self.mean[block_ids]
+
+    def loss_weight_per_item(self, block_ids: Tensor) -> Tensor:
+        """``[B, d_chunk]`` per-element MSE weight gathered by ``block_ids``."""
+        return self.mask[block_ids].to(self.std.dtype) / (self.std[block_ids] ** 2)
+
+    def mask_per_item(self, block_ids: Tensor) -> Tensor:
+        """``[B, d_chunk]`` float mask gathered by ``block_ids``."""
+        return self.mask[block_ids].to(self.std.dtype)
+
     @torch.no_grad()
     def fit(self, loader: Iterable[Tensor], n_samples: int | None = None) -> None:
         """Vectorized parallel-Welford over chunks streamed from ``loader``.

@@ -101,6 +101,51 @@ iterators so they can be re-run in any order.
 
 ---
 
+## Phase 5: overfit-a-batch sweep (resolves option 4 vs option D)
+
+Prereq: Phase 3 outputs (`chunk_norm_stats.pt` + at least `shard_0000.pt`).
+
+```bash
+sbatch scripts/slurm/submit_overfit_sweep.sh
+```
+
+Trains a freshly-initialized `CondVAE` + `PrefixEncoder` + `ConditionAssembler`
+under each mode on **one fixed batch of 256 chunks for 1000 steps**, with
+`β=0` (pure overfit). Per the plan's decision register, the winner is
+whichever mode reaches the lowest **unnormalized terminal-slot ((j=11, slot 7)) MSE**.
+Tie-break favors `option_d`.
+
+~30 min wall on v100-pcie.
+
+### Artifacts produced
+
+Under `${SCRATCH}/specdec_af/outputs/overfit_sweep/`:
+
+| File           | Content                                                    |
+|----------------|------------------------------------------------------------|
+| `results.json` | Per-mode list of `{step, recon_loss, kl, terminal_mse_unnorm}` |
+| `summary.txt`  | Final-step table + declared winner                          |
+
+### How to read the result
+
+The summary's final-step `terminal_mse_unnorm` column is the comparison metric.
+Whichever mode hits the lowest value wins. Two notes:
+
+- The `recon` column is in mode-native units (normalized for option_1; raw-σ-amplified for option_4; σ-weighted ≈ normalized for option_d). **Do not compare `recon` across modes** — only `terminal_mse_unnorm`.
+- If the two modes are within ~10% of each other on `terminal_mse_unnorm`, default to **option_d** for architectural-commitment reasons (the model carries no fixed σ anchor for OOD prefixes). See the project's `MEMORY.md` → `project_normalization_decision.md` for why.
+
+### Local smoke (no HPC, ~30s)
+
+```bash
+python -m specdec_af.training.overfit_sweep --smoke --n-chunks 64 --n-steps 100 --cpu
+```
+
+Synthetic data, ad-hoc per-block ChunkNorm fitted to the batch itself. Validates
+the sweep harness end-to-end. Don't read decision signal from the synthetic
+result — only from the HPC run against the real cache.
+
+---
+
 ## Hugging Face token
 
 **Not required.** WikiText-103 raw is public. The first job that touches it
