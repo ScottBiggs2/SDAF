@@ -369,7 +369,7 @@ Signals that option 4 is more sensitive to prefix token embeddings and has highe
 
 ---
 
-## Phase 6 — Training loop
+## Phase 6 — Training loop [DONE]
 
 **Goal:** training script with β anneal, per-block loss logging, joint checkpointing of VAE + prefix encoder + ChunkNorm stats.
 
