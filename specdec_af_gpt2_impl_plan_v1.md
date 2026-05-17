@@ -258,7 +258,7 @@ If the milestone fails, the diagnostic order is: (i) per-block MSE — is *any* 
 
 ---
 
-## Phase 5 — Conditional VAE
+## Phase 5 — Conditional VAE [DONE]
 
 **Goal:** the encoder/decoder for a single block chunk, plus the condition assembler. One VAE shared across all 12 blocks.
 
@@ -395,6 +395,9 @@ Signals that option 4 is more sensitive to prefix token embeddings and has highe
 5. **No NaN in any logged series** at any step.
 
 **Go/no-go:** check 1.
+
+**Option 4 vs. Option D**
+Option 4 appears to be the correct call based on validation MSE losses. Both training runs indicate that the KL penalty is too strong, as $\beta \rightarrow 1$ causes validation MSE to increase. I'm not sure how to exactly tune this yet, as I also suspect that increasing training epochs/iters is a serious option, and no downstream analysis has yet been completed to see how much MSE ~ 0.6 (option 4) or MSE ~ 0.8 (option D) actually matter. Keep in mind that these losses are on fundamentally different scales and may not be directly comparable. It might be wise to generate a helper analysis script to parse the training.out logs and other saved artifacts to quantitatively examine these questions. 
 
 ---
 
