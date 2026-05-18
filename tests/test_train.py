@@ -71,6 +71,7 @@ def test_train_smoke_25_steps(cache_dir_with_stats, tmp_path, mode):
         n_epochs=5,
         beta_max=1.0,
         beta_anneal_epochs=2,
+        free_bits=0.0,           # disabled: pre-rev-3 behavior for the baseline smoke
         log_every=5,
         val_every_steps=0,         # only final val
         checkpoint_every_steps=0,  # only final checkpoint
@@ -123,3 +124,36 @@ def test_train_smoke_25_steps(cache_dir_with_stats, tmp_path, mode):
                 continue
             assert fv == fv, f"NaN in {k} at step {r['step']}"
             assert abs(fv) != float("inf"), f"Inf in {k} at step {r['step']}"
+
+
+def test_train_smoke_with_free_bits(cache_dir_with_stats, tmp_path):
+    """With free_bits=0.1, training KL should not drop below the floor.
+
+    rev-3 anti-collapse fix smoke. The KL loss series in the training log is
+    the unfloored KL (the reported `kl_loss` column is `kl_divergence(mu,
+    logvar, free_bits=cfg.free_bits)` — i.e. the loss term). With free_bits
+    active, this column is floored at `free_bits` even if the raw KL has
+    collapsed. So `kl_loss >= free_bits` should hold everywhere — a direct
+    behavioral check that the floor is being applied.
+    """
+    cfg = TrainConfig(
+        mode="option_4",
+        batch_size=8, lr=1e-3, n_epochs=5,
+        beta_max=0.01, beta_anneal_epochs=2,
+        free_bits=0.1,            # rev-3 default
+        log_every=5, val_every_steps=0, checkpoint_every_steps=0,
+        val_max_batches=4, n_steps_override=25, seed=0,
+        prefix_hidden_dims=(1024,), num_workers=0, pin_memory=False,
+    )
+    output_dir = tmp_path / "run_free_bits"
+    summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
+
+    log_path = Path(summary["training_log_csv"])
+    with open(log_path) as fh:
+        rows = list(csv.DictReader(fh))
+    kls = [float(r["kl_loss"]) for r in rows]
+    floor = 0.1
+    # Allow a tiny float-slop margin (1e-6) below floor — rounding in clamp + reduce.
+    assert all(kl >= floor - 1e-6 for kl in kls), (
+        f"KL fell below free_bits floor ({floor}); min={min(kls):.4g}"
+    )

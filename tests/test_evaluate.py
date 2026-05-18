@@ -59,6 +59,7 @@ def trained_run(tmp_path_factory):
         mode="option_4",
         batch_size=8, lr=1e-3, n_epochs=5,
         beta_max=0.1, beta_anneal_epochs=2,
+        free_bits=0.0,
         log_every=5, val_every_steps=0, checkpoint_every_steps=0,
         val_max_batches=4, n_steps_override=25, seed=0,
         prefix_hidden_dims=(512,), num_workers=0, pin_memory=False,

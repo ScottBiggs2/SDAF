@@ -37,8 +37,9 @@ training:
   batch_size: 256
   lr: 1.0e-3
   epochs: 100
-  beta_max: 1.0
-  beta_anneal_epochs: 30
+  beta_max: 0.01          # was 1.0; reduced to avoid posterior collapse (see outputs/analysis_0516/)
+  beta_anneal_epochs: 60  # was 30; slower ramp gives encoder room to find latent structure
+  free_bits: 0.1          # Kingma+ 2016: per-dim KL floor in nats. 0.0 = disabled. Keeps KL > 0.
   seed: 42
 
 cluster:

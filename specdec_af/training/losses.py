@@ -35,9 +35,32 @@ from specdec_af.models.chunk_norm import ChunkNorm
 Mode = Literal["option_1", "option_4", "option_d"]
 
 
-def kl_divergence(mu: Tensor, logvar: Tensor) -> Tensor:
-    """Mean per-latent-dim KL to N(0, I)."""
-    return -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.0) -> Tensor:
+    """Mean per-latent-dim KL to N(0, I), with optional free-bits floor.
+
+    Args:
+        mu, logvar: ``[B, d_latent]`` encoder outputs.
+        free_bits: per-dim KL floor in nats (Kingma+ 2016, IAF paper). When >0,
+            each latent dim's batch-mean KL is clamped from below to
+            ``free_bits``; the optimizer sees no gradient on dims already at the
+            floor, preventing posterior collapse on that dim. Default 0.0 =
+            disabled (matches the rev-2 behavior).
+
+    The result is in **per-element** units (mean over batch and latent dim) so
+    it's directly comparable to the per-element recon losses in this module.
+    For ``d_latent=64``, the floor in those units is exactly ``free_bits`` —
+    e.g. ``free_bits=0.1`` floors the reported ``kl_loss`` at 0.1 even if every
+    dim has fully collapsed.
+    """
+    # per-dim per-item KL: [B, d_latent]
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    if free_bits > 0:
+        # Batch-mean per dim, then clamp each dim's KL to the floor.
+        # `clamp(min=free_bits)` has gradient 1 when above floor, 0 at/below.
+        kl_per_dim_batch = kl_per_dim.mean(dim=0)  # [d_latent]
+        floored = torch.clamp(kl_per_dim_batch, min=free_bits)
+        return floored.mean()  # mean over dims → per-element units
+    return kl_per_dim.mean()
 
 
 def _masked_mse(sq_err: Tensor, mask: Tensor) -> Tensor:

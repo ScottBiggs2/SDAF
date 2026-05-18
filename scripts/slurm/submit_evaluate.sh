@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/eval-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/eval-%j.err
 
@@ -33,7 +33,7 @@ SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 
 RUN_NAME="${RUN_NAME:-k1_option4}"
 CKPT="${CKPT:-${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/checkpoints/final.pt}"
-N_CHUNKS="${N_CHUNKS:-4096}"
+N_CHUNKS="${N_CHUNKS:-8192}"
 SPLITS="${SPLITS:-train val}"
 OUT_DIR="${SCRATCH}/specdec_af/outputs/eval/${RUN_NAME}"
 

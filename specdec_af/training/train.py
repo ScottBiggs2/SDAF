@@ -211,6 +211,7 @@ class TrainConfig:
     n_epochs: int
     beta_max: float
     beta_anneal_epochs: int
+    free_bits: float
     log_every: int
     val_every_steps: int
     checkpoint_every_steps: int
@@ -316,7 +317,7 @@ def train(
             out = vae(chunk_norm_input, cond)
 
             recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode)
-            kl = kl_divergence(out["mu"], out["logvar"])
+            kl = kl_divergence(out["mu"], out["logvar"], free_bits=cfg.free_bits)
             beta = beta_schedule(step, steps_per_epoch, cfg.beta_max, cfg.beta_anneal_epochs)
             loss = recon_loss + beta * kl
 
@@ -416,6 +417,8 @@ def main() -> int:
                    help="cap on total steps regardless of epochs (smoke runs)")
     p.add_argument("--beta-max", type=float, default=None)
     p.add_argument("--beta-anneal-epochs", type=int, default=None)
+    p.add_argument("--free-bits", type=float, default=None,
+                   help="per-dim KL floor in nats (Kingma+ 2016). 0 = disabled")
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--val-every-steps", type=int, default=0,
                    help="0 = only final val; otherwise eval every N steps")
@@ -443,6 +446,8 @@ def main() -> int:
         beta_max=args.beta_max if args.beta_max is not None else raw_cfg["training"]["beta_max"],
         beta_anneal_epochs=args.beta_anneal_epochs if args.beta_anneal_epochs is not None
                             else raw_cfg["training"]["beta_anneal_epochs"],
+        free_bits=args.free_bits if args.free_bits is not None
+                    else raw_cfg["training"].get("free_bits", 0.0),
         log_every=args.log_every,
         val_every_steps=args.val_every_steps,
         checkpoint_every_steps=args.checkpoint_every_steps,
@@ -456,6 +461,8 @@ def main() -> int:
 
     device = pick_device(force_cpu=args.cpu)
     print(f"device={device.type}  mode={tcfg.mode}  run={args.run_name}", flush=True)
+    print(f"beta_max={tcfg.beta_max}  beta_anneal_epochs={tcfg.beta_anneal_epochs}  "
+          f"free_bits={tcfg.free_bits}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
 
