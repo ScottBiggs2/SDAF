@@ -144,6 +144,55 @@ def comparison_table(runs: Iterable[TrainingRun]) -> dict:
     return out
 
 
+def write_analysis_summary(runs: list[TrainingRun], out_path: Path) -> Path:
+    """Write analysis_summary.txt — human-readable cross-run training summary.
+
+    Mirrors the format of ``specdec_af.evaluate``'s summary.txt for symmetry:
+    one block per run with final state + posterior-collapse diagnosis.
+    """
+    lines = ["Training-run cross-comparison", "=" * 60, ""]
+    for r in runs:
+        fv = r.summary.get("final_val", {})
+        coll = detect_posterior_collapse(r)
+        cfg = r.summary.get("training_config", {})
+        lines.append(f"--- {r.name}  (mode={r.summary.get('mode')}) ---")
+        lines.append(
+            f"  n_steps={r.summary.get('n_steps_completed')}  "
+            f"n_params={r.summary.get('n_params'):,}  "
+            f"wall={r.summary.get('wall_seconds', 0):.1f}s"
+        )
+        lines.append(
+            f"  config: beta_max={cfg.get('beta_max')}  "
+            f"beta_anneal_epochs={cfg.get('beta_anneal_epochs')}  "
+            f"free_bits={cfg.get('free_bits', 0.0)}"
+        )
+        lines.append(
+            f"  final train: recon={float(r.col('recon_loss')[-1]):.4g}  "
+            f"kl={float(r.col('kl_loss')[-1]):.4g}"
+        )
+        lines.append(
+            f"  final val:   recon={fv.get('val_recon', float('nan')):.4g}  "
+            f"kl={fv.get('val_kl', float('nan')):.4g}  "
+            f"terminal_mse={fv.get('val_terminal_mse_unnorm', float('nan')):.4g}"
+        )
+        if coll["collapse_step"] is not None:
+            lines.append(
+                f"  POSTERIOR COLLAPSE @ step {coll['collapse_step']} "
+                f"(β={coll['beta_at_collapse']:.3f}, "
+                f"threshold KL<{coll['kl_threshold']:.1e}, "
+                f"final KL={coll['final_kl']:.3g})"
+            )
+        else:
+            lines.append(
+                f"  no posterior collapse detected "
+                f"(final KL={coll['final_kl']:.4g} ≥ {coll['kl_threshold']:.1e})"
+            )
+        lines.append("")
+    text = "\n".join(lines)
+    out_path.write_text(text)
+    return out_path
+
+
 # ----------------------------------------------------------------------
 # Plots
 # ----------------------------------------------------------------------
@@ -271,7 +320,10 @@ def main() -> int:
     # Quantitative comparison
     comp = comparison_table(runs)
     (out_dir / "comparison.json").write_text(json.dumps(comp, indent=2))
-    print(f"\n=== comparison.json (excerpt) ===", flush=True)
+    summary_path = write_analysis_summary(runs, out_dir / "analysis_summary.txt")
+    print(f"\n=== analysis_summary.txt ===", flush=True)
+    print(summary_path.read_text(), flush=True)
+    print(f"=== comparison.json (excerpt) ===", flush=True)
     for r in comp["runs"]:
         coll = r["posterior_collapse"]
         print(
