@@ -47,12 +47,12 @@ def test_dataset_len_and_item_shape(cache_dir):
 
     item = ds[0]
     assert set(item.keys()) == {
-        "chunk_raw", "block_id", "i_idx", "k_val", "prefix_features", "target_token",
+        "chunk_raw", "block_id", "i_idx", "k_val", "prefix_ids", "target_token",
     }
     assert item["chunk_raw"].shape == (ds.d_chunk,)
     assert item["chunk_raw"].dtype == torch.float32
-    assert item["prefix_features"].shape == (12 * 768,)
-    assert item["prefix_features"].dtype == torch.float32
+    assert item["prefix_ids"].shape == (ds.ctx_len,)
+    assert item["prefix_ids"].dtype == torch.long
     assert item["block_id"].dtype == torch.long
     assert item["i_idx"].dtype == torch.long
     assert item["target_token"].dtype == torch.long
@@ -74,7 +74,7 @@ def test_dataset_dataloader_collate(cache_dir):
     loader = DataLoader(ds, batch_size=16, shuffle=True, num_workers=0)
     batch = next(iter(loader))
     assert batch["chunk_raw"].shape == (16, ds.d_chunk)
-    assert batch["prefix_features"].shape == (16, 12 * 768)
+    assert batch["prefix_ids"].shape == (16, ds.ctx_len)
     assert batch["block_id"].shape == (16,)
     assert batch["target_token"].shape == (16,)
     # All blocks should be representable across batches.

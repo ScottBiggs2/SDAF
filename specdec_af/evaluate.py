@@ -124,7 +124,7 @@ def sample_batch_from_dataset(
         "block_ids": torch.stack([it["block_id"] for it in items]).to(device),
         "i_idx": torch.stack([it["i_idx"] for it in items]).to(device),
         "k_val": torch.stack([it["k_val"] for it in items]).to(device),
-        "prefix_features": torch.stack([it["prefix_features"] for it in items]).to(device),
+        "prefix_ids": torch.stack([it["prefix_ids"] for it in items]).to(device),
         "target_token": torch.stack([it["target_token"] for it in items]).to(device),
     }
 
@@ -147,22 +147,24 @@ def forward_under_condition(
     """Returns ``recon`` under the named condition. ``z = mu`` (deterministic)
     for encoder-z conditions; ``z ~ N(0, I)`` for prior conditions.
 
-    Wrong-prefix conditions shuffle ``prefix_features`` via ``torch.roll(., 1, 0)``
+    Wrong-prefix conditions shuffle ``prefix_ids`` via ``torch.roll(., 1, 0)``
     before passing to the decoder; the encoder always sees the correct prefix
-    (matches Phase-7 plan: "encoder z, shuffled prefix").
+    (matches Phase-7 plan: "encoder z, shuffled prefix"). Under rev-4 this
+    shuffles **token sequences**, not pre-computed activation features —
+    numerically non-comparable with v1–v3 evaluations.
     """
     chunk_raw = batch["chunk_raw"]
     block_ids = batch["block_ids"]
     i_idx = batch["i_idx"]
     k_val = batch["k_val"]
-    prefix_features = batch["prefix_features"]
+    prefix_ids = batch["prefix_ids"]
     B = chunk_raw.shape[0]
 
     chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
 
     # Encoder always sees correct prefix; z is mu or prior depending on condition.
     cond_for_encoder = cond_assembler(
-        prefix_encoder(prefix_features), i_idx, block_ids, k_val,
+        prefix_encoder(prefix_ids), i_idx, block_ids, k_val,
     )
     if condition in ("qz", "wrong_prefix"):
         mu, _ = vae.encode(chunk_norm_input, cond_for_encoder)
@@ -171,13 +173,13 @@ def forward_under_condition(
         g = torch.Generator(device=chunk_raw.device).manual_seed(seed)
         z = torch.randn(B, vae.d_latent, device=chunk_raw.device, generator=g)
 
-    # Decoder sees correct or shuffled prefix.
+    # Decoder sees correct or shuffled prefix (token sequences shuffled, rev-4).
     if condition in ("wrong_prefix", "baseline"):
-        prefix_for_decoder = torch.roll(prefix_features, shifts=1, dims=0)
+        prefix_ids_for_decoder = torch.roll(prefix_ids, shifts=1, dims=0)
     else:
-        prefix_for_decoder = prefix_features
+        prefix_ids_for_decoder = prefix_ids
     cond_for_decoder = cond_assembler(
-        prefix_encoder(prefix_for_decoder), i_idx, block_ids, k_val,
+        prefix_encoder(prefix_ids_for_decoder), i_idx, block_ids, k_val,
     )
     return vae.decode(z, cond_for_decoder)
 

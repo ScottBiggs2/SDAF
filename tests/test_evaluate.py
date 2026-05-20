@@ -62,7 +62,10 @@ def trained_run(tmp_path_factory):
         free_bits=0.0,
         log_every=5, val_every_steps=0, checkpoint_every_steps=0,
         val_max_batches=4, n_steps_override=25, seed=0,
-        prefix_hidden_dims=(512,), num_workers=0, pin_memory=False,
+        num_workers=0, pin_memory=False,
+        grad_clip_norm=None,
+        prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
+        prefix_ctx_len=16,
     )
     summary = train(cdir, odir, cfg, device=torch.device("cpu"))
     ckpt = Path(summary["checkpoint_dir"]) / "final.pt"

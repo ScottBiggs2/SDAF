@@ -173,10 +173,10 @@ def run_validation(
         block_ids = batch["block_id"].to(device)
         i_idx = batch["i_idx"].to(device)
         k_val = batch["k_val"].to(device)
-        prefix_features = batch["prefix_features"].to(device)
+        prefix_ids = batch["prefix_ids"].to(device)
 
         chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
-        cond = cond_assembler(prefix_encoder(prefix_features), i_idx, block_ids, k_val)
+        cond = cond_assembler(prefix_encoder(prefix_ids), i_idx, block_ids, k_val)
         mu, logvar = vae.encode(chunk_norm_input, cond)
         recon = vae.decode(mu, cond)  # deterministic for eval
         sums["recon"] += chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
@@ -218,9 +218,14 @@ class TrainConfig:
     val_max_batches: int
     n_steps_override: int | None
     seed: int
-    prefix_hidden_dims: tuple[int, ...]
     num_workers: int
     pin_memory: bool
+    # rev-4 additions
+    grad_clip_norm: float | None  # None or 0 = disabled
+    prefix_n_attn_blocks: int
+    prefix_n_heads: int
+    prefix_d_ff: int
+    prefix_ctx_len: int
 
 
 def build_stack(
@@ -228,13 +233,34 @@ def build_stack(
     chunk_norm: ChunkNorm,
     *,
     device: torch.device,
-    prefix_hidden_dims: tuple[int, ...],
+    prefix_n_attn_blocks: int,
+    prefix_n_heads: int,
+    prefix_d_ff: int,
+    prefix_ctx_len: int,
+    gpt2_model_name: str = "openai-community/gpt2",
 ) -> tuple[CondVAE, PrefixEncoder, ConditionAssembler]:
+    """Build the trainable stack and copy frozen GPT-2 wte+wpe into the PrefixEncoder.
+
+    GPT-2 is loaded briefly here only to source the wte+wpe weights; the reference
+    is dropped after :meth:`PrefixEncoder.load_gpt2_embeddings` copies into the
+    persistent buffers. No teacher forward pass runs at train time.
+    """
+    from transformers import GPT2LMHeadModel
+
     decoder_output_space = "raw" if mode == "option_d" else "normalized"
     vae = CondVAE(decoder_output_space=decoder_output_space).to(device)
     if mode == "option_d":
         vae.init_decoder_out_for_raw_space(chunk_norm.std.to(device))
-    pe = PrefixEncoder(hidden_dims=prefix_hidden_dims).to(device)
+    pe = PrefixEncoder(
+        ctx_len=prefix_ctx_len,
+        n_attn_blocks=prefix_n_attn_blocks,
+        n_heads=prefix_n_heads,
+        d_ff=prefix_d_ff,
+    )
+    gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_name).eval()
+    pe.load_gpt2_embeddings(gpt2)
+    del gpt2  # free memory; we only needed wte+wpe weights
+    pe = pe.to(device)
     ca = ConditionAssembler().to(device)
     return vae, pe, ca
 
@@ -278,8 +304,14 @@ def train(
         p.requires_grad_(False)  # ChunkNorm has no parameters but symmetric with other modules
 
     # Trainable stack
-    vae, pe, ca = build_stack(cfg.mode, chunk_norm, device=device, prefix_hidden_dims=cfg.prefix_hidden_dims)
-    trainable = [*vae.parameters(), *pe.parameters(), *ca.parameters()]
+    vae, pe, ca = build_stack(
+        cfg.mode, chunk_norm, device=device,
+        prefix_n_attn_blocks=cfg.prefix_n_attn_blocks,
+        prefix_n_heads=cfg.prefix_n_heads,
+        prefix_d_ff=cfg.prefix_d_ff,
+        prefix_ctx_len=cfg.prefix_ctx_len,
+    )
+    trainable = [p for p in (*vae.parameters(), *pe.parameters(), *ca.parameters()) if p.requires_grad]
     n_params = sum(p.numel() for p in trainable)
     print(f"trainable params: {n_params:,}", flush=True)
 
@@ -310,10 +342,10 @@ def train(
             block_ids = batch["block_id"].to(device, non_blocking=cfg.pin_memory)
             i_idx = batch["i_idx"].to(device, non_blocking=cfg.pin_memory)
             k_val = batch["k_val"].to(device, non_blocking=cfg.pin_memory)
-            prefix_features = batch["prefix_features"].to(device, non_blocking=cfg.pin_memory)
+            prefix_ids = batch["prefix_ids"].to(device, non_blocking=cfg.pin_memory)
 
             chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
-            cond = ca(pe(prefix_features), i_idx, block_ids, k_val)
+            cond = ca(pe(prefix_ids), i_idx, block_ids, k_val)
             out = vae(chunk_norm_input, cond)
 
             recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode)
@@ -323,6 +355,8 @@ def train(
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if cfg.grad_clip_norm is not None and cfg.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
             opt.step()
 
             if step % cfg.log_every == 0 or step == total_steps - 1:
@@ -386,7 +420,11 @@ def train(
         "n_steps_completed": step,
         "n_params": n_params,
         "wall_seconds": time.time() - t0,
-        "prefix_hidden_dims": list(cfg.prefix_hidden_dims),
+        "prefix_n_attn_blocks": cfg.prefix_n_attn_blocks,
+        "prefix_n_heads": cfg.prefix_n_heads,
+        "prefix_d_ff": cfg.prefix_d_ff,
+        "prefix_ctx_len": cfg.prefix_ctx_len,
+        "grad_clip_norm": cfg.grad_clip_norm,
         "final_val": final_val,
         "val_history": val_history,
         "training_config": cfg.__dict__,
@@ -427,7 +465,14 @@ def main() -> int:
     p.add_argument("--val-max-batches", type=int, default=50,
                    help="cap on val batches per evaluation (full val pass takes time)")
     p.add_argument("--val-shards", type=int, default=1)
-    p.add_argument("--prefix-hidden-dims", nargs="*", type=int, default=[2048, 1024])
+    p.add_argument("--grad-clip-norm", type=float, default=None,
+                   help="max L2 norm for grad clip; None or 0 = disabled")
+    p.add_argument("--prefix-n-attn-blocks", type=int, default=None,
+                   help="number of transformer blocks in the PrefixEncoder")
+    p.add_argument("--prefix-n-heads", type=int, default=None,
+                   help="attention heads per PrefixEncoder block")
+    p.add_argument("--prefix-d-ff", type=int, default=None,
+                   help="FFN inner dim per PrefixEncoder block (default 4*d_model)")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--no-pin-memory", action="store_true")
     p.add_argument("--seed", type=int, default=None)
@@ -454,15 +499,27 @@ def main() -> int:
         val_max_batches=args.val_max_batches,
         n_steps_override=args.n_steps,
         seed=args.seed if args.seed is not None else raw_cfg["training"]["seed"],
-        prefix_hidden_dims=tuple(args.prefix_hidden_dims),
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
+        grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm is not None
+                        else raw_cfg["training"].get("grad_clip_norm", None),
+        prefix_n_attn_blocks=args.prefix_n_attn_blocks if args.prefix_n_attn_blocks is not None
+                              else raw_cfg["training"].get("prefix_n_attn_blocks", 2),
+        prefix_n_heads=args.prefix_n_heads if args.prefix_n_heads is not None
+                        else raw_cfg["training"].get("prefix_n_heads", 12),
+        prefix_d_ff=args.prefix_d_ff if args.prefix_d_ff is not None
+                     else raw_cfg["training"].get("prefix_d_ff", 3072),
+        prefix_ctx_len=raw_cfg["trace"]["ctx_len"],
     )
 
     device = pick_device(force_cpu=args.cpu)
     print(f"device={device.type}  mode={tcfg.mode}  run={args.run_name}", flush=True)
     print(f"beta_max={tcfg.beta_max}  beta_anneal_epochs={tcfg.beta_anneal_epochs}  "
           f"free_bits={tcfg.free_bits}", flush=True)
+    print(f"grad_clip_norm={tcfg.grad_clip_norm}  "
+          f"prefix_n_attn_blocks={tcfg.prefix_n_attn_blocks}  "
+          f"prefix_n_heads={tcfg.prefix_n_heads}  prefix_d_ff={tcfg.prefix_d_ff}  "
+          f"prefix_ctx_len={tcfg.prefix_ctx_len}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
 

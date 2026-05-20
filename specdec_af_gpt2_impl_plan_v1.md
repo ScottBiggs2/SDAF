@@ -8,7 +8,37 @@
 
 ## Change log
 
-### rev. 3 (current)
+### rev. 4 (current)
+
+- **PrefixEncoder redesigned: token IDs in, not GPT-2 activations.** The encoder now
+  consumes the raw prefix as a `[B, ctx_len]` sequence of token IDs; embeds via frozen
+  GPT-2 `wte + wpe` (loaded as non-trainable buffers, self-contained in the checkpoint);
+  runs 2 pre-LN GPT-2-style transformer blocks with causal self-attention; takes the
+  last-token hidden state; LayerNorms it; projects to 512 via Linear+GELU. ~14.6M
+  trainable params + ~39.4M frozen embedding buffers.
+- **Why:** v2's MLP-over-activations design baked in a hard requirement that the
+  teacher's full forward pass be available on the prefix at every inference step. This
+  is incompatible with AR latent rollouts (brainstorming E3) — the whole point of which
+  is to *not* re-run the teacher — and conflates VAE generalization with GPT-2's
+  activation-manifold geometry on OOD evals. Token-based PE is one architectural change
+  that unblocks both downstream framings while preserving the in-distribution SD pitch.
+- **Cache shards reused unchanged.** `prefix_ids: int32[B, 128]` was always written at
+  collection time; the v1–v3 dataset just never read it. `WindowChunkDataset` now yields
+  `prefix_ids` instead of `prefix_features`. The dead `prefix_features` field stays in
+  shards as ~184 MB of slack. No re-collection needed.
+- **Gradient clipping (`clip_grad_norm_`, default 1.0)** added between `loss.backward()`
+  and `opt.step()` in both `training.train` and `training.overfit_sweep`. Threaded
+  through `TrainConfig`, CLI, and the SLURM env-var forwarding. Standard fix for the
+  option_d spike pattern observed in v2 (27 spike events, max 53.5× over trailing
+  median).
+- **Backwards-compat:** `load_vae_checkpoint` raises `IncompatiblePrefixEncoderError`
+  on detection of a pre-rev-4 PE config (`hidden_dims` present, `n_attn_blocks` absent).
+  v2 checkpoints are functionally dead under the new design; fail-fast is cleaner than
+  a deep shape error in the forward pass.
+- **Wrong-prefix ablation:** now shuffles `prefix_ids` (token sequences) instead of
+  `prefix_features`. Numerically non-comparable with v1–v3 evaluations.
+
+### rev. 3 (superseded by rev. 4)
 
 - **Phase 1 complete.** Hooks contract implemented; all 5 gates (shape, matmul identity, terminal identity, completeness=74, causality) pass locally on CPU at atol=1e-4. See Phase 1 design notes.
 - **Normalization decision deferred to Phase 5 (empirical).** The plan now carries two paths through Phases 2–4 and resolves them at Phase 5's overfit-a-batch gate:
@@ -57,7 +87,8 @@ Self-contained list of what's settled and what isn't. New decisions and their re
 | Decision | Status | Resolved at | Resolution mechanism |
 |---|---|---|---|
 | **Normalization: option 4 (ChunkNorm + unnormalized-space loss) vs option D (raw decoder output, σ as loss weight)** | OPEN | Phase 5 | Overfit-a-batch sweep. Pick whichever drives lowest **unnormalized-space** terminal-slot recon error. Phase 3 CV diagnostic informs the prior. |
-| `prefix_features` source = stacked `mlp_proj_out` across blocks (B, 12·768) | TENTATIVE | Phase 7 | If `qz > prior > wrong_prefix` is soft, swap candidates: concat `attn_proj_out` (→ 24·768), include `ln_f_out`, or full-trace concat. |
+| `prefix_features` source = stacked `mlp_proj_out` across blocks (B, 12·768) | SUPERSEDED | rev-4 | Replaced by token-ID PrefixEncoder. The activations-based MLP path is deleted; v2 checkpoints fail-fast on load. |
+| **PE input modality: token IDs** (rev-4 commitment) — frozen GPT-2 `wte+wpe` → 2 pre-LN transformer blocks → last-token-pool → 512-d | DECIDED | rev-4 | Architectural commitment, not coordinate change: removes the inference-time teacher dependency, unblocking AR rollouts (E3) and clean OOD evals (E2). |
 | `embed_out` hooked on `transformer.drop` output | DECIDED | Phase 1 | Identity in `model.eval()`. Frozen-teacher inference is always eval. Re-evaluate if teacher is ever fine-tuned (dropout would otherwise silently contaminate the chunk). |
 | `lm_head_out` excluded from the trace; applied externally to terminal slot | DECIDED | rev-2 | Promotion to a slot is the first lever if Phase 7 check 2 (above-marginal-mode floor) is soft. |
 

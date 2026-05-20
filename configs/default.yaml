@@ -40,6 +40,10 @@ training:
   beta_max: 0.01          # was 1.0; reduced to avoid posterior collapse (see outputs/analysis_0516/)
   beta_anneal_epochs: 60  # was 30; slower ramp gives encoder room to find latent structure
   free_bits: 0.1          # Kingma+ 2016: per-dim KL floor in nats. 0.0 = disabled. Keeps KL > 0.
+  grad_clip_norm: 1.0     # rev-4: standard fix for option_d spike pattern. null/0 = disabled.
+  prefix_n_attn_blocks: 2 # rev-4 token-PE: GPT-2-style transformer blocks over the prefix.
+  prefix_n_heads: 12      # matches GPT-2 small per-block geometry.
+  prefix_d_ff: 3072       # 4 * d_model.
   seed: 42
 
 cluster:

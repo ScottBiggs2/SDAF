@@ -3,12 +3,16 @@
 The Phase-3 cache stores ``[B_window, k, J, D]`` chunks per shard. Training
 operates on flattened per-chunk items: each (window, k_idx, block_id) triple
 is one optimization item, carrying its raw chunk + the window's prefix
-features + the window's target token.
+token IDs + the window's target token.
+
+**Rev-4 (token PrefixEncoder):** dataset now yields ``prefix_ids`` (the full
+``[ctx_len]`` token sequence) instead of ``prefix_features`` (the cached
+GPT-2 activations). Cache shards have always written ``prefix_ids`` to disk;
+they were just unused by the v1–v3 MLP-over-activations prefix path.
 
 Memory model: in-RAM. The full 10k-window cache is ~2.3 GB of chunks +
-~184 MB of prefix_features. A node with 32 GB RAM holds this comfortably; for
-larger caches (Phase 2 / k > 1) revisit with a memory-mapped or streaming
-variant.
+~5 MB of prefix_ids (int32 × ctx_len × N). A node with 32 GB RAM holds this
+comfortably.
 
 API:
   - :class:`WindowChunkDataset` — PyTorch ``Dataset``. ``__len__ = N * k * J``.
@@ -28,12 +32,12 @@ class WindowChunkDataset(Dataset):
     """Per-chunk view over one or more cache shards.
 
     Each ``__getitem__`` returns a dict with:
-      - ``chunk_raw``       : ``[D_CHUNK]`` float32 — the unnormalized chunk.
-      - ``block_id``        : long scalar (0..J-1).
-      - ``i_idx``           : long scalar (0..k-1).
-      - ``k_val``           : long scalar — k (run-configured lookahead).
-      - ``prefix_features`` : ``[J * 768]`` float32.
-      - ``target_token``    : long scalar — ``window_ids[w, i]``.
+      - ``chunk_raw``    : ``[D_CHUNK]`` float32 — the unnormalized chunk.
+      - ``block_id``     : long scalar (0..J-1).
+      - ``i_idx``        : long scalar (0..k-1).
+      - ``k_val``        : long scalar — k (run-configured lookahead).
+      - ``prefix_ids``   : ``[ctx_len]`` long — full prefix token sequence.
+      - ``target_token`` : long scalar — ``window_ids[w, i]``.
 
     The default-collate stacks each field into a ``[B, ...]`` batch.
     """
@@ -53,20 +57,21 @@ class WindowChunkDataset(Dataset):
             shards = [all_shards[i] for i in shard_indices]
 
         chunks_parts: list[Tensor] = []
-        pf_parts: list[Tensor] = []
+        pids_parts: list[Tensor] = []
         wid_parts: list[Tensor] = []
         for s in shards:
             data = torch.load(s, map_location="cpu", weights_only=True)
             chunks_parts.append(data["chunks"])
-            pf_parts.append(data["prefix_features"])
+            pids_parts.append(data["prefix_ids"])
             wid_parts.append(data["window_ids"])
 
-        # Stay in fp16 on disk; cast to fp32 lazily per-item.
+        # Stay in fp16 on disk for chunks; cast lazily per-item. Token IDs are int32 on disk.
         self.chunks = torch.cat(chunks_parts, dim=0)             # [N, k, J, D]
-        self.prefix_features = torch.cat(pf_parts, dim=0)         # [N, J * 768]
+        self.prefix_ids = torch.cat(pids_parts, dim=0)            # [N, ctx_len], int32
         self.window_ids = torch.cat(wid_parts, dim=0)             # [N, k]
 
         self.n_windows, self.k, self.J, self.d_chunk = self.chunks.shape
+        self.ctx_len = self.prefix_ids.shape[1]
         self.total = self.n_windows * self.k * self.J
         self.shards_loaded = [s.name for s in shards]
 
@@ -85,7 +90,7 @@ class WindowChunkDataset(Dataset):
             "block_id": torch.tensor(block, dtype=torch.long),
             "i_idx": torch.tensor(i, dtype=torch.long),
             "k_val": torch.tensor(self.k, dtype=torch.long),
-            "prefix_features": self.prefix_features[win].to(torch.float32),
+            "prefix_ids": self.prefix_ids[win].to(torch.long),
             "target_token": self.window_ids[win, i].to(torch.long),
         }
 

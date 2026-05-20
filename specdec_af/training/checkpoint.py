@@ -27,6 +27,20 @@ from specdec_af.models.prefix_encoder import PrefixEncoder
 from specdec_af.models.vae import ConditionAssembler, CondVAE
 
 
+class IncompatiblePrefixEncoderError(RuntimeError):
+    """Raised when a pre-rev-4 PrefixEncoder config is encountered.
+
+    v1–v3 checkpoints saved an MLP-over-activations PrefixEncoder (config keys
+    ``n_layers``, ``d_block``, ``d_out``, ``hidden_dims``). The rev-4 token-ID
+    PrefixEncoder uses a different input modality (token IDs vs. concatenated
+    activations) and is architecturally incompatible; loading silently would
+    fail with a shape mismatch deep in the forward pass.
+
+    Retraining under rev-4 (which can reuse existing cache shards, since
+    ``prefix_ids`` is already cached) is required.
+    """
+
+
 def save_vae_checkpoint(
     path: Path | str,
     *,
@@ -96,7 +110,18 @@ def load_vae_checkpoint(
     )
     vae.load_state_dict(state["vae"]["state_dict"])
 
-    prefix_encoder = PrefixEncoder(**state["prefix_encoder"]["config"])
+    pe_cfg = state["prefix_encoder"]["config"]
+    # rev-4 gate: old MLP-over-activations checkpoints carry a `hidden_dims`
+    # key and no `n_attn_blocks`. They're not loadable under the new design.
+    if "hidden_dims" in pe_cfg and "n_attn_blocks" not in pe_cfg:
+        raise IncompatiblePrefixEncoderError(
+            f"Checkpoint at {path} was saved with a pre-rev-4 MLP PrefixEncoder "
+            f"(config keys: {sorted(pe_cfg.keys())}). The rev-4 token-ID design is "
+            f"architecturally incompatible (different input modality). Retrain under "
+            f"the current code — existing cache shards can be reused because "
+            f"prefix_ids was already written at collection time."
+        )
+    prefix_encoder = PrefixEncoder(**pe_cfg)
     prefix_encoder.load_state_dict(state["prefix_encoder"]["state_dict"])
 
     cond_assembler = ConditionAssembler()

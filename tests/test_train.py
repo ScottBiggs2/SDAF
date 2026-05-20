@@ -78,9 +78,13 @@ def test_train_smoke_25_steps(cache_dir_with_stats, tmp_path, mode):
         val_max_batches=4,
         n_steps_override=25,
         seed=0,
-        prefix_hidden_dims=(1024,),  # smaller for smoke speed
         num_workers=0,
         pin_memory=False,
+        grad_clip_norm=None,
+        prefix_n_attn_blocks=1,    # smaller for smoke speed
+        prefix_n_heads=4,
+        prefix_d_ff=512,
+        prefix_ctx_len=16,         # matches cache_dir_with_stats fixture
     )
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
 
@@ -143,7 +147,10 @@ def test_train_smoke_with_free_bits(cache_dir_with_stats, tmp_path):
         free_bits=0.1,            # rev-3 default
         log_every=5, val_every_steps=0, checkpoint_every_steps=0,
         val_max_batches=4, n_steps_override=25, seed=0,
-        prefix_hidden_dims=(1024,), num_workers=0, pin_memory=False,
+        num_workers=0, pin_memory=False,
+        grad_clip_norm=None,
+        prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
+        prefix_ctx_len=16,
     )
     output_dir = tmp_path / "run_free_bits"
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
@@ -156,4 +163,34 @@ def test_train_smoke_with_free_bits(cache_dir_with_stats, tmp_path):
     # Allow a tiny float-slop margin (1e-6) below floor — rounding in clamp + reduce.
     assert all(kl >= floor - 1e-6 for kl in kls), (
         f"KL fell below free_bits floor ({floor}); min={min(kls):.4g}"
+    )
+
+
+def test_train_smoke_with_grad_clipping(cache_dir_with_stats, tmp_path):
+    """Grad clip on doesn't break training; rev-4 anti-spike fix.
+
+    No clean way to assert "spikes were clipped" on a 25-step smoke (no spikes
+    happen naturally). The behavioral check is: training completes, recon
+    decreases, summary records grad_clip_norm=1.0.
+    """
+    cfg = TrainConfig(
+        mode="option_d", batch_size=8, lr=1e-3, n_epochs=5,
+        beta_max=0.01, beta_anneal_epochs=2, free_bits=0.0,
+        log_every=5, val_every_steps=0, checkpoint_every_steps=0,
+        val_max_batches=4, n_steps_override=25, seed=0,
+        num_workers=0, pin_memory=False,
+        grad_clip_norm=1.0,
+        prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
+        prefix_ctx_len=16,
+    )
+    output_dir = tmp_path / "run_grad_clip"
+    summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
+    assert summary["grad_clip_norm"] == 1.0
+    log_path = Path(summary["training_log_csv"])
+    with open(log_path) as fh:
+        rows = list(csv.DictReader(fh))
+    recons = [float(r["recon_loss"]) for r in rows]
+    assert min(recons) < recons[0], (
+        f"recon never decreased below step-0 ({recons[0]:.4g}); "
+        f"trajectory min={min(recons):.4g} max={max(recons):.4g}"
     )

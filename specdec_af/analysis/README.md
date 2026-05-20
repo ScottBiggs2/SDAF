@@ -142,5 +142,50 @@ The decision summary will rank by `val qz_top1` automatically.
 ## Project state landmarks
 
 - `MEMORY.md` (auto-loaded each session) anchors what was decided and why.
-- `specdec_af_gpt2_impl_plan_v1.md` carries the rev-3 milestone definitions and the open-decision register.
+- `specdec_af_gpt2_impl_plan_v1.md` carries the milestone definitions and the open-decision register (now rev-4).
 - `experiments_brainstorming_0514.md` is the post-Phase-1a downstream-experiment scratchpad.
+
+## rev-4 (token PrefixEncoder) — v3 sweep
+
+PrefixEncoder rewritten to consume token IDs directly (frozen GPT-2 `wte+wpe` →
+2 pre-LN transformer blocks → last-token pool → 512-d). System no longer needs
+a teacher forward pass at inference time. Cache shards reused unchanged
+(`prefix_ids` was already written at collection time). Gradient clipping
+(`clip_grad_norm_`, default 1.0) added between backward and step.
+
+**Launch the v3 sweep (after rev-4 lands on HPC):**
+
+```bash
+# Primary runs (config default: 2 attn blocks, grad clip 1.0).
+RUN_NAME=k1_option4_v3 MODE=option_4 sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_optiond_v3 MODE=option_d sbatch scripts/slurm/submit_train.sh
+
+# Ablation: isolate the grad-clip contribution for option_d.
+RUN_NAME=k1_optiond_v3_noclip MODE=option_d GRAD_CLIP_NORM=0 \
+  sbatch scripts/slurm/submit_train.sh
+
+# Evaluate each:
+for r in k1_option4_v3 k1_optiond_v3 k1_optiond_v3_noclip; do
+  RUN_NAME=$r sbatch scripts/slurm/submit_evaluate.sh
+done
+```
+
+**What to look at first in the v3 analyzer outputs:**
+
+1. `analysis_summary.txt` — verify both modes train without posterior collapse and
+   without spike events under grad clip on. Compare `k1_optiond_v3_noclip` to the
+   v2 run: spike count and per-block recon volatility should drop materially
+   when clip is on.
+2. `compare_top1.png` — does the token PrefixEncoder close the `qz_vs_wrong` gap
+   for option_d? v2 had +0.059 on val; rev-4 target is closer to +0.13 (option_4
+   v2's gap). If so, the prefix path is now contributing more.
+3. `compare_per_block_qz.png` — block 11 dominated the gap in v2; check whether
+   that's still the bottleneck or whether attention smooths it out.
+4. **Cross-rev comparability caveat:** v2 vs. v3 `wrong_prefix` numbers are
+   computed under different ablation semantics (token shuffle vs. activation
+   shuffle). Direct numerical comparison of `wrong_prefix_top1` across revs is
+   not meaningful — but `qz_top1` and the `qz_vs_*` gap signs are.
+
+**Old v2 checkpoints are dead.** `load_vae_checkpoint` raises
+`IncompatiblePrefixEncoderError` on detection (config carries `hidden_dims` and
+no `n_attn_blocks`). The old artifacts on disk are kept for reference only.

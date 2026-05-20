@@ -6,8 +6,8 @@ For each mode in ``--modes``, train a freshly-initialized ``CondVAE`` +
 ``--n-steps`` steps. At each log step, run two eval passes (deterministic,
 no_grad) under:
 
-  - ``correct``       — the batch's true ``prefix_features``
-  - ``wrong_prefix``  — ``prefix_features`` rolled by 1 across the batch
+  - ``correct``       — the batch's true ``prefix_ids`` (rev-4: token IDs)
+  - ``wrong_prefix``  — ``prefix_ids`` rolled by 1 across the batch
                          (decoder-only cond corruption, per Phase 7's
                          ``wrong_prefix`` ablation)
 
@@ -133,7 +133,7 @@ def load_overfit_batch_from_cache(
     """Load shard 0, flatten ``[B, k, J, D]`` → ``[B*k*J, D]``, sample ``n_chunks``."""
     shard = torch.load(cache_dir / "windows" / "shard_0000.pt", map_location="cpu", weights_only=True)
     chunks = shard["chunks"].to(torch.float32)
-    pf = shard["prefix_features"].to(torch.float32)
+    pids = shard["prefix_ids"].to(torch.long)  # [B_w, ctx_len]
     B_w, k, J, D = chunks.shape
 
     rng = torch.Generator().manual_seed(seed)
@@ -145,7 +145,7 @@ def load_overfit_batch_from_cache(
     block_ids = inner % J
 
     chunk_raw = chunks.reshape(-1, D)[flat_idx]
-    prefix_features = pf[win_idx]
+    prefix_ids = pids[win_idx]
     k_val = torch.full((n_chunks,), k, dtype=torch.long)
 
     return {
@@ -153,7 +153,7 @@ def load_overfit_batch_from_cache(
         "block_ids": block_ids.to(device),
         "i_idx": i_idx.to(device),
         "k_val": k_val.to(device),
-        "prefix_features": prefix_features.to(device),
+        "prefix_ids": prefix_ids.to(device),
     }
 
 
@@ -163,8 +163,10 @@ def make_synthetic_batch(
     d_chunk: int = 9984,
     seed: int = 42,
     device: torch.device | str = "cpu",
+    vocab_size: int = 50257,
+    ctx_len: int = 128,
 ) -> dict:
-    """Synthetic overfit batch for the local CPU smoke."""
+    """Synthetic overfit batch for the local CPU smoke (rev-4: token IDs)."""
     g = torch.Generator().manual_seed(seed)
     block_ids = torch.randint(0, n_layers, (n_chunks,), generator=g)
     std_per_block = torch.linspace(0.5, 5.0, n_layers)
@@ -179,7 +181,7 @@ def make_synthetic_batch(
     chunk_raw[block_ids != 0, bin_s:bin_e] = 0.0
     chunk_raw[block_ids != (n_layers - 1), bout_s:bout_e] = 0.0
 
-    prefix_features = torch.randn(n_chunks, n_layers * 768, generator=g)
+    prefix_ids = torch.randint(0, vocab_size, (n_chunks, ctx_len), generator=g, dtype=torch.long)
     i_idx = torch.zeros(n_chunks, dtype=torch.long)
     k_val = torch.ones(n_chunks, dtype=torch.long)
 
@@ -188,7 +190,7 @@ def make_synthetic_batch(
         "block_ids": block_ids.to(device),
         "i_idx": i_idx.to(device),
         "k_val": k_val.to(device),
-        "prefix_features": prefix_features.to(device),
+        "prefix_ids": prefix_ids.to(device),
     }
 
 
@@ -278,17 +280,17 @@ def eval_pass(
     block_ids: Tensor,
     i_idx: Tensor,
     k_val: Tensor,
-    prefix_features: Tensor,
+    prefix_ids: Tensor,
     chunk_norm: ChunkNorm,
     mode: Mode,
     lm_head: nn.Module | None,
 ) -> dict:
-    """Deterministic eval (``z=mu``, no grad) under whatever ``prefix_features`` is given.
+    """Deterministic eval (``z=mu``, no grad) under whatever ``prefix_ids`` is given.
 
     Returns a dict suitable for embedding under ``history[step]['eval_correct']``
     or ``history[step]['eval_wrong']``.
     """
-    prefix_emb = prefix_encoder(prefix_features)
+    prefix_emb = prefix_encoder(prefix_ids)
     cond = cond_assembler(prefix_emb, i_idx, block_ids, k_val)
     mu, _logvar = vae.encode(chunk_norm_input, cond)
     recon = vae.decode(mu, cond)
@@ -312,13 +314,29 @@ def _build_models(
     chunk_norm: ChunkNorm,
     *,
     device: torch.device | str,
-    prefix_hidden_dims: tuple[int, ...] = (2048, 1024),
+    prefix_n_attn_blocks: int = 2,
+    prefix_n_heads: int = 12,
+    prefix_d_ff: int = 3072,
+    prefix_ctx_len: int = 128,
+    gpt2_model_name: str = "openai-community/gpt2",
 ) -> tuple[CondVAE, PrefixEncoder, ConditionAssembler]:
+    """Build trainable stack; copies frozen GPT-2 wte+wpe into PrefixEncoder."""
+    from transformers import GPT2LMHeadModel
+
     decoder_output_space = "raw" if mode == "option_d" else "normalized"
     vae = CondVAE(decoder_output_space=decoder_output_space).to(device)
     if mode == "option_d":
         vae.init_decoder_out_for_raw_space(chunk_norm.std.to(device))
-    prefix_encoder = PrefixEncoder(hidden_dims=prefix_hidden_dims).to(device)
+    prefix_encoder = PrefixEncoder(
+        ctx_len=prefix_ctx_len,
+        n_attn_blocks=prefix_n_attn_blocks,
+        n_heads=prefix_n_heads,
+        d_ff=prefix_d_ff,
+    )
+    gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_name).eval()
+    prefix_encoder.load_gpt2_embeddings(gpt2)
+    del gpt2
+    prefix_encoder = prefix_encoder.to(device)
     cond = ConditionAssembler().to(device)
     return vae, prefix_encoder, cond
 
@@ -337,7 +355,11 @@ def run_one_mode(
     eval_wrong_prefix: bool = True,
     save_path: Path | None = None,
     training_config: dict | None = None,
-    prefix_hidden_dims: tuple[int, ...] = (2048, 1024),
+    prefix_n_attn_blocks: int = 2,
+    prefix_n_heads: int = 12,
+    prefix_d_ff: int = 3072,
+    prefix_ctx_len: int = 128,
+    grad_clip_norm: float | None = None,
 ) -> dict:
     """Train one mode for ``n_steps`` on the fixed ``batch``.
 
@@ -347,13 +369,19 @@ def run_one_mode(
     """
     torch.manual_seed(seed)
     vae, prefix_encoder, cond_assembler = _build_models(
-        mode, chunk_norm, device=device, prefix_hidden_dims=prefix_hidden_dims,
+        mode, chunk_norm, device=device,
+        prefix_n_attn_blocks=prefix_n_attn_blocks,
+        prefix_n_heads=prefix_n_heads,
+        prefix_d_ff=prefix_d_ff,
+        prefix_ctx_len=prefix_ctx_len,
     )
 
     params = [
-        *vae.parameters(),
-        *prefix_encoder.parameters(),
-        *cond_assembler.parameters(),
+        p for p in (
+            *vae.parameters(),
+            *prefix_encoder.parameters(),
+            *cond_assembler.parameters(),
+        ) if p.requires_grad
     ]
     n_params = sum(p.numel() for p in params)
     opt = torch.optim.Adam(params, lr=lr)
@@ -362,9 +390,9 @@ def run_one_mode(
     block_ids = batch["block_ids"]
     i_idx = batch["i_idx"]
     k_val = batch["k_val"]
-    prefix_features = batch["prefix_features"]
-    prefix_features_wrong = (
-        torch.roll(prefix_features, shifts=1, dims=0) if eval_wrong_prefix else None
+    prefix_ids = batch["prefix_ids"]
+    prefix_ids_wrong = (
+        torch.roll(prefix_ids, shifts=1, dims=0) if eval_wrong_prefix else None
     )
 
     chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
@@ -375,7 +403,7 @@ def run_one_mode(
             chunk_norm_input=chunk_norm_input,
             chunk_raw=chunk_raw, block_ids=block_ids,
             i_idx=i_idx, k_val=k_val,
-            prefix_features=prefix_features,
+            prefix_ids=prefix_ids,
             chunk_norm=chunk_norm, mode=mode, lm_head=lm_head,
         )
         entry: dict = {
@@ -384,13 +412,13 @@ def run_one_mode(
             "kl": kl_val,
             "eval_correct": eval_correct,
         }
-        if prefix_features_wrong is not None:
+        if prefix_ids_wrong is not None:
             entry["eval_wrong"] = eval_pass(
                 vae, prefix_encoder, cond_assembler,
                 chunk_norm_input=chunk_norm_input,
                 chunk_raw=chunk_raw, block_ids=block_ids,
                 i_idx=i_idx, k_val=k_val,
-                prefix_features=prefix_features_wrong,
+                prefix_ids=prefix_ids_wrong,
                 chunk_norm=chunk_norm, mode=mode, lm_head=lm_head,
             )
         return entry
@@ -400,7 +428,7 @@ def run_one_mode(
 
     # Step 0 baseline (before any training).
     with torch.no_grad():
-        prefix_emb0 = prefix_encoder(prefix_features)
+        prefix_emb0 = prefix_encoder(prefix_ids)
         cond_vec0 = cond_assembler(prefix_emb0, i_idx, block_ids, k_val)
         out0 = vae(chunk_norm_input, cond_vec0)
         rec_loss0 = chunk_recon_loss(out0["recon"], chunk_raw, block_ids, chunk_norm, mode=mode).item()
@@ -408,7 +436,7 @@ def run_one_mode(
     history.append(_log_step(0, rec_loss0, kl0))
 
     for step in range(1, n_steps + 1):
-        prefix_emb = prefix_encoder(prefix_features)
+        prefix_emb = prefix_encoder(prefix_ids)
         cond_vec = cond_assembler(prefix_emb, i_idx, block_ids, k_val)
         out = vae(chunk_norm_input, cond_vec)
         recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=mode)
@@ -416,6 +444,8 @@ def run_one_mode(
         loss = recon_loss  # beta = 0 for overfit-a-batch
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_norm)
         opt.step()
 
         if step % log_every == 0 or step == n_steps:
@@ -437,7 +467,10 @@ def run_one_mode(
         "n_steps": n_steps,
         "lr": lr,
         "n_params": int(n_params),
-        "prefix_hidden_dims": list(prefix_hidden_dims),
+        "prefix_n_attn_blocks": prefix_n_attn_blocks,
+        "prefix_n_heads": prefix_n_heads,
+        "prefix_d_ff": prefix_d_ff,
+        "grad_clip_norm": grad_clip_norm,
         "wall_seconds": wall,
         "history": history,
         "final": history[-1] if history else None,
@@ -459,7 +492,11 @@ def run_sweep(
     eval_wrong_prefix: bool = True,
     checkpoints_dir: Path | None = None,
     training_config: dict | None = None,
-    prefix_hidden_dims: tuple[int, ...] = (2048, 1024),
+    prefix_n_attn_blocks: int = 2,
+    prefix_n_heads: int = 12,
+    prefix_d_ff: int = 3072,
+    prefix_ctx_len: int = 128,
+    grad_clip_norm: float | None = None,
 ) -> dict:
     out = {
         "modes": [],
@@ -477,7 +514,11 @@ def run_sweep(
             log_every=log_every, seed=seed,
             lm_head=lm_head, eval_wrong_prefix=eval_wrong_prefix,
             save_path=save_path, training_config=training_config,
-            prefix_hidden_dims=prefix_hidden_dims,
+            prefix_n_attn_blocks=prefix_n_attn_blocks,
+            prefix_n_heads=prefix_n_heads,
+            prefix_d_ff=prefix_d_ff,
+            prefix_ctx_len=prefix_ctx_len,
+            grad_clip_norm=grad_clip_norm,
         )
         f = result["final"]
         ec = f["eval_correct"]
@@ -579,8 +620,12 @@ def main() -> int:
                    help="skip the wrong-prefix ablation eval")
     p.add_argument("--no-save", action="store_true",
                    help="skip writing per-mode checkpoints")
-    p.add_argument("--prefix-hidden-dims", nargs="*", type=int, default=[2048, 1024],
-                   help="hidden dims for PrefixEncoder (empty for shallow Linear+GELU baseline)")
+    p.add_argument("--prefix-n-attn-blocks", type=int, default=2)
+    p.add_argument("--prefix-n-heads", type=int, default=12)
+    p.add_argument("--prefix-d-ff", type=int, default=3072)
+    p.add_argument("--prefix-ctx-len", type=int, default=128)
+    p.add_argument("--grad-clip-norm", type=float, default=None,
+                   help="max L2 norm for grad clip; None or 0 = disabled")
     args = p.parse_args()
 
     device = pick_device(force_cpu=args.cpu)
@@ -588,7 +633,9 @@ def main() -> int:
     print(f"modes={args.modes}  n_chunks={args.n_chunks}  n_steps={args.n_steps}  lr={args.lr}", flush=True)
 
     if args.smoke:
-        batch = make_synthetic_batch(args.n_chunks, seed=args.seed, device=device)
+        batch = make_synthetic_batch(
+            args.n_chunks, seed=args.seed, device=device, ctx_len=args.prefix_ctx_len,
+        )
         chunk_norm = fit_chunk_norm_from_batch(batch["chunk_raw"], batch["block_ids"]).to(device)
         output_dir = Path("./outputs/overfit_sweep_smoke")
         load_lm = args.smoke_with_lm_head and not args.no_downstream_metrics
@@ -615,7 +662,6 @@ def main() -> int:
         except Exception as e:
             print(f"  WARN: failed to load lm_head ({type(e).__name__}: {e}); skipping downstream metrics", flush=True)
 
-    prefix_hidden_dims = tuple(args.prefix_hidden_dims)
     checkpoints_dir = None if args.no_save else (output_dir / "checkpoints")
 
     results = run_sweep(
@@ -627,9 +673,18 @@ def main() -> int:
         checkpoints_dir=checkpoints_dir,
         training_config={
             "lr": args.lr, "n_chunks": args.n_chunks, "n_steps": args.n_steps,
-            "seed": args.seed, "prefix_hidden_dims": list(prefix_hidden_dims),
+            "seed": args.seed,
+            "prefix_n_attn_blocks": args.prefix_n_attn_blocks,
+            "prefix_n_heads": args.prefix_n_heads,
+            "prefix_d_ff": args.prefix_d_ff,
+            "prefix_ctx_len": args.prefix_ctx_len,
+            "grad_clip_norm": args.grad_clip_norm,
         },
-        prefix_hidden_dims=prefix_hidden_dims,
+        prefix_n_attn_blocks=args.prefix_n_attn_blocks,
+        prefix_n_heads=args.prefix_n_heads,
+        prefix_d_ff=args.prefix_d_ff,
+        prefix_ctx_len=args.prefix_ctx_len,
+        grad_clip_norm=args.grad_clip_norm,
     )
     write_summary(results, output_dir)
     print(f"\nresults: {output_dir / 'results.json'}", flush=True)

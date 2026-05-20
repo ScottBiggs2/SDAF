@@ -49,7 +49,11 @@ def _make_synthetic_run(out_dir: Path, name: str, collapse_at: int | None = None
         "mode": "option_d" if "d" in name else "option_4",
         "n_steps_completed": 1000,
         "n_params": 70_000_000,
-        "prefix_hidden_dims": [2048, 1024],
+        "prefix_n_attn_blocks": 2,
+        "prefix_n_heads": 12,
+        "prefix_d_ff": 3072,
+        "prefix_ctx_len": 128,
+        "grad_clip_norm": 1.0,
         "wall_seconds": 100.0,
         "final_val": {
             "val_recon": 0.5,

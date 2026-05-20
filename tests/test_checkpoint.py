@@ -1,15 +1,29 @@
-"""Round-trip tests for VAE checkpoint save/load."""
+"""Round-trip tests for VAE checkpoint save/load (rev-4: token-ID PrefixEncoder)."""
+import pytest
 import torch
 
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.prefix_encoder import PrefixEncoder
 from specdec_af.models.vae import ConditionAssembler, CondVAE
-from specdec_af.training.checkpoint import load_vae_checkpoint, save_vae_checkpoint
+from specdec_af.training.checkpoint import (
+    IncompatiblePrefixEncoderError,
+    load_vae_checkpoint,
+    save_vae_checkpoint,
+)
 
 
-def _make_stack(mode: str = "option_d", prefix_hidden=(2048, 1024)):
+def _make_stack(
+    mode: str = "option_d",
+    *,
+    ctx_len: int = 32,
+    n_attn_blocks: int = 1,
+    n_heads: int = 4,
+    d_ff: int = 512,
+):
     vae = CondVAE(decoder_output_space=("raw" if mode == "option_d" else "normalized"))
-    pe = PrefixEncoder(hidden_dims=prefix_hidden)
+    pe = PrefixEncoder(
+        ctx_len=ctx_len, n_attn_blocks=n_attn_blocks, n_heads=n_heads, d_ff=d_ff,
+    )
     cond = ConditionAssembler()
     cn = ChunkNorm(n_layers=12)
     # Tweak ChunkNorm state to non-trivial values so round-trip is meaningful.
@@ -36,20 +50,29 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded["step"] == 1234
     assert loaded["training_config"] == {"lr": 1e-3, "n_chunks": 256}
 
-    # Architecture matches: param counts equal, output matches on fixed input.
+    # Architecture matches: param counts equal (trainable) + state dicts equal length.
     for orig, restored in (
         (vae, loaded["vae"]),
         (pe, loaded["prefix_encoder"]),
         (cond, loaded["cond_assembler"]),
         (cn, loaded["chunk_norm"]),
     ):
-        n_orig = sum(p.numel() for p in orig.parameters())
-        n_restored = sum(p.numel() for p in restored.parameters())
+        n_orig = sum(p.numel() for p in orig.parameters() if p.requires_grad)
+        n_restored = sum(p.numel() for p in restored.parameters() if p.requires_grad)
         assert n_orig == n_restored
+
+    # PrefixEncoder buffers (wte/wpe) round-trip identically.
+    torch.testing.assert_close(
+        pe.wte_buffer, loaded["prefix_encoder"].wte_buffer, atol=0.0, rtol=0.0,
+    )
+    torch.testing.assert_close(
+        pe.wpe_buffer, loaded["prefix_encoder"].wpe_buffer, atol=0.0, rtol=0.0,
+    )
 
     # End-to-end equivalence: same chunk + cond → same recon.
     chunk_norm_input = torch.randn(4, 9984)
-    prefix_emb = pe(torch.randn(4, 9216))
+    prefix_ids = torch.randint(0, 50257, (4, 32))
+    prefix_emb = pe(prefix_ids)
     cond_vec = cond(
         prefix_emb,
         torch.zeros(4, dtype=torch.long),
@@ -60,7 +83,6 @@ def test_save_load_roundtrip(tmp_path):
     torch.manual_seed(0)
     out_orig = vae(chunk_norm_input, cond_vec)
 
-    prefix_emb2 = loaded["prefix_encoder"](torch.randn(4, 9216))  # different input — distinct
     # Use the same chunk + cond; reset RNG so reparam matches
     torch.manual_seed(0)
     out_restored = loaded["vae"](chunk_norm_input, cond_vec)
@@ -77,14 +99,53 @@ def test_save_load_roundtrip(tmp_path):
 def test_checkpoint_preserves_prefix_encoder_config(tmp_path):
     """Saving/loading a non-default PrefixEncoder config restores its shape."""
     vae, _pe, cond, cn = _make_stack()
-    pe_shallow = PrefixEncoder(hidden_dims=())
-    path = tmp_path / "shallow.pt"
+    pe_two_blocks = PrefixEncoder(ctx_len=32, n_attn_blocks=2, n_heads=4, d_ff=512)
+    path = tmp_path / "two_blocks.pt"
 
     save_vae_checkpoint(
         path,
-        vae=vae, prefix_encoder=pe_shallow, cond_assembler=cond, chunk_norm=cn,
+        vae=vae, prefix_encoder=pe_two_blocks, cond_assembler=cond, chunk_norm=cn,
         mode="option_4", step=0,
     )
     loaded = load_vae_checkpoint(path)
-    assert loaded["prefix_encoder"].hidden_dims == ()
-    assert sum(p.numel() for p in loaded["prefix_encoder"].parameters()) == 9216 * 512 + 512
+    assert loaded["prefix_encoder"].n_attn_blocks == 2
+    assert loaded["prefix_encoder"].ctx_len == 32
+    assert sum(p.numel() for p in loaded["prefix_encoder"].parameters() if p.requires_grad) \
+        == sum(p.numel() for p in pe_two_blocks.parameters() if p.requires_grad)
+
+
+def test_load_v2_checkpoint_raises_incompatible_error(tmp_path):
+    """A pre-rev-4 PE config (hidden_dims, no n_attn_blocks) is detected and rejected."""
+    # Synthesize a v2-style checkpoint by writing the old config schema directly.
+    vae, _pe, cond, cn = _make_stack()
+    fake = {
+        "format_version": 1,
+        "mode": "option_4",
+        "step": 0,
+        "training_config": {"comment": "synthetic v2 ckpt for negative test"},
+        "vae": {
+            "state_dict": vae.state_dict(),
+            "decoder_output_space": vae.decoder_output_space,
+            "d_latent": vae.d_latent,
+        },
+        "prefix_encoder": {
+            "state_dict": {},  # not loadable; the config check fires before load
+            "config": {
+                # Old v2/v3 schema — no n_attn_blocks key, hidden_dims present.
+                "n_layers": 12,
+                "d_block": 768,
+                "d_out": 512,
+                "hidden_dims": [2048, 1024],
+            },
+        },
+        "cond_assembler": {"state_dict": cond.state_dict()},
+        "chunk_norm": {
+            "state_dict": cn.state_dict(),
+            "n_layers": cn.n_layers,
+            "eps": cn.eps,
+        },
+    }
+    path = tmp_path / "v2_fake.pt"
+    torch.save(fake, path)
+    with pytest.raises(IncompatiblePrefixEncoderError, match="pre-rev-4 MLP PrefixEncoder"):
+        load_vae_checkpoint(path)

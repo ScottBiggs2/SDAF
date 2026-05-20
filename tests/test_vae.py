@@ -44,7 +44,7 @@ def test_shape_contract():
     vae, pe, cond = _make_models()
     B = 4
     chunk_norm = torch.randn(B, D_CHUNK)
-    prefix_emb = pe(torch.randn(B, 12 * 768))
+    prefix_emb = pe(torch.randint(0, 50257, (B, 128)))
     cond_vec = cond(
         prefix_emb,
         torch.zeros(B, dtype=torch.long),
@@ -81,7 +81,7 @@ def test_condition_matters():
     torch.manual_seed(0)
     vae, pe, cond = _make_models()
     chunk_norm = torch.randn(1, D_CHUNK)
-    prefix_emb = pe(torch.randn(1, 12 * 768))
+    prefix_emb = pe(torch.randint(0, 50257, (1, 128)))
 
     cond_a = cond(prefix_emb, torch.zeros(1, dtype=torch.long), torch.tensor([0]), torch.ones(1, dtype=torch.long))
     cond_b = cond(prefix_emb, torch.zeros(1, dtype=torch.long), torch.tensor([11]), torch.ones(1, dtype=torch.long))
@@ -104,7 +104,7 @@ def test_backward_every_param_gets_grad():
     block_ids = torch.tensor([0, 5, 7, 11], dtype=torch.long)
     chunk_norm_input = cn.forward_per_item(chunk_raw, block_ids)
 
-    prefix_emb = pe(torch.randn(B, 12 * 768))
+    prefix_emb = pe(torch.randint(0, 50257, (B, 128)))
     cond_vec = cond(
         prefix_emb, torch.zeros(B, dtype=torch.long), block_ids, torch.ones(B, dtype=torch.long),
     )
