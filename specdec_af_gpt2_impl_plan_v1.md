@@ -8,7 +8,36 @@
 
 ## Change log
 
-### rev. 4 (current)
+### rev. 5 (current)
+
+- **Eval OOM fix.** The rev-4 v3 sweep trained successfully but evaluation
+  OOM'd inside the PrefixEncoder self-attention at the SLURM-default
+  `n_chunks=8192`. Root cause: `nn.MultiheadAttention` with an explicit bool
+  `attn_mask` bypasses PyTorch's SDPA fast path and materializes a
+  `[B·H, L, L]` fp32 score tensor — ~6.4 GB per attention layer, ~51 GB peak
+  across the 8 PE forward passes per split.
+- **TransformerBlock rewritten** to call `F.scaled_dot_product_attention(q, k, v,
+  is_causal=True)` directly with manual QKV projections. Same param count as
+  rev-4 (same 4 linears, just unwrapped from `nn.MultiheadAttention`). The
+  `causal_mask` buffer is dropped; causality is enforced inside the SDPA kernel.
+  FlashAttention dispatch is automatic on supported hardware; the memory-
+  efficient kernel is the fallback. No `[B·H, L, L]` score buffer is ever
+  materialized.
+- **`d_latent: 64 → 128`.** The latent dim was flagged as undersized relative
+  to the 9984-d chunk. +98K VAE params (0.2%). Z_trace per token = 12×128 =
+  1536-d, which gives the downstream CFM stage more substrate to work with.
+- **LR warmup added.** `lr: 1e-3 → 5e-4` plus a 500-step linear warmup via
+  `LambdaLR`. The CSV's `lr` column now reflects the effective lr (read from
+  the optimizer's param_group), so the ramp is visible in the analyzer.
+- **Eval micro-batch knob** added as an orthogonal safety net. `--eval-micro-batch-size`
+  (or `EVAL_MICRO_BATCH_SIZE` env var on SLURM) chunks the PE/VAE forward in
+  evaluation. The roll-based wrong-prefix and seeded prior `z` are pre-computed
+  at full batch size and sliced; bit-identical to the unbatched path when
+  `micro_batch_size >= B`.
+- **v3 in-flight checkpoints are dead** by the architectural d_latent change.
+  New sweep naming is v4. v2 artifacts remain dead per rev-4 design.
+
+### rev. 4 (superseded by rev. 5)
 
 - **PrefixEncoder redesigned: token IDs in, not GPT-2 activations.** The encoder now
   consumes the raw prefix as a `[B, ctx_len]` sequence of token IDs; embeds via frozen
@@ -89,6 +118,8 @@ Self-contained list of what's settled and what isn't. New decisions and their re
 | **Normalization: option 4 (ChunkNorm + unnormalized-space loss) vs option D (raw decoder output, σ as loss weight)** | OPEN | Phase 5 | Overfit-a-batch sweep. Pick whichever drives lowest **unnormalized-space** terminal-slot recon error. Phase 3 CV diagnostic informs the prior. |
 | `prefix_features` source = stacked `mlp_proj_out` across blocks (B, 12·768) | SUPERSEDED | rev-4 | Replaced by token-ID PrefixEncoder. The activations-based MLP path is deleted; v2 checkpoints fail-fast on load. |
 | **PE input modality: token IDs** (rev-4 commitment) — frozen GPT-2 `wte+wpe` → 2 pre-LN transformer blocks → last-token-pool → 512-d | DECIDED | rev-4 | Architectural commitment, not coordinate change: removes the inference-time teacher dependency, unblocking AR rollouts (E3) and clean OOD evals (E2). |
+| **PE attention backend: `F.scaled_dot_product_attention(is_causal=True)`** with manual QKV projections | DECIDED | rev-5 | Fixes eval OOM at n_chunks=8192. FlashAttention / memory-efficient kernel dispatch is automatic. Same param count as the rev-4 `nn.MultiheadAttention` setup; only state_dict naming differs. |
+| **`d_latent` per-chunk latent dim: 128** | DECIDED | rev-5 | Bumped from rev-3's implicit 64. Z_trace = 12×128 = 1536-d per token. Conservative 2x bump; +98K VAE params. 256 stays available as a follow-on ablation if 128 underfits. |
 | `embed_out` hooked on `transformer.drop` output | DECIDED | Phase 1 | Identity in `model.eval()`. Frozen-teacher inference is always eval. Re-evaluate if teacher is ever fine-tuned (dropout would otherwise silently contaminate the chunk). |
 | `lm_head_out` excluded from the trace; applied externally to terminal slot | DECIDED | rev-2 | Promotion to a slot is the first lever if Phase 7 check 2 (above-marginal-mode floor) is soft. |
 

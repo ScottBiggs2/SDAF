@@ -35,22 +35,23 @@ outputs/from_hpc/
 ### 1. Launch on HPC
 
 ```bash
-# Training (sets β/free-bits defaults from configs/default.yaml):
-RUN_NAME=k1_option4_v2 MODE=option_4 sbatch scripts/slurm/submit_train.sh
-RUN_NAME=k1_optiond_v2 MODE=option_d sbatch scripts/slurm/submit_train.sh
+# Training (sets β/free-bits/lr defaults from configs/default.yaml):
+RUN_NAME=k1_option4_v4 MODE=option_4 sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_optiond_v4 MODE=option_d sbatch scripts/slurm/submit_train.sh
 
-# Evaluation (after training lands):
-RUN_NAME=k1_option4_v2 sbatch scripts/slurm/submit_evaluate.sh
-RUN_NAME=k1_optiond_v2 sbatch scripts/slurm/submit_evaluate.sh
+# Evaluation (after training lands; rev-5 SDPA path makes n_chunks=8192 fit on V100):
+RUN_NAME=k1_option4_v4 sbatch scripts/slurm/submit_evaluate.sh
+RUN_NAME=k1_optiond_v4 sbatch scripts/slurm/submit_evaluate.sh
 
-# Optional env-var overrides for the sweep variant of training:
+# Optional env-var overrides:
 # BETA_MAX=0.05 RUN_NAME=k1_option4_b0.05 sbatch scripts/slurm/submit_train.sh
+# EVAL_MICRO_BATCH_SIZE=2048 RUN_NAME=k1_option4_v4 sbatch scripts/slurm/submit_evaluate.sh
 ```
 
 ### 2. Pull artifacts down
 
 ```bash
-RUNS=(k1_option4_v2 k1_optiond_v2)
+RUNS=(k1_option4_v4 k1_optiond_v4)
 mkdir -p outputs/from_hpc/eval
 for r in "${RUNS[@]}"; do
   mkdir -p "outputs/from_hpc/$r" "outputs/from_hpc/eval/$r"
@@ -68,9 +69,9 @@ posterior collapse and emits side-by-side curves.
 
 ```bash
 python -m specdec_af.analysis.training_logs \
-  --run k1_option4_v2=outputs/from_hpc/k1_option4_v2 \
-  --run k1_optiond_v2=outputs/from_hpc/k1_optiond_v2 \
-  --out outputs/analysis_v2
+  --run k1_option4_v4=outputs/from_hpc/k1_option4_v4 \
+  --run k1_optiond_v4=outputs/from_hpc/k1_optiond_v4 \
+  --out outputs/analysis_v4
 ```
 
 **What to look at first:**
@@ -142,7 +143,7 @@ The decision summary will rank by `val qz_top1` automatically.
 ## Project state landmarks
 
 - `MEMORY.md` (auto-loaded each session) anchors what was decided and why.
-- `specdec_af_gpt2_impl_plan_v1.md` carries the milestone definitions and the open-decision register (now rev-4).
+- `specdec_af_gpt2_impl_plan_v1.md` carries the milestone definitions and the open-decision register (now rev-5).
 - `experiments_brainstorming_0514.md` is the post-Phase-1a downstream-experiment scratchpad.
 
 ## rev-4 (token PrefixEncoder) — v3 sweep
@@ -189,3 +190,44 @@ done
 **Old v2 checkpoints are dead.** `load_vae_checkpoint` raises
 `IncompatiblePrefixEncoderError` on detection (config carries `hidden_dims` and
 no `n_attn_blocks`). The old artifacts on disk are kept for reference only.
+
+## rev-5 (eval OOM fix + d_latent=128 + LR warmup) — v4 sweep
+
+The rev-4 v3 sweep trained successfully but eval OOM'd inside the PrefixEncoder
+self-attention at `n_chunks=8192`. Three changes in rev-5 unblock it:
+
+- **PrefixEncoder attention now uses PyTorch's SDPA fast path** (FlashAttention
+  on supported hardware, memory-efficient kernel otherwise). The block calls
+  `F.scaled_dot_product_attention(q, k, v, is_causal=True)` with manual QKV
+  projections — no explicit mask, no `[B·H, L, L]` score materialization.
+  Same param count as the rev-4 `nn.MultiheadAttention` setup.
+- **`d_latent: 64 → 128`** as the new default. +98K VAE params (0.2%); Z_trace
+  per token = 12×128 = 1536-d.
+- **`lr: 1e-3 → 5e-4`** with a 500-step linear warmup. Gentler ramp for the
+  wider latent.
+- **Eval micro-batch knob** (`--eval-micro-batch-size`, or `EVAL_MICRO_BATCH_SIZE`
+  env var) added as an orthogonal safety net.
+
+**v3 in-flight checkpoints are dead** by the architectural `d_latent` change
+(retrain required). The new sweep is named `v4` to avoid colliding with the
+OOM'd v3 attempts.
+
+**Launch the v4 sweep:**
+
+```bash
+RUN_NAME=k1_option4_v4 MODE=option_4 sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_optiond_v4 MODE=option_d sbatch scripts/slurm/submit_train.sh
+for r in k1_option4_v4 k1_optiond_v4; do
+  RUN_NAME=$r sbatch scripts/slurm/submit_evaluate.sh
+done
+```
+
+**What to look at in the v4 analyzer outputs:**
+
+1. `metrics.json` actually materializes (eval no longer OOMs).
+2. `compare_top1.png` — does the bigger latent close the floor gap? v3 target
+   was val `qz_top1 > baseline_pred_concentration ≈ 0.21`.
+3. `diagnostics.png` — smooth early-step recon descent under warmup (no spike
+   pattern in the first 500 steps).
+4. `compare_per_block_qz.png` — block 11 was the v2/v3 bottleneck; check whether
+   the d_latent bump flattens it.

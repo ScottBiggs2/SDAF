@@ -88,6 +88,9 @@ def test_save_load_roundtrip(tmp_path):
     out_restored = loaded["vae"](chunk_norm_input, cond_vec)
     torch.testing.assert_close(out_orig["recon"], out_restored["recon"], atol=1e-6, rtol=1e-6)
 
+    # rev-5: lock the d_latent default contract.
+    assert loaded["vae"].d_latent == 128
+
     # ChunkNorm round-trip
     chunk_raw = torch.randn(4, 9984)
     block_ids = torch.tensor([0, 5, 7, 11], dtype=torch.long)

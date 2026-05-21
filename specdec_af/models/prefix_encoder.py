@@ -30,12 +30,31 @@ from torch import Tensor
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN GPT-2-style block: LN → MHA → residual → LN → MLP → residual."""
+    """Pre-LN GPT-2-style block: LN → causal SDPA → residual → LN → MLP → residual.
+
+    Calls :func:`torch.nn.functional.scaled_dot_product_attention` with
+    ``is_causal=True`` and no explicit mask. SDPA dispatches to FlashAttention on
+    supported hardware and to the memory-efficient kernel otherwise; either way,
+    the full ``[B·H, L, L]`` score matrix is never materialized — that's what
+    keeps eval-time memory tractable at large batch sizes (the rev-4 PE OOM'd
+    at n_chunks=8192 precisely because explicit ``attn_mask`` forced the slow path).
+
+    Param count is identical to ``nn.MultiheadAttention`` (same 4 linears); only
+    the state_dict naming differs.
+    """
 
     def __init__(self, d_model: int = 768, n_heads: int = 12, d_ff: int = 3072) -> None:
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by n_heads={n_heads}")
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+
         self.ln_1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        # Packed QKV projection — same shape (3·d_model, d_model) as nn.MHA's in_proj.
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
         self.ln_2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -43,12 +62,21 @@ class TransformerBlock(nn.Module):
             nn.Linear(d_ff, d_model),
         )
 
-    def forward(self, x: Tensor, attn_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        B, L, D = x.shape
         h = self.ln_1(x)
-        a, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        qkv = self.qkv_proj(h)  # [B, L, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)  # each [B, L, D]
+        # Reshape for SDPA: expects [B, H, L, D_head].
+        q = q.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # [B, H, L, D_head]
+        a = a.transpose(1, 2).contiguous().view(B, L, D)
+        a = self.out_proj(a)
         x = x + a
-        h = self.ln_2(x)
-        return x + self.mlp(h)
+        h2 = self.ln_2(x)
+        return x + self.mlp(h2)
 
 
 class PrefixEncoder(nn.Module):
@@ -84,11 +112,9 @@ class PrefixEncoder(nn.Module):
             "wpe_buffer", torch.zeros(wpe_max_positions, d_model), persistent=True
         )
 
-        # Causal mask + position index cache (derived; not persistent).
-        causal_mask = torch.triu(
-            torch.ones(ctx_len, ctx_len, dtype=torch.bool), diagonal=1
-        )
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
+        # Position-index cache (derived; not persistent). Causality is now enforced
+        # inside the attention kernel via ``is_causal=True``, so no mask buffer is
+        # registered — this is what unlocks PyTorch's SDPA fast path.
         self.register_buffer(
             "pos_ids", torch.arange(ctx_len, dtype=torch.long), persistent=False
         )
@@ -138,7 +164,7 @@ class PrefixEncoder(nn.Module):
         )  # [B, L, d_model]
 
         for block in self.blocks:
-            h = block(h, attn_mask=self.causal_mask)
+            h = block(h)
         h = self.final_ln(h)
         h_last = h[:, -1, :]  # [B, d_model] — GPT-2-style next-token pooling
         return self.act(self.proj(h_last))

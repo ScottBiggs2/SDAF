@@ -226,6 +226,8 @@ class TrainConfig:
     prefix_n_heads: int
     prefix_d_ff: int
     prefix_ctx_len: int
+    # rev-5 additions
+    lr_warmup_steps: int  # 0 = no warmup
 
 
 def build_stack(
@@ -316,6 +318,14 @@ def train(
     print(f"trainable params: {n_params:,}", flush=True)
 
     opt = torch.optim.Adam(trainable, lr=cfg.lr)
+    # rev-5: optional linear warmup. step 0 gets 1/warmup_steps; step >= warmup_steps gets 1.0.
+    if cfg.lr_warmup_steps > 0:
+        warmup_steps = cfg.lr_warmup_steps
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            opt, lr_lambda=lambda s: min(1.0, (s + 1) / warmup_steps),
+        )
+    else:
+        scheduler = None
 
     # Logging
     csv_fields = _csv_fields(N_LAYERS_DEFAULT)
@@ -358,6 +368,8 @@ def train(
             if cfg.grad_clip_norm is not None and cfg.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
             if step % cfg.log_every == 0 or step == total_steps - 1:
                 with torch.no_grad():
@@ -365,7 +377,9 @@ def train(
                         out["recon"], chunk_raw, block_ids, chunk_norm,
                         out["mu"], out["logvar"], mode=cfg.mode,
                     )
-                row = _row_from(step, epoch, beta, cfg.lr,
+                # Effective lr — reflects warmup ramp via the scheduler.
+                effective_lr = opt.param_groups[0]["lr"]
+                row = _row_from(step, epoch, beta, effective_lr,
                                 recon_loss.item(), kl.item(), loss.item(),
                                 diag, N_LAYERS_DEFAULT)
                 csv_logger.log(row)
@@ -473,6 +487,8 @@ def main() -> int:
                    help="attention heads per PrefixEncoder block")
     p.add_argument("--prefix-d-ff", type=int, default=None,
                    help="FFN inner dim per PrefixEncoder block (default 4*d_model)")
+    p.add_argument("--lr-warmup-steps", type=int, default=None,
+                   help="linear LR warmup over the first N steps; 0 = no warmup")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--no-pin-memory", action="store_true")
     p.add_argument("--seed", type=int, default=None)
@@ -510,6 +526,8 @@ def main() -> int:
         prefix_d_ff=args.prefix_d_ff if args.prefix_d_ff is not None
                      else raw_cfg["training"].get("prefix_d_ff", 3072),
         prefix_ctx_len=raw_cfg["trace"]["ctx_len"],
+        lr_warmup_steps=args.lr_warmup_steps if args.lr_warmup_steps is not None
+                         else raw_cfg["training"].get("lr_warmup_steps", 0),
     )
 
     device = pick_device(force_cpu=args.cpu)
@@ -519,7 +537,8 @@ def main() -> int:
     print(f"grad_clip_norm={tcfg.grad_clip_norm}  "
           f"prefix_n_attn_blocks={tcfg.prefix_n_attn_blocks}  "
           f"prefix_n_heads={tcfg.prefix_n_heads}  prefix_d_ff={tcfg.prefix_d_ff}  "
-          f"prefix_ctx_len={tcfg.prefix_ctx_len}", flush=True)
+          f"prefix_ctx_len={tcfg.prefix_ctx_len}  "
+          f"lr={tcfg.lr}  lr_warmup_steps={tcfg.lr_warmup_steps}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
 

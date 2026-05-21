@@ -18,7 +18,7 @@ trace:
   J: 12
 
 vae:
-  d_latent: 64
+  d_latent: 128           # rev-5: bumped from 64. Z_trace per token = 12 × 128 = 1536-d.
   cond_dim:
     prefix: 512
     token_pos: 64
@@ -35,7 +35,8 @@ corpus:
 
 training:
   batch_size: 256
-  lr: 1.0e-3
+  lr: 5.0e-4              # rev-5: lowered from 1.0e-3; paired with warmup below.
+  lr_warmup_steps: 500    # rev-5: linear warmup over the first 500 optimizer steps.
   epochs: 100
   beta_max: 0.01          # was 1.0; reduced to avoid posterior collapse (see outputs/analysis_0516/)
   beta_anneal_epochs: 60  # was 30; slower ramp gives encoder room to find latent structure

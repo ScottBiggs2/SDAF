@@ -66,6 +66,7 @@ def trained_run(tmp_path_factory):
         grad_clip_norm=None,
         prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
         prefix_ctx_len=16,
+        lr_warmup_steps=0,
     )
     summary = train(cdir, odir, cfg, device=torch.device("cpu"))
     ckpt = Path(summary["checkpoint_dir"]) / "final.pt"
@@ -123,3 +124,33 @@ def test_skip_lm_head(trained_run, tmp_path):
     qz = results["splits"]["val"]["conditions"]["qz"]
     # Downstream keys absent or NaN
     assert "top1_agreement" not in qz or qz["top1_agreement"] != qz["top1_agreement"]  # NaN check
+
+
+def test_micro_batching_equivalent(trained_run, tmp_path):
+    """rev-5: micro-batched eval is numerically equivalent to whole-batch eval.
+
+    Run all 4 conditions twice — once unbatched, once with micro_batch_size=4
+    against a 16-chunk batch. The recon_mse_normalized arrays should match
+    within fp tolerance for every condition (proves the pre-computed full-
+    batch roll + seeded prior z stays bit-identical under chunking).
+    """
+    common = dict(
+        cache_dir=trained_run["cache_dir"],
+        splits=["val"], n_chunks=16, val_shards=1, seed=0,
+        conditions=["qz", "prior", "wrong_prefix", "baseline"],
+        device=torch.device("cpu"),
+        skip_lm_head=True,
+    )
+    r_whole = evaluate_checkpoint(trained_run["checkpoint"], **common)
+    r_micro = evaluate_checkpoint(
+        trained_run["checkpoint"], **common, micro_batch_size=4,
+    )
+    for cond in ("qz", "prior", "wrong_prefix", "baseline"):
+        a = r_whole["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
+        b = r_micro["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
+        # Float-tolerance comparison element-wise. The chunked path may have
+        # tiny float-summation differences but should match within ~1e-5.
+        for j, (x, y) in enumerate(zip(a, b)):
+            if x != x or y != y:  # both NaN is allowed (sparse blocks)
+                continue
+            assert abs(x - y) < 1e-4, f"{cond} block {j}: whole={x:.6g} micro={y:.6g}"

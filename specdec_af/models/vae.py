@@ -38,7 +38,7 @@ D_K_DEFAULT = 16
 K_MAX_DEFAULT = 16
 
 D_COND_DEFAULT = D_PREFIX_DEFAULT + D_TOKEN_POS_DEFAULT + D_BLOCK_DEFAULT + D_K_DEFAULT  # 656
-D_LATENT_DEFAULT = 64
+D_LATENT_DEFAULT = 128  # rev-5: bumped from 64 (Z_trace = 12 × d_latent per token)
 
 
 class ConditionAssembler(nn.Module):

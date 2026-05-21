@@ -143,6 +143,7 @@ def forward_under_condition(
     *,
     condition: Condition,
     seed: int = 0,
+    micro_batch_size: int | None = None,
 ) -> Tensor:
     """Returns ``recon`` under the named condition. ``z = mu`` (deterministic)
     for encoder-z conditions; ``z ~ N(0, I)`` for prior conditions.
@@ -152,6 +153,12 @@ def forward_under_condition(
     (matches Phase-7 plan: "encoder z, shuffled prefix"). Under rev-4 this
     shuffles **token sequences**, not pre-computed activation features —
     numerically non-comparable with v1–v3 evaluations.
+
+    ``micro_batch_size`` (rev-5): if set and ``< B``, the PE / VAE forward is
+    chunked into sub-batches of this size and recons are concatenated. Full-
+    batch quantities (the ``torch.roll`` shuffle and the seeded prior z)
+    are computed once over the whole batch and then sliced, so the result is
+    bit-identical to the unbatched path when ``micro_batch_size >= B``.
     """
     chunk_raw = batch["chunk_raw"]
     block_ids = batch["block_ids"]
@@ -160,28 +167,41 @@ def forward_under_condition(
     prefix_ids = batch["prefix_ids"]
     B = chunk_raw.shape[0]
 
-    chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
-
-    # Encoder always sees correct prefix; z is mu or prior depending on condition.
-    cond_for_encoder = cond_assembler(
-        prefix_encoder(prefix_ids), i_idx, block_ids, k_val,
-    )
-    if condition in ("qz", "wrong_prefix"):
-        mu, _ = vae.encode(chunk_norm_input, cond_for_encoder)
-        z = mu
-    else:  # prior, baseline
-        g = torch.Generator(device=chunk_raw.device).manual_seed(seed)
-        z = torch.randn(B, vae.d_latent, device=chunk_raw.device, generator=g)
-
-    # Decoder sees correct or shuffled prefix (token sequences shuffled, rev-4).
+    # Pre-compute full-batch quantities (preserves wrong_prefix roll semantics
+    # and seeded prior sampling under micro-batching).
     if condition in ("wrong_prefix", "baseline"):
         prefix_ids_for_decoder = torch.roll(prefix_ids, shifts=1, dims=0)
     else:
         prefix_ids_for_decoder = prefix_ids
-    cond_for_decoder = cond_assembler(
-        prefix_encoder(prefix_ids_for_decoder), i_idx, block_ids, k_val,
-    )
-    return vae.decode(z, cond_for_decoder)
+
+    if condition in ("prior", "baseline"):
+        g = torch.Generator(device=chunk_raw.device).manual_seed(seed)
+        z_full = torch.randn(B, vae.d_latent, device=chunk_raw.device, generator=g)
+    else:
+        z_full = None  # encoder produces z per slice for qz / wrong_prefix
+
+    mbs = B if micro_batch_size is None or micro_batch_size >= B else int(micro_batch_size)
+
+    recons = []
+    for start in range(0, B, mbs):
+        end = min(start + mbs, B)
+        sl = slice(start, end)
+        cnorm_slice = chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl])
+        cond_for_encoder = cond_assembler(
+            prefix_encoder(prefix_ids[sl]), i_idx[sl], block_ids[sl], k_val[sl],
+        )
+        if z_full is None:  # qz / wrong_prefix: z = encoder.mu
+            mu, _ = vae.encode(cnorm_slice, cond_for_encoder)
+            z = mu
+        else:
+            z = z_full[sl]
+        cond_for_decoder = cond_assembler(
+            prefix_encoder(prefix_ids_for_decoder[sl]),
+            i_idx[sl], block_ids[sl], k_val[sl],
+        )
+        recons.append(vae.decode(z, cond_for_decoder))
+
+    return torch.cat(recons, dim=0)
 
 
 # ----------------------------------------------------------------------
@@ -333,6 +353,7 @@ def evaluate_split(
     seed: int,
     conditions: Iterable[Condition],
     device: torch.device | str,
+    micro_batch_size: int | None = None,
 ) -> dict:
     """Evaluate one split (already-sampled batch) across all conditions."""
     batch = sample_batch_from_dataset(ds, n_chunks, seed=seed, device=device)
@@ -340,7 +361,7 @@ def evaluate_split(
     for cond in conditions:
         recon = forward_under_condition(
             vae, prefix_encoder, cond_assembler, chunk_norm, batch,
-            condition=cond, seed=seed,
+            condition=cond, seed=seed, micro_batch_size=micro_batch_size,
         )
         out["conditions"][cond] = compute_all_metrics(
             recon, batch, chunk_norm, lm_head, mode=mode,
@@ -359,6 +380,7 @@ def evaluate_checkpoint(
     conditions: list[Condition],
     device: torch.device,
     skip_lm_head: bool = False,
+    micro_batch_size: int | None = None,
 ) -> dict:
     loaded = load_vae_checkpoint(checkpoint_path, device=device)
     vae = loaded["vae"]
@@ -396,6 +418,7 @@ def evaluate_checkpoint(
             vae, pe, ca, chunk_norm, split_map[sp], lm_head,
             mode=mode, n_chunks=n_chunks, seed=seed,
             conditions=conditions, device=device,
+            micro_batch_size=micro_batch_size,
         )
         # print a brief per-condition summary
         for cond, m in results["splits"][sp]["conditions"].items():
@@ -541,6 +564,9 @@ def main() -> int:
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--skip-lm-head", action="store_true",
                    help="omit downstream CE/top1/perplexity metrics")
+    p.add_argument("--eval-micro-batch-size", type=int, default=None,
+                   help="rev-5: cap PE/VAE memory by chunking the forward pass. "
+                        "None = process whole batch at once (default; bit-identical).")
     args = p.parse_args()
 
     if args.cache_dir is None:
@@ -560,6 +586,7 @@ def main() -> int:
         val_shards=args.val_shards, seed=args.seed,
         conditions=args.conditions, device=device,
         skip_lm_head=args.skip_lm_head,
+        micro_batch_size=args.eval_micro_batch_size,
     )
     write_summary(results, out_dir)
     plot_bars(results, out_dir)

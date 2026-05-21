@@ -96,17 +96,29 @@ def test_earlier_token_flip_changes_output_via_attention(gpt2_for_pe):
     assert not torch.allclose(out_a, out_b)
 
 
-def test_causal_mask_registered():
+def test_no_explicit_causal_mask_buffer(gpt2_for_pe):
+    """rev-5: the causal_mask buffer is gone — SDPA enforces causality internally."""
     pe = PrefixEncoder()
-    # Mask is a non-persistent buffer of shape [ctx_len, ctx_len], bool, upper-triangular.
-    mask = pe.causal_mask
-    assert mask.shape == (128, 128)
-    assert mask.dtype == torch.bool
-    # Diagonal and below are not masked; strict upper triangle is.
-    assert not mask[0, 0]
-    assert mask[0, 1]
-    assert not mask[127, 127]
-    assert not mask[127, 0]
+    assert not hasattr(pe, "causal_mask")
+    # Causality is still in effect: flipping a token at position 0 must propagate
+    # through 2 attention layers and change the last-token pooled output.
+    pe.load_gpt2_embeddings(gpt2_for_pe)
+    torch.manual_seed(0)
+    ids = torch.randint(0, 50257, (1, 128))
+    out_a = pe(ids)
+    ids[0, 0] = (ids[0, 0] + 1) % 50257
+    out_b = pe(ids)
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_sdpa_path_handles_large_batch(gpt2_for_pe):
+    """rev-5: SDPA fast path means the old [B*H, L, L] OOM at eval n_chunks=8192
+    no longer happens. A 256-row batch on CPU is the smallest meaningful smoke."""
+    pe = PrefixEncoder()
+    pe.load_gpt2_embeddings(gpt2_for_pe)
+    ids = torch.randint(0, 50257, (256, 128))
+    out = pe(ids)
+    assert out.shape == (256, 512)
 
 
 def test_get_config_roundtrip():

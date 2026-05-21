@@ -85,6 +85,7 @@ def test_train_smoke_25_steps(cache_dir_with_stats, tmp_path, mode):
         prefix_n_heads=4,
         prefix_d_ff=512,
         prefix_ctx_len=16,         # matches cache_dir_with_stats fixture
+        lr_warmup_steps=0,         # no warmup so the smoke trajectory check is clean
     )
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
 
@@ -151,6 +152,7 @@ def test_train_smoke_with_free_bits(cache_dir_with_stats, tmp_path):
         grad_clip_norm=None,
         prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
         prefix_ctx_len=16,
+        lr_warmup_steps=0,
     )
     output_dir = tmp_path / "run_free_bits"
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
@@ -182,6 +184,7 @@ def test_train_smoke_with_grad_clipping(cache_dir_with_stats, tmp_path):
         grad_clip_norm=1.0,
         prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
         prefix_ctx_len=16,
+        lr_warmup_steps=0,
     )
     output_dir = tmp_path / "run_grad_clip"
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
@@ -194,3 +197,38 @@ def test_train_smoke_with_grad_clipping(cache_dir_with_stats, tmp_path):
         f"recon never decreased below step-0 ({recons[0]:.4g}); "
         f"trajectory min={min(recons):.4g} max={max(recons):.4g}"
     )
+
+
+def test_train_smoke_with_lr_warmup(cache_dir_with_stats, tmp_path):
+    """rev-5 LR warmup smoke. lr_warmup_steps=10 → effective lr ramps from
+    lr/10 at step 0 to lr at step 10+. The training log's `lr` column should
+    reflect this ramp, not the constant configured value.
+    """
+    target_lr = 1e-3
+    cfg = TrainConfig(
+        mode="option_4", batch_size=8, lr=target_lr, n_epochs=5,
+        beta_max=0.01, beta_anneal_epochs=2, free_bits=0.0,
+        log_every=1, val_every_steps=0, checkpoint_every_steps=0,
+        val_max_batches=4, n_steps_override=25, seed=0,
+        num_workers=0, pin_memory=False,
+        grad_clip_norm=None,
+        prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
+        prefix_ctx_len=16,
+        lr_warmup_steps=10,
+    )
+    output_dir = tmp_path / "run_warmup"
+    summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
+    log_path = Path(summary["training_log_csv"])
+    with open(log_path) as fh:
+        rows = list(csv.DictReader(fh))
+    lrs = [float(r["lr"]) for r in rows]
+    # The CSV row is written AFTER scheduler.step() at each logged step, so
+    # lrs[0] reflects the first warmup-incremented lr (= target_lr * 2/warmup_steps
+    # under our LambdaLR formula). Either way it must be < target.
+    assert lrs[0] < target_lr, f"step 0 lr={lrs[0]:.4g} should be below target {target_lr}"
+    # Warmup should be monotone non-decreasing across at least the first 10 steps.
+    warmup_lrs = lrs[:11]
+    for a, b in zip(warmup_lrs, warmup_lrs[1:]):
+        assert b >= a - 1e-12, f"lr decreased during warmup: {a} → {b}"
+    # By the end the warmup is complete; final-step lr equals target.
+    assert abs(lrs[-1] - target_lr) < 1e-9, f"final lr={lrs[-1]:.4g}, expected {target_lr}"
