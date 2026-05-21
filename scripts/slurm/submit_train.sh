@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/train-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/train-%j.err
 
