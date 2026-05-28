@@ -46,9 +46,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-CONDITIONS = ("qz", "prior", "wrong_prefix", "baseline")
+CONDITIONS = ("qz", "prior", "wrong_prefix", "wrong_z", "baseline")
 CONDITION_COLORS = {"qz": "tab:green", "prior": "tab:blue",
-                    "wrong_prefix": "tab:orange", "baseline": "tab:red"}
+                    "wrong_prefix": "tab:orange", "wrong_z": "tab:purple",
+                    "baseline": "tab:red"}
 
 
 # ----------------------------------------------------------------------

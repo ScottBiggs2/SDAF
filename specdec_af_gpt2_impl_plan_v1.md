@@ -8,7 +8,17 @@
 
 ## Change log
 
-### rev. 5 (current)
+### rev. 6 (current)
+
+- **Decoder-only conditioning.** Encoder loses `cond` entirely. `Encoder.__init__(d_chunk, d_latent)` (no `d_cond`); `Encoder.forward(chunk_norm)`; `CondVAE.encode(chunk_norm)`. Decoder unchanged — still gets `(z, cond)`. `CondVAE.forward(chunk_norm, cond)` signature preserved, only the internal plumbing changes.
+- **Why:** the chunk fed to the VAE encoder is GPT-2's forward pass on `(prefix + window)`, so it already encodes prefix-derived info densely. We were *also* conditioning the encoder on `prefix_emb` from the same tokens, giving the optimizer two correlated paths into `(mu, logvar)`. It collapsed onto chunk and ignored cond. v4 evidence: `qz` and `wrong_prefix` produced bit-identical metrics in optiond_v4 (top1=0.4086 ≡ 0.4086 across CE, ppl, KL, terminal_mse on 8192 sampled chunks). After this rev, cond is the *only* path for prefix info into the decoder — the optimizer is forced to use it.
+- **`wrong_z` added as 5th eval condition.** Decoder gets correct prefix but a rolled `z` (different chunk's encoder mu). Direct readout on whether the cond pathway is now contributing — if `wrong_z` recon stays good, decoder is still mostly z-driven; if it degrades meaningfully, cond is alive. Two-pass implementation under micro-batching (encoder over full batch first, then roll, then decode per slice).
+- **Checkpoint format_version: 1 → 2.** Pre-rev-6 checkpoints (v1–v4) are architecturally incompatible. `load_vae_checkpoint` raises a new `IncompatibleVAEEncoderError` on mismatch with a clear retrain pointer. The rev-4 `IncompatiblePrefixEncoderError` class is kept as a public symbol for downstream import compat but its check is removed (subsumed by the format_version gate).
+- **VAE trainable params: 48.05M → 46.70M** (encoder's first Linear drops 656×2048 = 1.34M from the cond projection).
+- **Hyperparameters unchanged from rev-5.** Architectural change is the only variable: `d_latent=128`, `lr=5e-4` + warmup 500, `β_max=0.01`, `free_bits=0.1`, `grad_clip 1.0`, prefix-PE 2 blocks / 12 heads / 3072 ff.
+- **Future:** classifier-free guidance (training with a "null prefix" token sequence mixed in) is the natural follow-on if rev-6's cond pathway is alive but weak. Deferred.
+
+### rev. 5 (superseded by rev. 6)
 
 - **Eval OOM fix.** The rev-4 v3 sweep trained successfully but evaluation
   OOM'd inside the PrefixEncoder self-attention at the SLURM-default
@@ -120,6 +130,9 @@ Self-contained list of what's settled and what isn't. New decisions and their re
 | **PE input modality: token IDs** (rev-4 commitment) — frozen GPT-2 `wte+wpe` → 2 pre-LN transformer blocks → last-token-pool → 512-d | DECIDED | rev-4 | Architectural commitment, not coordinate change: removes the inference-time teacher dependency, unblocking AR rollouts (E3) and clean OOD evals (E2). |
 | **PE attention backend: `F.scaled_dot_product_attention(is_causal=True)`** with manual QKV projections | DECIDED | rev-5 | Fixes eval OOM at n_chunks=8192. FlashAttention / memory-efficient kernel dispatch is automatic. Same param count as the rev-4 `nn.MultiheadAttention` setup; only state_dict naming differs. |
 | **`d_latent` per-chunk latent dim: 128** | DECIDED | rev-5 | Bumped from rev-3's implicit 64. Z_trace = 12×128 = 1536-d per token. Conservative 2x bump; +98K VAE params. 256 stays available as a follow-on ablation if 128 underfits. |
+| **Encoder conditions on `cond` (prefix_emb + block + i + k)** | SUPERSEDED | rev-6 | Replaced by decoder-only conditioning. The chunk already encodes prefix-derived info (it's GPT-2's forward pass on prefix+window), so dual-conditioning the encoder created a redundant pathway that the optimizer collapsed onto chunk, killing the cond pathway. v4 evidence: optiond_v4 had qz ≡ wrong_prefix on five metrics. |
+| **Encoder = `q(z \| chunk)` only; Decoder = `p(chunk \| z, cond)`** (textbook conditional VAE) | DECIDED | rev-6 | Forces cond onto the gradient path: it's the only place prefix info enters at decode time. Also more aligned with CFM stackability — shared block-agnostic encoder produces per-block latents with consistent geometry. |
+| **`wrong_z` eval condition added** (decoder gets correct prefix, rolled z) | DECIDED | rev-6 | Direct diagnostic for cond-pathway liveness, complementary to `wrong_prefix`. Not in the milestone gate (informational). |
 | `embed_out` hooked on `transformer.drop` output | DECIDED | Phase 1 | Identity in `model.eval()`. Frozen-teacher inference is always eval. Re-evaluate if teacher is ever fine-tuned (dropout would otherwise silently contaminate the chunk). |
 | `lm_head_out` excluded from the trace; applied externally to terminal slot | DECIDED | rev-2 | Promotion to a slot is the first lever if Phase 7 check 2 (above-marginal-mode floor) is soft. |
 

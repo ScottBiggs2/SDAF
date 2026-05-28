@@ -177,7 +177,7 @@ def run_validation(
 
         chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
         cond = cond_assembler(prefix_encoder(prefix_ids), i_idx, block_ids, k_val)
-        mu, logvar = vae.encode(chunk_norm_input, cond)
+        mu, logvar = vae.encode(chunk_norm_input)  # rev-6: encoder ignores cond
         recon = vae.decode(mu, cond)  # deterministic for eval
         sums["recon"] += chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
         sums["kl"] += kl_divergence(mu, logvar).item()

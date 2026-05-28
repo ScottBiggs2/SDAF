@@ -36,22 +36,21 @@ outputs/from_hpc/
 
 ```bash
 # Training (sets β/free-bits/lr defaults from configs/default.yaml):
-RUN_NAME=k1_option4_v4 MODE=option_4 sbatch scripts/slurm/submit_train.sh
-RUN_NAME=k1_optiond_v4 MODE=option_d sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_option4_v5 MODE=option_4 sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_optiond_v5 MODE=option_d sbatch scripts/slurm/submit_train.sh
 
-# Evaluation (after training lands; rev-5 SDPA path makes n_chunks=8192 fit on V100):
-RUN_NAME=k1_option4_v4 sbatch scripts/slurm/submit_evaluate.sh
-RUN_NAME=k1_optiond_v4 sbatch scripts/slurm/submit_evaluate.sh
+# Evaluation (rev-5 lesson: pass EVAL_MICRO_BATCH_SIZE so the FFN intermediate fits on V100):
+EVAL_MICRO_BATCH_SIZE=1024 RUN_NAME=k1_option4_v5 sbatch scripts/slurm/submit_evaluate.sh
+EVAL_MICRO_BATCH_SIZE=1024 RUN_NAME=k1_optiond_v5 sbatch scripts/slurm/submit_evaluate.sh
 
 # Optional env-var overrides:
 # BETA_MAX=0.05 RUN_NAME=k1_option4_b0.05 sbatch scripts/slurm/submit_train.sh
-# EVAL_MICRO_BATCH_SIZE=2048 RUN_NAME=k1_option4_v4 sbatch scripts/slurm/submit_evaluate.sh
 ```
 
 ### 2. Pull artifacts down
 
 ```bash
-RUNS=(k1_option4_v4 k1_optiond_v4)
+RUNS=(k1_option4_v5 k1_optiond_v5)
 mkdir -p outputs/from_hpc/eval
 for r in "${RUNS[@]}"; do
   mkdir -p "outputs/from_hpc/$r" "outputs/from_hpc/eval/$r"
@@ -231,3 +230,54 @@ done
    pattern in the first 500 steps).
 4. `compare_per_block_qz.png` — block 11 was the v2/v3 bottleneck; check whether
    the d_latent bump flattens it.
+
+## rev-6 (decoder-only conditioning + wrong_z) — v5 sweep
+
+The v4 sweep cleared the milestone floor but surfaced a structural failure:
+in optiond_v4, `qz` and `wrong_prefix` produced **bit-identical** metrics
+(top1 ≡ 0.4086 across CE, ppl, KL, terminal_mse on 8192 sampled chunks). The
+decoder had stopped reading `cond`. Mechanism: the chunk is GPT-2's forward
+pass on `(prefix + window)`, so it already encodes prefix info densely; the
+encoder also got `prefix_emb` via `cond`; the optimizer collapsed both
+pathways onto chunk and the cond pathway atrophied.
+
+**Three changes in rev-6 fix this:**
+
+- **Decoder-only conditioning.** `Encoder.forward(chunk_norm)` only — no
+  `cond`. Decoder still gets `(z, cond)`. Cond is now the *only* path for
+  prefix info to enter the decoder, so the optimizer must use it.
+- **`wrong_z` ablation added** (5th eval condition). Decoder gets correct
+  prefix but a *rolled* `z` (different chunk's encoder mu). Direct readout
+  on whether the cond pathway is now contributing.
+- **Checkpoint format_version: 1 → 2.** Pre-rev-6 checkpoints
+  (`k1_*_v4` included) fail-fast with `IncompatibleVAEEncoderError` on load.
+
+**Launch the v5 sweep:**
+
+```bash
+RUN_NAME=k1_option4_v5 MODE=option_4 sbatch scripts/slurm/submit_train.sh
+RUN_NAME=k1_optiond_v5 MODE=option_d sbatch scripts/slurm/submit_train.sh
+for r in k1_option4_v5 k1_optiond_v5; do
+  EVAL_MICRO_BATCH_SIZE=1024 RUN_NAME=$r sbatch scripts/slurm/submit_evaluate.sh
+done
+```
+
+**What to look at in the v5 analyzer outputs:**
+
+1. `comparison.txt` — the `qz_vs_wrong_prefix` gap should grow substantially
+   for both modes (v4 optiond was 0.0000; we want ≥+0.10 minimum).
+2. `compare_top1.png` — new `wrong_z` purple bar should be **lower** than
+   `qz` for both modes. If `wrong_z ≈ qz`, the decoder is still mostly
+   z-driven and the architectural fix didn't fully bite. If `wrong_z < qz`
+   by a clear margin, the cond pathway is alive.
+3. `compare_per_block_qz.png` — recon quality should be preserved (within
+   ~10% of v4 baseline). A clear regression below v4's qz_top1 means the
+   architectural change traded conditioning for capacity.
+4. **Cross-rev comparability:** v5 vs. v4 numbers for `qz_top1` and the
+   gaps are directly comparable — same cache, same hyperparams, only the
+   encoder's cond access changed.
+
+**Final adjudication:** post-v5, both modes are on "even and meaningful
+ground" — the redundant-pathway pathology that made v2/v4 comparison
+unfair is gone. The val `qz_top1` winner with healthy `qz_vs_wrong_prefix`
+gap is the option_4 vs option_d call.

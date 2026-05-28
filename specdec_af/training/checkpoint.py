@@ -33,11 +33,24 @@ class IncompatiblePrefixEncoderError(RuntimeError):
     v1–v3 checkpoints saved an MLP-over-activations PrefixEncoder (config keys
     ``n_layers``, ``d_block``, ``d_out``, ``hidden_dims``). The rev-4 token-ID
     PrefixEncoder uses a different input modality (token IDs vs. concatenated
-    activations) and is architecturally incompatible; loading silently would
-    fail with a shape mismatch deep in the forward pass.
+    activations) and is architecturally incompatible.
 
-    Retraining under rev-4 (which can reuse existing cache shards, since
-    ``prefix_ids`` is already cached) is required.
+    Kept for backwards-import compatibility under rev-6; the explicit check
+    in :func:`load_vae_checkpoint` was subsumed by the ``format_version`` gate.
+    """
+
+
+class IncompatibleVAEEncoderError(RuntimeError):
+    """Raised when a pre-rev-6 checkpoint is loaded.
+
+    rev-6 dropped ``cond`` from the VAE encoder's input — ``Encoder.__init__``
+    no longer takes ``d_cond``, so the first ``Linear`` shrank from 10640 →
+    9984 input features. Pre-rev-6 state_dicts (format_version=1) cannot load
+    into the current architecture; the failure mode without this check would
+    be an opaque shape mismatch deep in ``load_state_dict``.
+
+    The cache shards and ``chunk_norm_stats.pt`` are unaffected — retrain
+    under the current code to produce rev-6 checkpoints.
     """
 
 
@@ -57,7 +70,7 @@ def save_vae_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     state: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,  # rev-6: encoder no longer conditions on cond
         "mode": mode,
         "step": int(step),
         "training_config": dict(training_config) if training_config else {},
@@ -98,8 +111,17 @@ def load_vae_checkpoint(
     """
     path = Path(path)
     state = torch.load(path, map_location="cpu", weights_only=True)
-    if state.get("format_version") != 1:
-        raise ValueError(f"unsupported checkpoint format_version {state.get('format_version')}")
+    fmt = state.get("format_version")
+    if fmt != 2:
+        # rev-6 gate: format_version 1 means encoder was conditioned on cond
+        # (input dim 10640) — architecturally incompatible with the current
+        # encoder (input dim 9984). Subsumes the older rev-4 PE check.
+        raise IncompatibleVAEEncoderError(
+            f"Checkpoint at {path} has format_version={fmt}; rev-6 requires "
+            f"format_version=2 (encoder dropped cond, input dim 10640 → 9984). "
+            f"The cache + ChunkNorm stats are still reusable — retrain under "
+            f"the current code."
+        )
 
     chunk_norm = ChunkNorm(n_layers=state["chunk_norm"]["n_layers"], eps=state["chunk_norm"]["eps"])
     chunk_norm.load_state_dict(state["chunk_norm"]["state_dict"])
@@ -111,16 +133,6 @@ def load_vae_checkpoint(
     vae.load_state_dict(state["vae"]["state_dict"])
 
     pe_cfg = state["prefix_encoder"]["config"]
-    # rev-4 gate: old MLP-over-activations checkpoints carry a `hidden_dims`
-    # key and no `n_attn_blocks`. They're not loadable under the new design.
-    if "hidden_dims" in pe_cfg and "n_attn_blocks" not in pe_cfg:
-        raise IncompatiblePrefixEncoderError(
-            f"Checkpoint at {path} was saved with a pre-rev-4 MLP PrefixEncoder "
-            f"(config keys: {sorted(pe_cfg.keys())}). The rev-4 token-ID design is "
-            f"architecturally incompatible (different input modality). Retrain under "
-            f"the current code — existing cache shards can be reused because "
-            f"prefix_ids was already written at collection time."
-        )
     prefix_encoder = PrefixEncoder(**pe_cfg)
     prefix_encoder.load_state_dict(state["prefix_encoder"]["state_dict"])
 

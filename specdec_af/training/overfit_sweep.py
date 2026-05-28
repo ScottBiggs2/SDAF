@@ -292,7 +292,7 @@ def eval_pass(
     """
     prefix_emb = prefix_encoder(prefix_ids)
     cond = cond_assembler(prefix_emb, i_idx, block_ids, k_val)
-    mu, _logvar = vae.encode(chunk_norm_input, cond)
+    mu, _logvar = vae.encode(chunk_norm_input)  # rev-6: encoder ignores cond
     recon = vae.decode(mu, cond)
 
     rl = chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()

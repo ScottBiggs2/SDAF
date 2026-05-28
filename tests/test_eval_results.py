@@ -51,7 +51,7 @@ def _make_metrics(*, mode: str, top1_qz: float, top1_prior: float,
         "n_params": 70_000_000,
         "n_chunks_requested": 1024,
         "seed": 42,
-        "conditions": ["qz", "prior", "wrong_prefix", "baseline"],
+        "conditions": ["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
         "splits": {
             "val": {
                 "n_chunks_sampled": 1024,
@@ -59,6 +59,10 @@ def _make_metrics(*, mode: str, top1_qz: float, top1_prior: float,
                     "qz": cond(top1_qz),
                     "prior": cond(top1_prior),
                     "wrong_prefix": cond(top1_wrong),
+                    # rev-6: wrong_z slots between wrong_prefix and baseline.
+                    # Synthesize as halfway between qz and prior — plausible
+                    # value, the analyzer just needs the key to exist.
+                    "wrong_z": cond((top1_qz + top1_prior) / 2),
                     "baseline": cond(top1_baseline),
                 },
             },

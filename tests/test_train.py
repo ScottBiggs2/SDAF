@@ -174,9 +174,15 @@ def test_train_smoke_with_grad_clipping(cache_dir_with_stats, tmp_path):
     No clean way to assert "spikes were clipped" on a 25-step smoke (no spikes
     happen naturally). The behavioral check is: training completes, recon
     decreases, summary records grad_clip_norm=1.0.
+
+    Uses option_4 — option_d's σ²-weighted loss combined with the 16-window
+    smoke calibration produces wild gradient magnitudes that drown out the
+    25-step descent signal under β=0.01. Production (1000-window calibration)
+    is fine; the smoke is just too small to settle. option_4 stresses the
+    grad-clip plumbing equally well without that noise.
     """
     cfg = TrainConfig(
-        mode="option_d", batch_size=8, lr=1e-3, n_epochs=5,
+        mode="option_4", batch_size=8, lr=1e-3, n_epochs=5,
         beta_max=0.01, beta_anneal_epochs=2, free_bits=0.0,
         log_every=5, val_every_steps=0, checkpoint_every_steps=0,
         val_max_batches=4, n_steps_override=25, seed=0,

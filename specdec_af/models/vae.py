@@ -82,20 +82,21 @@ class ConditionAssembler(nn.Module):
 
 
 class Encoder(nn.Module):
-    """``concat(chunk_norm, cond)`` → ``(mu, logvar)`` per the plan widths.
+    """``chunk_norm`` → ``(mu, logvar)`` — rev-6: encoder no longer sees ``cond``.
 
-    Architecture: 3 × (Linear + LayerNorm + GELU) tower 10640 → 2048 → 1024 → 512,
-    then ``mu`` and ``logvar`` heads to ``d_latent``.
+    Architecture: 3 × (Linear + LayerNorm + GELU) tower d_chunk → 2048 → 1024 → 512,
+    then ``mu`` and ``logvar`` heads to ``d_latent``. The encoder is a shared,
+    block-agnostic chunk autoencoder; all prefix / block / position / k
+    conditioning happens only in the decoder (see :class:`Decoder`).
     """
 
     def __init__(
         self,
         d_chunk: int = D_CHUNK,
-        d_cond: int = D_COND_DEFAULT,
         d_latent: int = D_LATENT_DEFAULT,
     ) -> None:
         super().__init__()
-        d_in = d_chunk + d_cond
+        d_in = d_chunk
         self.tower = nn.Sequential(
             nn.Linear(d_in, 2048), nn.LayerNorm(2048), nn.GELU(),
             nn.Linear(2048, 1024), nn.LayerNorm(1024), nn.GELU(),
@@ -104,8 +105,8 @@ class Encoder(nn.Module):
         self.mu = nn.Linear(512, d_latent)
         self.logvar = nn.Linear(512, d_latent)
 
-    def forward(self, chunk_norm: Tensor, cond: Tensor) -> tuple[Tensor, Tensor]:
-        h = self.tower(torch.cat([chunk_norm, cond], dim=-1))
+    def forward(self, chunk_norm: Tensor) -> tuple[Tensor, Tensor]:
+        h = self.tower(chunk_norm)
         return self.mu(h), self.logvar(h)
 
 
@@ -150,11 +151,12 @@ class CondVAE(nn.Module):
             raise ValueError(f"unknown decoder_output_space: {decoder_output_space!r}")
         self.decoder_output_space = decoder_output_space
         self.d_latent = d_latent
-        self.encoder = Encoder(d_chunk, d_cond, d_latent)
+        # rev-6: encoder is block-agnostic and unconditioned; decoder still gets cond.
+        self.encoder = Encoder(d_chunk, d_latent)
         self.decoder = Decoder(d_chunk, d_cond, d_latent)
 
-    def encode(self, chunk_norm: Tensor, cond: Tensor) -> tuple[Tensor, Tensor]:
-        return self.encoder(chunk_norm, cond)
+    def encode(self, chunk_norm: Tensor) -> tuple[Tensor, Tensor]:
+        return self.encoder(chunk_norm)
 
     @staticmethod
     def reparameterize(mu: Tensor, logvar: Tensor) -> Tensor:
@@ -165,7 +167,8 @@ class CondVAE(nn.Module):
         return self.decoder(z, cond)
 
     def forward(self, chunk_norm: Tensor, cond: Tensor) -> dict[str, Tensor]:
-        mu, logvar = self.encode(chunk_norm, cond)
+        # cond is intentionally NOT passed to the encoder (rev-6).
+        mu, logvar = self.encode(chunk_norm)
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z, cond)
         return {"recon": recon, "mu": mu, "logvar": logvar, "z": z}

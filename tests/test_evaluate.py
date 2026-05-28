@@ -78,7 +78,7 @@ def test_evaluate_end_to_end(trained_run, tmp_path):
     results = evaluate_checkpoint(
         trained_run["checkpoint"], trained_run["cache_dir"],
         splits=["val"], n_chunks=16, val_shards=1, seed=0,
-        conditions=["qz", "prior", "wrong_prefix", "baseline"],
+        conditions=["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
         device=torch.device("cpu"),
         skip_lm_head=False,
     )
@@ -87,7 +87,7 @@ def test_evaluate_end_to_end(trained_run, tmp_path):
     assert results["mode"] == "option_4"
     assert "val" in results["splits"]
     conds = results["splits"]["val"]["conditions"]
-    assert set(conds.keys()) == {"qz", "prior", "wrong_prefix", "baseline"}
+    assert set(conds.keys()) == {"qz", "prior", "wrong_prefix", "wrong_z", "baseline"}
 
     # Each condition has full metric dict
     for cond, m in conds.items():
@@ -128,16 +128,17 @@ def test_skip_lm_head(trained_run, tmp_path):
 
 def test_micro_batching_equivalent(trained_run, tmp_path):
     """rev-5: micro-batched eval is numerically equivalent to whole-batch eval.
+    rev-6: extended to cover the new wrong_z condition (two-pass forward).
 
-    Run all 4 conditions twice — once unbatched, once with micro_batch_size=4
+    Run all 5 conditions twice — once unbatched, once with micro_batch_size=4
     against a 16-chunk batch. The recon_mse_normalized arrays should match
     within fp tolerance for every condition (proves the pre-computed full-
-    batch roll + seeded prior z stays bit-identical under chunking).
+    batch rolls + seeded prior z stay bit-identical under chunking).
     """
     common = dict(
         cache_dir=trained_run["cache_dir"],
         splits=["val"], n_chunks=16, val_shards=1, seed=0,
-        conditions=["qz", "prior", "wrong_prefix", "baseline"],
+        conditions=["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
         device=torch.device("cpu"),
         skip_lm_head=True,
     )
@@ -145,7 +146,7 @@ def test_micro_batching_equivalent(trained_run, tmp_path):
     r_micro = evaluate_checkpoint(
         trained_run["checkpoint"], **common, micro_batch_size=4,
     )
-    for cond in ("qz", "prior", "wrong_prefix", "baseline"):
+    for cond in ("qz", "prior", "wrong_prefix", "wrong_z", "baseline"):
         a = r_whole["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
         b = r_micro["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
         # Float-tolerance comparison element-wise. The chunked path may have

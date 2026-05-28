@@ -79,8 +79,10 @@ from specdec_af.training.overfit_sweep import load_lm_head_only
 
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
-Condition = Literal["qz", "prior", "wrong_prefix", "baseline"]
-ALL_CONDITIONS: tuple[Condition, ...] = ("qz", "prior", "wrong_prefix", "baseline")
+Condition = Literal["qz", "prior", "wrong_prefix", "wrong_z", "baseline"]
+ALL_CONDITIONS: tuple[Condition, ...] = (
+    "qz", "prior", "wrong_prefix", "wrong_z", "baseline",
+)
 
 
 def expand_env(s: str) -> str:
@@ -154,9 +156,14 @@ def forward_under_condition(
     shuffles **token sequences**, not pre-computed activation features —
     numerically non-comparable with v1–v3 evaluations.
 
+    rev-6 adds ``wrong_z``: the decoder gets the correct prefix but a *rolled*
+    ``z`` (a different chunk's encoder mu). This is the diagnostic counterpart
+    to ``wrong_prefix`` — if recon degrades meaningfully under wrong_z, the
+    cond pathway is contributing; if it stays good, z is doing all the work.
+
     ``micro_batch_size`` (rev-5): if set and ``< B``, the PE / VAE forward is
     chunked into sub-batches of this size and recons are concatenated. Full-
-    batch quantities (the ``torch.roll`` shuffle and the seeded prior z)
+    batch quantities (the ``torch.roll`` shuffles and the seeded prior z)
     are computed once over the whole batch and then sliced, so the result is
     bit-identical to the unbatched path when ``micro_batch_size >= B``.
     """
@@ -167,31 +174,39 @@ def forward_under_condition(
     prefix_ids = batch["prefix_ids"]
     B = chunk_raw.shape[0]
 
-    # Pre-compute full-batch quantities (preserves wrong_prefix roll semantics
-    # and seeded prior sampling under micro-batching).
+    # Pre-compute full-batch quantities (preserves cross-batch semantics under
+    # micro-batching).
     if condition in ("wrong_prefix", "baseline"):
         prefix_ids_for_decoder = torch.roll(prefix_ids, shifts=1, dims=0)
     else:
         prefix_ids_for_decoder = prefix_ids
 
+    mbs = B if micro_batch_size is None or micro_batch_size >= B else int(micro_batch_size)
+
     if condition in ("prior", "baseline"):
         g = torch.Generator(device=chunk_raw.device).manual_seed(seed)
         z_full = torch.randn(B, vae.d_latent, device=chunk_raw.device, generator=g)
+    elif condition == "wrong_z":
+        # Two-pass: encoder over full batch (in micro-batches), gather mu, roll
+        # by 1 across the batch. Decoder still gets the correct prefix below.
+        mus: list[Tensor] = []
+        for start in range(0, B, mbs):
+            end = min(start + mbs, B)
+            sl = slice(start, end)
+            cnorm_slice = chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl])
+            mu, _ = vae.encode(cnorm_slice)
+            mus.append(mu)
+        z_full = torch.roll(torch.cat(mus, dim=0), shifts=1, dims=0)
     else:
         z_full = None  # encoder produces z per slice for qz / wrong_prefix
-
-    mbs = B if micro_batch_size is None or micro_batch_size >= B else int(micro_batch_size)
 
     recons = []
     for start in range(0, B, mbs):
         end = min(start + mbs, B)
         sl = slice(start, end)
         cnorm_slice = chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl])
-        cond_for_encoder = cond_assembler(
-            prefix_encoder(prefix_ids[sl]), i_idx[sl], block_ids[sl], k_val[sl],
-        )
-        if z_full is None:  # qz / wrong_prefix: z = encoder.mu
-            mu, _ = vae.encode(cnorm_slice, cond_for_encoder)
+        if z_full is None:  # qz / wrong_prefix: z = encoder.mu (single-pass)
+            mu, _ = vae.encode(cnorm_slice)  # rev-6: encoder ignores cond
             z = mu
         else:
             z = z_full[sl]

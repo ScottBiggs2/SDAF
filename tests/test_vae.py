@@ -120,6 +120,26 @@ def test_backward_every_param_gets_grad():
 
 
 # ---------------------------------------------------------------------------
+def test_encoder_drops_cond():
+    """rev-6: encoder is unconditioned; CondVAE.encode takes only chunk_norm."""
+    vae, _pe, _cond = _make_models("normalized")
+    # Encoder's first Linear input dim equals d_chunk, not d_chunk + d_cond.
+    assert vae.encoder.tower[0].in_features == D_CHUNK
+
+    # encode() with single arg works.
+    chunk = torch.randn(4, D_CHUNK)
+    mu, logvar = vae.encode(chunk)
+    assert mu.shape == (4, D_LATENT_DEFAULT)
+    assert logvar.shape == (4, D_LATENT_DEFAULT)
+
+    # Calling encode with a stray cond arg now errors (TypeError on positional).
+    cond = torch.randn(4, 656)
+    import pytest
+    with pytest.raises(TypeError):
+        vae.encode(chunk, cond)
+
+
+# ---------------------------------------------------------------------------
 def test_overfit_a_batch_smoke_option_d():
     """Short overfit run under option_d on synthetic data: recon trends down.
 

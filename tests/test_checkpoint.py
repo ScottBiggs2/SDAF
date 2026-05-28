@@ -7,6 +7,7 @@ from specdec_af.models.prefix_encoder import PrefixEncoder
 from specdec_af.models.vae import ConditionAssembler, CondVAE
 from specdec_af.training.checkpoint import (
     IncompatiblePrefixEncoderError,
+    IncompatibleVAEEncoderError,
     load_vae_checkpoint,
     save_vae_checkpoint,
 )
@@ -90,6 +91,8 @@ def test_save_load_roundtrip(tmp_path):
 
     # rev-5: lock the d_latent default contract.
     assert loaded["vae"].d_latent == 128
+    # rev-6: lock the encoder-without-cond contract — first Linear input dim is d_chunk only.
+    assert loaded["vae"].encoder.tower[0].in_features == 9984
 
     # ChunkNorm round-trip
     chunk_raw = torch.randn(4, 9984)
@@ -117,30 +120,25 @@ def test_checkpoint_preserves_prefix_encoder_config(tmp_path):
         == sum(p.numel() for p in pe_two_blocks.parameters() if p.requires_grad)
 
 
-def test_load_v2_checkpoint_raises_incompatible_error(tmp_path):
-    """A pre-rev-4 PE config (hidden_dims, no n_attn_blocks) is detected and rejected."""
-    # Synthesize a v2-style checkpoint by writing the old config schema directly.
+def test_load_pre_rev6_checkpoint_raises_incompatible_vae_encoder_error(tmp_path):
+    """rev-6: any format_version != 2 raises IncompatibleVAEEncoderError on load.
+
+    Subsumes the older rev-4 PE-config check: v1/v2/v3 (pre-rev-4 PE) and v4
+    (rev-4/rev-5, pre-rev-6 encoder) all carry format_version=1 and fall
+    through to the new gate.
+    """
     vae, _pe, cond, cn = _make_stack()
     fake = {
-        "format_version": 1,
+        "format_version": 1,  # rev-6 expects 2
         "mode": "option_4",
         "step": 0,
-        "training_config": {"comment": "synthetic v2 ckpt for negative test"},
+        "training_config": {"comment": "synthetic pre-rev-6 ckpt for negative test"},
         "vae": {
             "state_dict": vae.state_dict(),
             "decoder_output_space": vae.decoder_output_space,
             "d_latent": vae.d_latent,
         },
-        "prefix_encoder": {
-            "state_dict": {},  # not loadable; the config check fires before load
-            "config": {
-                # Old v2/v3 schema — no n_attn_blocks key, hidden_dims present.
-                "n_layers": 12,
-                "d_block": 768,
-                "d_out": 512,
-                "hidden_dims": [2048, 1024],
-            },
-        },
+        "prefix_encoder": {"state_dict": {}, "config": {}},
         "cond_assembler": {"state_dict": cond.state_dict()},
         "chunk_norm": {
             "state_dict": cn.state_dict(),
@@ -148,7 +146,12 @@ def test_load_v2_checkpoint_raises_incompatible_error(tmp_path):
             "eps": cn.eps,
         },
     }
-    path = tmp_path / "v2_fake.pt"
+    path = tmp_path / "pre_rev6_fake.pt"
     torch.save(fake, path)
-    with pytest.raises(IncompatiblePrefixEncoderError, match="pre-rev-4 MLP PrefixEncoder"):
+    with pytest.raises(IncompatibleVAEEncoderError, match="format_version=2"):
         load_vae_checkpoint(path)
+
+
+def test_incompatible_prefix_encoder_error_still_importable():
+    """The rev-4 error class is kept as a public symbol for downstream import compat."""
+    assert issubclass(IncompatiblePrefixEncoderError, RuntimeError)
