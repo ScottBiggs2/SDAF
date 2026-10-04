@@ -61,12 +61,11 @@ class HookBatch:
             hook's intrinsic width (768, 2304, or 3072).
         prefix_features: ``[B, n_layers * 768]``. ``mlp_proj_out`` (the last
             theta @ data per block) at ``prefix_pos``, stacked across layers.
-            Per the project's framing as weight-space lineage, this is the
-            conditioning surface for the prefix encoder.
+            ``None`` when no ``prefix_pos`` is given (rev-7 cache v2 path).
     """
 
     hooks: dict[str, Tensor]
-    prefix_features: Tensor
+    prefix_features: Tensor | None
 
 
 def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
@@ -111,24 +110,43 @@ def _slice_positions(t: Tensor, positions: slice | Iterable[int] | Tensor) -> Te
     return t.index_select(dim=1, index=idx.to(t.device))
 
 
+def _gather_positions(t: Tensor, positions: Tensor) -> Tensor:
+    """Per-row gather ``[B, T, D]`` → ``[B, n_pos, D]`` with ``positions: [B, n_pos]``."""
+    idx = positions.to(device=t.device, dtype=torch.long)
+    return torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+
+
 def build_hook_batch_from_buffer(
     buffer: dict[str, Tensor],
     *,
-    window_slice: slice | Iterable[int] | Tensor,
-    prefix_pos: int,
+    window_slice: slice | Iterable[int] | Tensor | None = None,
+    positions: Tensor | None = None,
+    prefix_pos: int | None = None,
     n_layers: int,
 ) -> HookBatch:
     """Assemble a HookBatch from a (pre-populated) hook buffer.
 
-    For Phase-3 cache collection, the caller registers hooks once (via
+    For cache collection, the caller registers hooks once (via
     :func:`register_hooks`) and re-uses the long-lived buffer across forwards.
-    This helper extracts the sliced hooks + prefix features without
-    re-registering. Each tensor is ``.clone()``-d so subsequent forwards that
-    overwrite the buffer don't mutate the returned batch.
+    This helper extracts the selected positions (+ optional prefix features)
+    without re-registering. Every returned tensor is a fresh copy, so
+    subsequent forwards that overwrite the buffer don't mutate the batch.
+
+    Exactly one of:
+      - ``window_slice``: the same positions for every row (v1 cache path).
+      - ``positions``: ``[B, n_pos]`` per-row position indices (rev-7 cache
+        v2), gathered with ``torch.gather`` on the sequence dim.
     """
-    hooks = {name: _slice_positions(t, window_slice).clone() for name, t in buffer.items()}
-    prefix_parts = [buffer[f"mlp_proj_out_l{l}"][:, prefix_pos, :] for l in range(n_layers)]
-    prefix_features = torch.cat(prefix_parts, dim=-1).clone()  # [B, n_layers * D]
+    if (window_slice is None) == (positions is None):
+        raise ValueError("pass exactly one of window_slice / positions")
+    if positions is not None:
+        hooks = {name: _gather_positions(t, positions) for name, t in buffer.items()}
+    else:
+        hooks = {name: _slice_positions(t, window_slice).clone() for name, t in buffer.items()}
+    prefix_features = None
+    if prefix_pos is not None:
+        prefix_parts = [buffer[f"mlp_proj_out_l{l}"][:, prefix_pos, :] for l in range(n_layers)]
+        prefix_features = torch.cat(prefix_parts, dim=-1).clone()  # [B, n_layers * D]
     return HookBatch(hooks=hooks, prefix_features=prefix_features)
 
 

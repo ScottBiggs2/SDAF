@@ -61,7 +61,7 @@ import yaml
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from specdec_af.data.dataset import WindowChunkDataset, make_train_val_split
+from specdec_af.data.dataset import PositionSet, read_split
 from specdec_af.models.chunk_index import (
     N_LAYERS_DEFAULT,
     SLOT_NAMES,
@@ -108,7 +108,7 @@ def pick_device(force_cpu: bool = False) -> torch.device:
 # ----------------------------------------------------------------------
 
 def sample_batch_from_dataset(
-    ds: WindowChunkDataset,
+    ds: PositionSet,
     n_chunks: int,
     *,
     seed: int,
@@ -317,7 +317,7 @@ def compute_all_metrics(
 def evaluate_split(
     vae,
     chunk_norm: ChunkNorm,
-    ds: WindowChunkDataset,
+    ds: PositionSet,
     lm_head: nn.Module | None,
     *,
     mode: Mode,
@@ -347,7 +347,7 @@ def evaluate_checkpoint(
     *,
     splits: list[str],
     n_chunks: int,
-    val_shards: int,
+    val_shards: int | None,
     seed: int,
     conditions: list[Condition],
     device: torch.device,
@@ -359,7 +359,9 @@ def evaluate_checkpoint(
     chunk_norm = loaded["chunk_norm"]
     mode = loaded["mode"]
 
-    train_ds, val_ds = make_train_val_split(cache_dir, val_shards=val_shards)
+    train_shards, val_shards_ = read_split(cache_dir, val_shards)
+    train_ds = PositionSet(train_shards, max_positions=5000)
+    val_ds = PositionSet(val_shards_, max_positions=5000)
 
     lm_head = None
     if not skip_lm_head:
@@ -510,7 +512,8 @@ def main() -> int:
     p.add_argument("--out", type=str, required=True)
     p.add_argument("--splits", nargs="+", default=["val"], choices=["train", "val"])
     p.add_argument("--n-chunks", type=int, default=2048)
-    p.add_argument("--val-shards", type=int, default=1)
+    p.add_argument("--val-shards", type=int, default=None,
+                   help="fallback when the cache has no split.json")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--conditions", nargs="+", default=list(ALL_CONDITIONS),
                    choices=list(ALL_CONDITIONS))

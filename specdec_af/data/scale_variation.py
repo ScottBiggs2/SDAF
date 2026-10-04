@@ -12,12 +12,17 @@ Phase 5 normalization decision (option 4 vs option D — see
 
 Padded slots (``boundary_in`` for blocks 1..L-1, ``boundary_out`` for blocks
 0..L-2) are excluded; only their data-bearing blocks appear in the output.
+
+rev-7: reads either cache layout — v2 ``shards/shard_NNNN/chunks.npy``
+(``[N_pos, J, D]``, memory-mapped, streamed in blocks) or v1
+``windows/shard_NNNN.pt`` (``[B, k, J, D]``).
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from specdec_af.models.chunk_index import N_LAYERS_DEFAULT, SLOT_NAMES, SLOT_OFFSETS
@@ -32,8 +37,26 @@ def _data_bearing_blocks(slot_name: str, n_layers: int) -> list[int]:
     return list(range(n_layers))
 
 
+def _iter_flat_chunks(cache_dir: Path, block_rows: int = 256):
+    """Yield ``[N, J, D]`` float32 chunk blocks from a v2 or v1 cache."""
+    v2 = sorted(p.parent for p in (cache_dir / "shards").glob("shard_*/meta.json"))
+    if v2:
+        for shard in v2:
+            m = np.load(shard / "chunks.npy", mmap_mode="r")
+            for i in range(0, m.shape[0], block_rows):
+                yield torch.from_numpy(np.asarray(m[i:i + block_rows], dtype=np.float32))
+        return
+    shards = sorted((cache_dir / "windows").glob("shard_*.pt"))
+    if not shards:
+        raise FileNotFoundError(f"no v2 shards in {cache_dir / 'shards'} or v1 shards in {cache_dir / 'windows'}")
+    for shard in shards:
+        chunks = torch.load(shard, map_location="cpu", weights_only=True)["chunks"].to(torch.float32)
+        B, k, J, D = chunks.shape
+        yield chunks.reshape(B * k, J, D)
+
+
 def compute_scale_variation(cache_dir: Path | str) -> dict:
-    """Stream all shards under ``${cache_dir}/windows`` and accumulate stats.
+    """Stream all shards (v2 ``shards/`` or v1 ``windows/``) and accumulate stats.
 
     Returns a dict with structure::
 
@@ -49,24 +72,16 @@ def compute_scale_variation(cache_dir: Path | str) -> dict:
         }
     """
     cache_dir = Path(cache_dir)
-    shards_dir = cache_dir / "windows"
-    shards = sorted(shards_dir.glob("shard_*.pt"))
-    if not shards:
-        raise FileNotFoundError(f"no shards in {shards_dir}")
-
     n_layers: int | None = None
     sums: dict[str, torch.Tensor] = {}
     sumsq: dict[str, torch.Tensor] = {}
     counts: torch.Tensor | None = None  # one scalar count (same for all slots)
 
-    for shard in shards:
-        data = torch.load(shard, map_location="cpu", weights_only=True)
-        chunks = data["chunks"].to(torch.float32)  # [B, k, J, D]
-        B, k, J, _ = chunks.shape
+    for chunks_flat in _iter_flat_chunks(cache_dir):  # [N, J, D_CHUNK]
+        J = chunks_flat.shape[1]
         if n_layers is None:
             n_layers = J
             counts = torch.zeros(1, dtype=torch.int64)
-        chunks_flat = chunks.reshape(B * k, J, -1)  # [N, J, D_CHUNK]
 
         for slot in SLOT_NAMES:
             s_off, e_off = SLOT_OFFSETS[slot]
@@ -83,7 +98,7 @@ def compute_scale_variation(cache_dir: Path | str) -> dict:
         counts += chunks_flat.shape[0]
 
     n_total = int(counts.item())
-    out: dict = {"n_windows": n_total, "n_layers": int(n_layers or N_LAYERS_DEFAULT), "per_slot": {}}
+    out: dict = {"n_windows": n_total, "n_positions": n_total, "n_layers": int(n_layers or N_LAYERS_DEFAULT), "per_slot": {}}
 
     for slot in SLOT_NAMES:
         means = sums[slot] / max(n_total, 1)

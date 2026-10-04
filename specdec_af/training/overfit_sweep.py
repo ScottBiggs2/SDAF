@@ -128,20 +128,20 @@ def load_overfit_batch_from_cache(
     device: torch.device | str = "cpu",
     seed: int = 42,
 ) -> dict:
-    """Load shard 0, flatten ``[B, k, J, D]`` → ``[B*k*J, D]``, sample ``n_chunks``."""
-    shard = torch.load(cache_dir / "windows" / "shard_0000.pt", map_location="cpu", weights_only=True)
-    chunks = shard["chunks"].to(torch.float32)
-    B_w, k, J, D = chunks.shape
+    """Sample ``n_chunks`` ``(position, block)`` items from the first cache-v2 shard."""
+    from specdec_af.data.dataset import list_shards  # lazy: keep CLI import light
+    import numpy as np
 
+    chunks = np.load(list_shards(cache_dir)[0] / "chunks.npy", mmap_mode="r")  # [N, J, D]
+    N, J, _ = chunks.shape
     rng = torch.Generator().manual_seed(seed)
-    n_chunks = min(n_chunks, B_w * k * J)
-    flat_idx = torch.randperm(B_w * k * J, generator=rng)[:n_chunks]
-    block_ids = flat_idx % J
-
-    chunk_raw = chunks.reshape(-1, D)[flat_idx]
+    n_chunks = min(n_chunks, N * J)
+    flat_idx = torch.randperm(N * J, generator=rng)[:n_chunks].numpy()
+    rows, block_ids = flat_idx // J, flat_idx % J
+    chunk_raw = torch.from_numpy(np.asarray(chunks[rows, block_ids], dtype=np.float32))
     return {
         "chunk_raw": chunk_raw.to(device),
-        "block_ids": block_ids.to(device),
+        "block_ids": torch.from_numpy(block_ids).to(device),
     }
 
 

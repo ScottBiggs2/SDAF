@@ -1,7 +1,9 @@
 """Phase 6 training loop for the unconditional trace VAE.
 
 rev-7: trains ``TraceVAE`` alone (``E(chunk) → z``, ``D(z, block_id) → chunk``)
-on the cache. The PrefixEncoder / ConditionAssembler of rev-4..rev-6 are gone;
+on cache v2 (memory-mapped shards via :class:`TraceShardDataset`; fixed val
+set = first ``val_positions`` positions of the pinned val shards). The
+PrefixEncoder / ConditionAssembler of rev-4..rev-6 are gone;
 context conditioning moves to the latent generator (next plan). ``ChunkNorm``
 stats are loaded frozen.
 
@@ -15,8 +17,9 @@ checkpoint so eval (Phase 7) can route correctly without re-specifying.
 
 rev-7 ``--resume PATH|auto``: periodic and final checkpoints carry the full
 training state (optimizer, LR scheduler, epoch + position in epoch, RNG
-states, val history). Data order is a pure function of ``(seed, epoch)`` so a
-resumed run continues bit-for-bit where the interrupted run stopped. ``auto``
+states, val history). Data order is a pure function of ``(seed, epoch)``
+(independent of ``num_workers``) so a resumed run continues exactly where the
+interrupted run stopped. ``auto``
 picks ``final.pt`` or the latest ``step_*.pt`` in the run's checkpoint dir
 (fresh start if none) — use it for chained sbatch jobs under the 8h limit.
 
@@ -54,7 +57,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from specdec_af.data.dataset import EpochShuffleSampler, make_train_val_split
+from specdec_af.data.dataset import make_trace_split
 from specdec_af.models.chunk_index import N_LAYERS_DEFAULT
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
@@ -281,6 +284,8 @@ class TrainConfig:
     # rev-7 additions
     beta_anneal_steps: int | None = None  # overrides beta_anneal_epochs when set
     max_wall_seconds: float | None = None  # checkpoint + exit cleanly past this budget
+    shard_buffer: int = 4                  # shards shuffled together per buffer
+    val_positions: int | None = 5000       # fixed val set size (positions; × 12 items)
 
 
 def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device) -> TraceVAE:
@@ -298,7 +303,7 @@ def train(
     cfg: TrainConfig,
     *,
     device: torch.device,
-    val_shards: int = 1,
+    val_shards: int | None = None,
     resume_from: Path | str | None = None,
 ) -> dict:
     """Run the Phase-6 training loop. Returns the final summary dict.
@@ -317,24 +322,26 @@ def train(
 
     torch.manual_seed(cfg.seed)
 
-    # Data. The sampler's per-epoch permutation is a pure function of
-    # (seed, epoch); the loader's own generator is isolated from the global
-    # RNG so iterator creation never perturbs the model's RNG stream.
-    train_ds, val_ds = make_train_val_split(cache_dir, val_shards=val_shards)
-    sampler = EpochShuffleSampler(len(train_ds), seed=cfg.seed)
+    # Data. The dataset's per-epoch batch plan is a pure function of
+    # (seed, epoch); the loaders' generators are isolated from the global RNG
+    # so iterator creation never perturbs the model's RNG stream.
+    train_ds, val_ds = make_trace_split(
+        cache_dir, batch_size=cfg.batch_size, seed=cfg.seed, val_shards=val_shards,
+        val_positions=cfg.val_positions, shard_buffer=cfg.shard_buffer,
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, sampler=sampler,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, drop_last=True,
+        train_ds, batch_size=None, num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
         generator=torch.Generator().manual_seed(cfg.seed),
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+        generator=torch.Generator().manual_seed(cfg.seed),
     )
-    steps_per_epoch = len(train_ds) // cfg.batch_size
-    print(f"train shards: {train_ds.shards_loaded}", flush=True)
-    print(f"val shards:   {val_ds.shards_loaded}", flush=True)
-    print(f"steps/epoch={steps_per_epoch}  total items={len(train_ds)}", flush=True)
+    steps_per_epoch = train_ds.batches_per_epoch
+    print(f"train shards: {len(train_ds.shards_loaded)}  val shards: {val_ds.shards_loaded}", flush=True)
+    print(f"steps/epoch={steps_per_epoch}  train items={train_ds.n_items}  "
+          f"val positions={val_ds.n_positions}", flush=True)
 
     # ChunkNorm (frozen — loaded from Phase-3 stats)
     stats_path = cache_dir / "chunk_norm_stats.pt"
@@ -419,7 +426,7 @@ def train(
     resumed_complete = step >= total_steps
 
     while step < total_steps and not out_of_time:
-        sampler.set_epoch(epoch, skip=batch_in_epoch * cfg.batch_size)
+        train_ds.set_epoch(epoch, skip_batches=batch_in_epoch)
         for batch in train_loader:
             idx = step  # 0-based index of this optimizer step (CSV "step" column)
 
@@ -567,7 +574,10 @@ def main() -> int:
                    help="0 = only final checkpoint; otherwise save every N steps")
     p.add_argument("--val-max-batches", type=int, default=50,
                    help="cap on val batches per evaluation (full val pass takes time)")
-    p.add_argument("--val-shards", type=int, default=1)
+    p.add_argument("--val-shards", type=int, default=None,
+                   help="fallback when the cache has no split.json (default: cache_v2.val_shards)")
+    p.add_argument("--val-positions", type=int, default=None)
+    p.add_argument("--shard-buffer", type=int, default=None)
     p.add_argument("--grad-clip-norm", type=float, default=None,
                    help="max L2 norm for grad clip; None or 0 = disabled")
     p.add_argument("--lr-warmup-steps", type=int, default=None,
@@ -611,6 +621,8 @@ def main() -> int:
         beta_anneal_steps=args.beta_anneal_steps if args.beta_anneal_steps is not None
                            else tr.get("beta_anneal_steps"),
         max_wall_seconds=args.max_wall_minutes * 60 if args.max_wall_minutes is not None else None,
+        shard_buffer=args.shard_buffer or raw_cfg["cache_v2"].get("shard_buffer", 4),
+        val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
     )
 
     device = pick_device(force_cpu=args.cpu)
@@ -622,7 +634,8 @@ def main() -> int:
     print(f"cache_dir={cache_dir}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
 
-    train(cache_dir, output_dir, tcfg, device=device, val_shards=args.val_shards,
+    val_shards = args.val_shards or raw_cfg["cache_v2"].get("val_shards")
+    train(cache_dir, output_dir, tcfg, device=device, val_shards=val_shards,
           resume_from=args.resume)
     return 0
 

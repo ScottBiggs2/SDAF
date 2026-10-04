@@ -225,3 +225,37 @@ def test_causality(model, tokenizer):
     for k in short:
         torch.testing.assert_close(short[k], long_[k], atol=0.0, rtol=0.0,
                                    msg=lambda m, name=k: f"{name} not causal: {m}")
+
+
+# ---------------------------------------------------------------------------
+def test_gather_positions_matches_slice_path(model, batch):
+    """rev-7: per-row ``positions`` gather == ``window_slice`` path when all rows
+    share positions; and per-row positions pick the right rows."""
+    from specdec_af.models.hooks import build_hook_batch_from_buffer
+
+    input_ids, _ = batch
+    n_layers = len(model.transformer.h)
+    handles, buffer = register_hooks(model)
+    try:
+        with torch.no_grad():
+            model(input_ids=input_ids)
+        sl = build_hook_batch_from_buffer(buffer, window_slice=[3, 7, 9], prefix_pos=2, n_layers=n_layers)
+        pos = torch.tensor([[3, 7, 9]] * input_ids.shape[0])
+        g = build_hook_batch_from_buffer(buffer, positions=pos, n_layers=n_layers)
+        assert g.prefix_features is None
+        for k in sl.hooks:
+            torch.testing.assert_close(g.hooks[k], sl.hooks[k], atol=0, rtol=0)
+
+        per_row = torch.tensor([[1, 5], [12, 0]])
+        g2 = build_hook_batch_from_buffer(buffer, positions=per_row, n_layers=n_layers)
+        for k, t in buffer.items():
+            for b in range(2):
+                torch.testing.assert_close(g2.hooks[k][b], t[b, per_row[b]], atol=0, rtol=0)
+        # Returned tensors are copies, not views of the live buffer.
+        assert g2.hooks["embed_out"].data_ptr() != buffer["embed_out"].data_ptr()
+    finally:
+        for h in handles:
+            h.remove()
+
+    with pytest.raises(ValueError):
+        build_hook_batch_from_buffer(buffer, n_layers=n_layers)

@@ -173,3 +173,40 @@ def test_scale_variation_json(tmp_path, model, tokenizer):
         assert len(entry["cv"]) == 12
         # CV must be finite and non-negative
         assert all(cv >= 0 and cv == cv for cv in entry["cv"])  # cv == cv rejects NaN
+
+
+# ---------------------------------------------------------------------------
+# rev-7 cache v2
+# ---------------------------------------------------------------------------
+
+def test_iter_token_sequences_same_packing(tokenizer):
+    from specdec_af.data.corpus import iter_token_sequences
+
+    seqs = torch.cat(list(iter_token_sequences(tokenizer, iter(SMOKE_CORPUS), seq_len=17, batch_size=4)))
+    wins = torch.cat([torch.cat([p, w], dim=1) for p, w in
+                      iter_token_windows(tokenizer, iter(SMOKE_CORPUS), ctx_len=16, k=1, batch_size=4)])
+    assert seqs.shape[1] == 17
+    torch.testing.assert_close(seqs, wins, atol=0, rtol=0)
+
+
+def test_v2_roundtrip_gate_and_scale_variation(v2_cache, gpt2):
+    from specdec_af.data.collect_v2 import cache_roundtrip_check_v2
+
+    rt = cache_roundtrip_check_v2(gpt2, v2_cache, device="cpu", n_check=16)
+    assert rt["ok"], rt
+    assert rt["n_checked"] == 16 and rt["top1_match_rate"] == 1.0
+
+    out = save_scale_variation(v2_cache, output_path=v2_cache.parent / "sv_v2.json")
+    data = json.loads(out.read_text())
+    assert data["n_positions"] == 48
+    assert data["per_slot"]["boundary_out"]["blocks"] == [11]
+    assert all(c > 0 for c in data["per_slot"]["boundary_out"]["cv"])
+
+
+def test_v2_collect_refuses_overwrite(v2_cache, gpt2, tokenizer):
+    from specdec_af.data.collect_v2 import collect_v2
+
+    with pytest.raises(FileExistsError):
+        collect_v2(gpt2, iter(SMOKE_CORPUS), tokenizer=tokenizer, cache_dir=v2_cache,
+                   n_seq=4, seqs_per_shard=4, seq_len=32, n_pos=4, p_min=4, seed=0,
+                   shard_offset=2, device="cpu")

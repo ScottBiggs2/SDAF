@@ -6,6 +6,8 @@ Two surfaces:
     redirected to ``/scratch`` on Explorer via ``HF_HOME``.
   - :func:`iter_token_windows` — tokenizer-and-corpus-agnostic. Concatenates
     tokens from any iterable of strings and yields fixed-length window batches.
+  - :func:`iter_token_sequences` — rev-7 cache v2: same packing, yields whole
+    ``[B, seq_len]`` sequences (positions are sampled inside each sequence).
 """
 from __future__ import annotations
 
@@ -82,3 +84,23 @@ def iter_token_windows(
 
     if batch_windows:
         yield _emit()
+
+
+def iter_token_sequences(
+    tokenizer,
+    corpus_iter: Iterable[str],
+    *,
+    seq_len: int,
+    batch_size: int,
+) -> Iterator[Tensor]:
+    """Yield ``input_ids [B, seq_len]`` batches of packed, non-overlapping sequences.
+
+    Identical packing semantics to :func:`iter_token_windows` (it is that
+    function with ``ctx_len = seq_len - 1, k = 1``, re-joined), so sequence
+    ``n`` of this stream is window ``n`` of a ``ctx_len + k = seq_len`` window
+    stream. Emits a final partial batch if any sequences remain.
+    """
+    for prefix_ids, window_ids in iter_token_windows(
+        tokenizer, corpus_iter, ctx_len=seq_len - 1, k=1, batch_size=batch_size,
+    ):
+        yield torch.cat([prefix_ids, window_ids], dim=1)

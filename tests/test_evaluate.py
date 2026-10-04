@@ -1,6 +1,6 @@
 """Smoke test for Phase-7 evaluation end-to-end.
 
-Builds a mini cache + trains a 25-step checkpoint, then runs the evaluator
+Uses the shared mini cache-v2 + trains a 25-step checkpoint, then runs the evaluator
 on val (a tiny shard) with all conditions. Checks output structure and
 that condition ordering is at least computed without errors.
 """
@@ -11,49 +11,14 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import GPT2LMHeadModel
 
-from specdec_af.data.calibration import run_calibration
-from specdec_af.data.collect import collect_windows
-from specdec_af.data.corpus import load_gpt2_tokenizer
 from specdec_af.evaluate import evaluate_checkpoint, plot_bars, plot_per_block, write_summary
 from specdec_af.training.train import TrainConfig, train
 
 
-SMOKE_CORPUS = [
-    "The quick brown fox jumps over the lazy dog today and tomorrow.",
-    "In the beginning was the Word, and the Word was with God, and the Word was God.",
-    "Two roads diverged in a yellow wood, and sorry I could not travel both.",
-    "It was the best of times, it was the worst of times, it was the age of wisdom.",
-    "Call me Ishmael. Some years ago, never mind how long precisely, I went sailing.",
-    "All happy families are alike; each unhappy family is unhappy in its own way.",
-    "It is a truth universally acknowledged that a single man in possession of a good fortune.",
-    "Tyger Tyger, burning bright, in the forests of the night.",
-    "I have a dream that one day this nation will rise up.",
-    "Whether tis nobler in the mind to suffer the slings and arrows of outrageous fortune.",
-] * 6
-
-
 @pytest.fixture(scope="module")
-def trained_run(tmp_path_factory):
-    """Build a tiny cache + train 25 steps + return paths to cache + checkpoint."""
-    model = GPT2LMHeadModel.from_pretrained("openai-community/gpt2").eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    tok = load_gpt2_tokenizer()
-    cdir = tmp_path_factory.mktemp("eval_cache")
-
-    cn = run_calibration(
-        model, iter(SMOKE_CORPUS), tokenizer=tok,
-        n_windows=16, ctx_len=16, k=1, batch_size=4, device="cpu",
-    )
-    torch.save(cn.state_dict(), cdir / "chunk_norm_stats.pt")
-    collect_windows(
-        model, iter(SMOKE_CORPUS), tokenizer=tok,
-        output_dir=cdir, n_windows=24, shard_size=8,
-        ctx_len=16, k=1, batch_size=4, device="cpu",
-    )
-
+def trained_run(v2_cache, tmp_path_factory):
+    """Train 25 steps on the shared mini cache-v2; return cache + checkpoint paths."""
     odir = tmp_path_factory.mktemp("eval_run")
     cfg = TrainConfig(
         mode="option_4",
@@ -66,16 +31,16 @@ def trained_run(tmp_path_factory):
         grad_clip_norm=None,
         lr_warmup_steps=0,
     )
-    summary = train(cdir, odir, cfg, device=torch.device("cpu"))
+    summary = train(v2_cache, odir, cfg, device=torch.device("cpu"))
     ckpt = Path(summary["checkpoint_dir"]) / "final.pt"
-    return {"cache_dir": cdir, "checkpoint": ckpt, "output_dir": odir}
+    return {"cache_dir": v2_cache, "checkpoint": ckpt, "output_dir": odir}
 
 
 def test_evaluate_end_to_end(trained_run, tmp_path):
     out_dir = tmp_path / "eval_out"
     results = evaluate_checkpoint(
         trained_run["checkpoint"], trained_run["cache_dir"],
-        splits=["val"], n_chunks=16, val_shards=1, seed=0,
+        splits=["val"], n_chunks=16, val_shards=None, seed=0,
         conditions=["qz", "prior", "wrong_z"],
         device=torch.device("cpu"),
         skip_lm_head=False,
@@ -114,7 +79,7 @@ def test_skip_lm_head(trained_run, tmp_path):
     """--skip-lm-head omits the downstream CE/top1/etc. fields gracefully."""
     results = evaluate_checkpoint(
         trained_run["checkpoint"], trained_run["cache_dir"],
-        splits=["val"], n_chunks=8, val_shards=1, seed=0,
+        splits=["val"], n_chunks=8, val_shards=None, seed=0,
         conditions=["qz", "prior"],
         device=torch.device("cpu"),
         skip_lm_head=True,
@@ -135,7 +100,7 @@ def test_micro_batching_equivalent(trained_run, tmp_path):
     """
     common = dict(
         cache_dir=trained_run["cache_dir"],
-        splits=["val"], n_chunks=16, val_shards=1, seed=0,
+        splits=["val"], n_chunks=16, val_shards=None, seed=0,
         conditions=["qz", "prior", "wrong_z"],
         device=torch.device("cpu"),
         skip_lm_head=True,

@@ -2,7 +2,8 @@
 # Path strings support ${VAR} / ${VAR:-default} expansion at load time.
 
 paths:
-  cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache"
+  cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache_v2"   # rev-7: cache v2 (collect_v2)
+  cache_v1_dir: "${SCRATCH:-./outputs}/specdec_af/cache"   # legacy v1 windows (collect.py)
   output_dir: "${SCRATCH:-./outputs}/specdec_af/outputs"
   log_dir: "${SCRATCH:-./outputs}/specdec_af/logs"
 
@@ -19,6 +20,18 @@ trace:
 vae:
   d_latent: 128           # rev-5: bumped from 64. Z_trace per token = 12 × 128 = 1536-d.
   d_block: 64             # rev-7: block_embed is the decoder's only condition (D(z, block_id)).
+
+cache_v2:                 # rev-7: many sampled positions per sequence (collect_v2)
+  seq_len: 256
+  n_pos: 16               # positions sampled per sequence, uniform w/o replacement
+  p_min: 32               # positions drawn from [p_min, seq_len - 1]
+  seed: 1234              # position-sampling seed (Stage B adds --seed-offset)
+  n_seq: 6250             # Stage A: 6,250 × 16 = 100k positions (≈ 24 GB)
+  n_calibration_seq: 1000 # ChunkNorm fit on 16k positions from the same distribution
+  seqs_per_shard: 62      # whole sequences per shard → 992 positions (≈ 237 MB)
+  val_shards: 6           # pinned in split.json at first collection (~6k positions)
+  val_positions: 5000     # fixed val set = first 5k positions of the val shards
+  shard_buffer: 4         # shards shuffled together per training buffer
 
 corpus:
   name: "wikitext"

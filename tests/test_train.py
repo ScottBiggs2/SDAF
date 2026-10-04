@@ -1,6 +1,6 @@
 """Phase 6 training-loop smoke.
 
-Builds a 3-shard mini-cache + fitted ChunkNorm, then runs ~25 train steps under
+Uses the shared 3-shard mini cache-v2 + fitted ChunkNorm, runs ~25 train steps under
 each Phase-5 mode and verifies:
 
   1. Recon loss decreases (rough monotonic — last < first).
@@ -16,50 +16,15 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import GPT2LMHeadModel
 
-from specdec_af.data.calibration import run_calibration
-from specdec_af.data.collect import collect_windows
-from specdec_af.data.corpus import load_gpt2_tokenizer
 from specdec_af.training.checkpoint import load_vae_checkpoint
 from specdec_af.training.train import TrainConfig, train
 
 
-SMOKE_CORPUS = [
-    "The quick brown fox jumps over the lazy dog today and tomorrow.",
-    "In the beginning was the Word, and the Word was with God, and the Word was God.",
-    "Two roads diverged in a yellow wood, and sorry I could not travel both.",
-    "It was the best of times, it was the worst of times, it was the age of wisdom.",
-    "Call me Ishmael. Some years ago, never mind how long precisely, I went sailing.",
-    "All happy families are alike; each unhappy family is unhappy in its own way.",
-    "It is a truth universally acknowledged that a single man in possession of a good fortune.",
-    "Tyger Tyger, burning bright, in the forests of the night.",
-    "I have a dream that one day this nation will rise up.",
-    "Whether tis nobler in the mind to suffer the slings and arrows of outrageous fortune.",
-] * 6
-
-
 @pytest.fixture(scope="module")
-def cache_dir_with_stats(tmp_path_factory):
-    """Build a mini-cache + ChunkNorm stats."""
-    model = GPT2LMHeadModel.from_pretrained("openai-community/gpt2").eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    tok = load_gpt2_tokenizer()
-    cdir = tmp_path_factory.mktemp("cache_train")
-    # Calibration first → chunk_norm_stats.pt
-    cn = run_calibration(
-        model, iter(SMOKE_CORPUS), tokenizer=tok,
-        n_windows=16, ctx_len=16, k=1, batch_size=4, device="cpu",
-    )
-    torch.save(cn.state_dict(), cdir / "chunk_norm_stats.pt")
-    # Collection → shards
-    collect_windows(
-        model, iter(SMOKE_CORPUS), tokenizer=tok,
-        output_dir=cdir, n_windows=24, shard_size=8,
-        ctx_len=16, k=1, batch_size=4, device="cpu",
-    )
-    return cdir
+def cache_dir_with_stats(v2_cache):
+    """rev-7: the shared mini cache-v2 (3 shards × 16 positions; 1 val shard)."""
+    return v2_cache
 
 
 @pytest.mark.parametrize("mode", ["option_4", "option_d"])
@@ -82,7 +47,11 @@ def test_train_smoke_25_steps(cache_dir_with_stats, tmp_path, mode):
         num_workers=0,
         pin_memory=False,
         grad_clip_norm=None,
-        lr_warmup_steps=0,         # no warmup so the smoke trajectory check is clean
+        # rev-7: warmup as in production. The cache-v2 mini fixture calibrates
+        # on only 32 positions, so option_d's 1/σ² weights spike its first
+        # un-warmed steps (step-0 is then the trajectory min); option_4 is
+        # unaffected either way.
+        lr_warmup_steps=10,
     )
     summary = train(cache_dir_with_stats, output_dir, cfg, device=torch.device("cpu"))
 
@@ -233,13 +202,13 @@ def test_train_smoke_with_lr_warmup(cache_dir_with_stats, tmp_path):
 
 def _resume_cfg(n_steps: int, **kw) -> TrainConfig:
     base = dict(
-        mode="option_4", batch_size=16, lr=1e-3, n_epochs=10,
+        mode="option_4", batch_size=32, lr=1e-3, n_epochs=10,
         beta_max=0.01, beta_anneal_epochs=1, free_bits=0.1,
         log_every=1, val_every_steps=4, checkpoint_every_steps=0,
         val_max_batches=2, n_steps_override=n_steps, seed=0,
         num_workers=0, pin_memory=False,
         grad_clip_norm=1.0, lr_warmup_steps=5,
-        beta_anneal_steps=15,
+        beta_anneal_steps=15, shard_buffer=1, val_positions=8,
     )
     base.update(kw)
     return TrainConfig(**base)
@@ -248,8 +217,8 @@ def _resume_cfg(n_steps: int, **kw) -> TrainConfig:
 def test_resume_matches_uninterrupted(cache_dir_with_stats, tmp_path):
     """rev-7 gate: 20-step run == 10-step run + resume + 10 steps.
 
-    Train split = 16 windows × 12 blocks = 192 items → 12 steps/epoch at
-    batch 16, so the resume point (step 10) is mid-epoch and the continuation
+    Train split = 32 positions × 12 blocks = 384 items → 12 steps/epoch at
+    batch 32, so the resume point (step 10) is mid-epoch and the continuation
     crosses an epoch boundary. Exercises optimizer, warmup scheduler, β ramp,
     free-bits, grad clip, data-order fast-forward and RNG (reparam noise).
     """

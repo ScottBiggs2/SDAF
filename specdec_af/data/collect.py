@@ -240,7 +240,7 @@ def main() -> int:
     args = p.parse_args()
 
     cfg = load_config(args.config)
-    cache_dir = Path(expand_env(cfg["paths"]["cache_dir"]))
+    cache_dir = Path(expand_env(cfg["paths"].get("cache_v1_dir", cfg["paths"]["cache_dir"])))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     ctx_len = cfg["trace"]["ctx_len"]
