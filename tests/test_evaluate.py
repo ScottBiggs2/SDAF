@@ -1,120 +1,101 @@
-"""Smoke test for Phase-7 evaluation end-to-end.
+"""rev-7 fidelity eval smoke (specdec_af.evaluate) on the shared mini cache-v2.
 
-Uses the shared mini cache-v2 + trains a 25-step checkpoint, then runs the evaluator
-on val (a tiny shard) with all conditions. Checks output structure and
-that condition ordering is at least computed without errors.
+  1. End-to-end: every condition's metric shapes; outputs + plots written.
+  2. Micro-batch equivalence for every condition (rev-5 knob kept).
+  3. wrong_z feeds another position's μ from the same block.
+  4. Real-data consistency floor is at fp16 level.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
+import numpy as np
 import pytest
 import torch
 
-from specdec_af.evaluate import evaluate_checkpoint, plot_bars, plot_per_block, write_summary
-from specdec_af.training.train import TrainConfig, train
+from specdec_af.evaluate import (
+    ALL_CONDITIONS,
+    condition_latents,
+    evaluate_checkpoint,
+    plot_consistency,
+    plot_latents,
+    plot_per_block,
+    write_summary,
+)
+from specdec_af.models.chunk_index import SLOT_NAMES
 
 
 @pytest.fixture(scope="module")
-def trained_run(v2_cache, tmp_path_factory):
-    """Train 25 steps on the shared mini cache-v2; return cache + checkpoint paths."""
-    odir = tmp_path_factory.mktemp("eval_run")
-    cfg = TrainConfig(
-        mode="option_4",
-        batch_size=8, lr=1e-3, n_epochs=5,
-        beta_max=0.1, beta_anneal_epochs=2,
-        free_bits=0.0,
-        log_every=5, val_every_steps=0, checkpoint_every_steps=0,
-        val_max_batches=4, n_steps_override=25, seed=0,
-        num_workers=0, pin_memory=False,
-        grad_clip_norm=None,
-        lr_warmup_steps=0,
-    )
-    summary = train(v2_cache, odir, cfg, device=torch.device("cpu"))
-    ckpt = Path(summary["checkpoint_dir"]) / "final.pt"
-    return {"cache_dir": v2_cache, "checkpoint": ckpt, "output_dir": odir}
-
-
-def test_evaluate_end_to_end(trained_run, tmp_path):
-    out_dir = tmp_path / "eval_out"
-    results = evaluate_checkpoint(
+def results(trained_run):
+    return evaluate_checkpoint(
         trained_run["checkpoint"], trained_run["cache_dir"],
-        splits=["val"], n_chunks=16, val_shards=None, seed=0,
-        conditions=["qz", "prior", "wrong_z"],
-        device=torch.device("cpu"),
-        skip_lm_head=False,
+        splits=["train", "val"], n_positions=12, seed=0,
+        conditions=list(ALL_CONDITIONS), device=torch.device("cpu"), pos_batch=5,
     )
 
-    # Structure
-    assert results["mode"] == "option_4"
-    assert "val" in results["splits"]
-    conds = results["splits"]["val"]["conditions"]
-    assert set(conds.keys()) == {"qz", "prior", "wrong_z"}
 
-    # Each condition has full metric dict
-    for cond, m in conds.items():
-        assert "recon_mse_normalized" in m and len(m["recon_mse_normalized"]) == 12
-        assert "recon_mse_unnorm" in m and len(m["recon_mse_unnorm"]) == 12
-        assert "recon_cosine" in m and len(m["recon_cosine"]) == 12
-        assert "terminal_mse_unnorm" in m
-        assert "top1_agreement" in m
-        assert "ce_teacher_student" in m
-        assert "perplexity_TS" in m
-        assert "kl_teacher_student" in m
-        assert "pred_concentration" in m
+def test_evaluate_end_to_end(results, tmp_path):
+    assert results["format"] == "rev7_eval" and results["mode"] == "option_4"
+    for sp in ("train", "val"):
+        d = results["splits"][sp]
+        assert d["n_positions"] == 12
+        assert set(d["conditions"]) == set(ALL_CONDITIONS)
+        for cond, m in d["conditions"].items():
+            r = m["recon"]
+            assert r["slots"] == list(SLOT_NAMES)
+            for k in ("mse_norm", "rel_err", "cosine"):
+                assert np.array(r[k], dtype=float).shape == (12, 8)
+                assert len(r[f"block_{k}"]) == 12
+            # Padded slots are null: boundary_in only at block 0, boundary_out only at block 11.
+            assert r["cosine"][0][0] is not None and r["cosine"][1][0] is None
+            assert r["cosine"][11][7] is not None and r["cosine"][10][7] is None
+            for k in ("top1_agreement", "top5_overlap", "kl_teacher_student", "ce_teacher_student",
+                      "pred_concentration", "consistency_cross_median", "consistency_intra_median"):
+                assert np.isfinite(m[k]), (cond, k)
+            assert 0.0 <= m["top1_agreement"] <= 1.0 and 0.0 <= m["top5_overlap"] <= 1.0
+            assert m["n_terminal"] == 12
+        ls = d["latent_stats"]
+        assert len(ls["kl_block"]) == 12 and len(ls["active_units_block"]) == 12
+        assert np.array(ls["spectrum_block"]).shape == (12, 128)
+        assert np.array(ls["cross_block_abs_corr"]).shape == (12, 12)
+        # Real cache traces satisfy the identities to fp16 precision.
+        assert d["real_consistency"]["cross_median"] < 5e-3
+        assert d["real_consistency"]["intra_median"] < 5e-3
 
-    # Reporting
-    write_summary(results, out_dir)
-    assert (out_dir / "metrics.json").exists()
-    assert (out_dir / "summary.txt").exists()
-    # Plots
-    p_bar = plot_bars(results, out_dir)
-    p_block = plot_per_block(results, out_dir)
-    assert p_bar.exists() and p_bar.stat().st_size > 1000
-    assert p_block.exists() and p_block.stat().st_size > 1000
-
-
-def test_skip_lm_head(trained_run, tmp_path):
-    """--skip-lm-head omits the downstream CE/top1/etc. fields gracefully."""
-    results = evaluate_checkpoint(
-        trained_run["checkpoint"], trained_run["cache_dir"],
-        splits=["val"], n_chunks=8, val_shards=None, seed=0,
-        conditions=["qz", "prior"],
-        device=torch.device("cpu"),
-        skip_lm_head=True,
-    )
-    qz = results["splits"]["val"]["conditions"]["qz"]
-    # Downstream keys absent or NaN
-    assert "top1_agreement" not in qz or qz["top1_agreement"] != qz["top1_agreement"]  # NaN check
+    write_summary(results, tmp_path)
+    assert (tmp_path / "metrics.json").exists() and (tmp_path / "summary.txt").exists()
+    for p in [plot_per_block(results, tmp_path), plot_consistency(results, tmp_path),
+              *plot_latents(results, tmp_path)]:
+        assert p.exists() and p.stat().st_size > 1000
 
 
-def test_micro_batching_equivalent(trained_run, tmp_path):
-    """rev-5: micro-batched eval is numerically equivalent to whole-batch eval.
-    rev-6: extended to cover the new wrong_z condition (two-pass forward).
+def test_micro_batching_equivalent(trained_run):
+    common = dict(splits=["val"], n_positions=10, seed=0, conditions=list(ALL_CONDITIONS),
+                  device=torch.device("cpu"), pos_batch=4, skip_consistency=True)
+    a = evaluate_checkpoint(trained_run["checkpoint"], trained_run["cache_dir"], **common)
+    b = evaluate_checkpoint(trained_run["checkpoint"], trained_run["cache_dir"], **common, micro_batch_size=5)
+    for cond in ALL_CONDITIONS:
+        ma, mb = a["splits"]["val"]["conditions"][cond], b["splits"]["val"]["conditions"][cond]
+        np.testing.assert_allclose(ma["recon_mse_normalized"], mb["recon_mse_normalized"], rtol=1e-4, atol=1e-6)
+        assert ma["top1_agreement"] == mb["top1_agreement"]
+        np.testing.assert_allclose(ma["kl_teacher_student"], mb["kl_teacher_student"], rtol=1e-4)
 
-    Run all conditions twice — once unbatched, once with micro_batch_size=4
-    against a 16-chunk batch. The recon_mse_normalized arrays should match
-    within fp tolerance for every condition (proves the pre-computed full-
-    batch rolls + seeded prior z stay bit-identical under chunking).
-    """
-    common = dict(
-        cache_dir=trained_run["cache_dir"],
-        splits=["val"], n_chunks=16, val_shards=None, seed=0,
-        conditions=["qz", "prior", "wrong_z"],
-        device=torch.device("cpu"),
-        skip_lm_head=True,
-    )
-    r_whole = evaluate_checkpoint(trained_run["checkpoint"], **common)
-    r_micro = evaluate_checkpoint(
-        trained_run["checkpoint"], **common, micro_batch_size=4,
-    )
-    for cond in ("qz", "prior", "wrong_z"):
-        a = r_whole["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
-        b = r_micro["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
-        # Float-tolerance comparison element-wise. The chunked path may have
-        # tiny float-summation differences but should match within ~1e-5.
-        for j, (x, y) in enumerate(zip(a, b)):
-            if x != x or y != y:  # both NaN is allowed (sparse blocks)
-                continue
-            assert abs(x - y) < 1e-4, f"{cond} block {j}: whole={x:.6g} micro={y:.6g}"
+
+def test_condition_latents_semantics():
+    mu = torch.randn(5, 12, 8)
+    lv = torch.full_like(mu, -2.0)
+    wz = condition_latents("wrong_z", mu, lv, seed=0)
+    torch.testing.assert_close(wz[1:], mu[:-1])  # position p gets position p-1's μ ...
+    torch.testing.assert_close(wz[0], mu[-1])    # ... at the same block index
+    assert torch.equal(condition_latents("qz_mean", mu, lv, seed=0), mu)
+    s1, s2 = condition_latents("qz_sample", mu, lv, seed=3), condition_latents("qz_sample", mu, lv, seed=3)
+    assert torch.equal(s1, s2) and not torch.equal(s1, mu)
+    assert (s1 - mu).std() < 1.0  # σ = e^{-1} ≈ 0.37
+    p = condition_latents("prior", mu, lv, seed=3)
+    assert p.shape == mu.shape and not torch.equal(p, s1)
+
+
+def test_skip_lm_head(trained_run):
+    r = evaluate_checkpoint(trained_run["checkpoint"], trained_run["cache_dir"], splits=["val"],
+                            n_positions=4, seed=0, conditions=["qz_mean"], device=torch.device("cpu"),
+                            skip_lm_head=True, skip_consistency=True)
+    m = r["splits"]["val"]["conditions"]["qz_mean"]
+    assert "top1_agreement" not in m and np.isnan(m["consistency_cross_median"])

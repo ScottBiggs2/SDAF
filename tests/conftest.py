@@ -63,3 +63,23 @@ def v2_cache(tmp_path_factory, gpt2, gpt2_tokenizer):
     )
     write_split(cdir, val_shards=1)
     return cdir
+
+
+@pytest.fixture(scope="session")
+def trained_run(v2_cache, tmp_path_factory):
+    """25-step option_4 checkpoint on the mini cache-v2 (for eval / export tests)."""
+    from pathlib import Path
+
+    from specdec_af.training.train import TrainConfig, train
+
+    odir = tmp_path_factory.mktemp("eval_run")
+    cfg = TrainConfig(
+        mode="option_4", batch_size=8, lr=1e-3, n_epochs=5,
+        beta_max=0.1, beta_anneal_epochs=2, free_bits=0.0,
+        log_every=5, val_every_steps=0, checkpoint_every_steps=0,
+        val_max_batches=4, n_steps_override=25, seed=0,
+        num_workers=0, pin_memory=False, grad_clip_norm=None, lr_warmup_steps=0,
+    )
+    summary = train(v2_cache, odir, cfg, device=torch.device("cpu"))
+    return {"cache_dir": v2_cache, "checkpoint": Path(summary["checkpoint_dir"]) / "final.pt",
+            "output_dir": odir}

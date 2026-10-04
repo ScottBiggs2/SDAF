@@ -1,35 +1,33 @@
-"""Parse + compare + visualize Phase-7 evaluation results.
+"""Parse + compare + visualize rev-7 fidelity evaluations.
 
-Designed to run **locally** on ``metrics.json`` files pulled from the HPC. Each
-input is a directory produced by ``specdec_af.evaluate`` containing:
+Designed to run **locally** on ``metrics.json`` files pulled from the HPC
+(``specdec_af.evaluate`` output, ``"format": "rev7_eval"``). Compares 1–N
+runs side-by-side. Outputs:
 
-  - ``metrics.json``       — nested {split → condition → metric: value}
-  - ``summary.txt``        — human-readable per-run summary
-  - ``bar_chart.png``      — 3-row bar chart (top-1, CE, terminal MSE)
-  - ``per_block_recon.png``— per-block recon MSE by condition
+  - ``${out_dir}/comparison.json``     — per-run headline numbers + decision
+  - ``${out_dir}/comparison.txt``      — human-readable table + decision rationale
+  - ``${out_dir}/compare_top1.png``    — teacher top-1 by condition, runs grouped
+  - ``${out_dir}/compare_per_block.png`` — qz_mean per-block cosine / rel. error
+  - ``${out_dir}/compare_consistency.png`` — qz_mean consistency vs the real fp16 floor
 
-This tool compares 1–N evaluation runs side-by-side. Outputs:
+rev-7 decision (pre-registered in ``agent_plan_rev7.md`` §5, applied mechanically
+by :func:`decision_rule`):
 
-  - ``${out_dir}/comparison.json``  — quantitative cross-run table
-  - ``${out_dir}/comparison.txt``   — human-readable side-by-side summary
-  - ``${out_dir}/compare_top1.png`` — top-1 agreement, runs × conditions × splits
-  - ``${out_dir}/compare_ce.png``   — CE(teacher, student), same layout
-  - ``${out_dir}/compare_tmse.png`` — unnormalized terminal MSE
+  1. Disqualify any run with posterior collapse (every block's KL < 1e-3) or
+     any block whose ``qz_mean`` recon cosine is < 0.5.
+  2. Winner = higher val ``qz_mean`` teacher top-1. Within 2 pp → lower median
+     cross-block consistency error. Also within 10 % relative → ``option_d``
+     (standing tie-break: fewer architectural commitments).
 
-The decision-summary section of ``comparison.txt`` calls out:
-
-  - which run has highest **val qz top-1**
-  - which runs pass each Phase-7 milestone check
-  - the **qz vs prior gap** on val (how much the latent is contributing)
-  - the **qz vs wrong_prefix gap** on val (how much the prefix is contributing)
+The rev-4..6 prefix milestone ordering (qz > prior > wrong_prefix ≈ baseline)
+is gone with the prefix conditions.
 
 Usage::
 
     python -m specdec_af.analysis.eval_results \\
-      --run k1_option4=outputs/from_hpc/eval/k1_option4 \\
-      --run k1_option4_v2=outputs/from_hpc/eval/k1_option4_v2 \\
-      --run k1_optiond_v2=outputs/from_hpc/eval/k1_optiond_v2 \\
-      --out outputs/eval_analysis_$(date +%Y%m%d)
+      --run rev7A_opt4=outputs/from_hpc/eval/rev7A_opt4 \\
+      --run rev7A_optd=outputs/from_hpc/eval/rev7A_optd \\
+      --out outputs/eval_analysis_rev7A
 """
 from __future__ import annotations
 
@@ -37,7 +35,6 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib
 
@@ -46,10 +43,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-CONDITIONS = ("qz", "prior", "wrong_prefix", "wrong_z", "baseline")
-CONDITION_COLORS = {"qz": "tab:green", "prior": "tab:blue",
-                    "wrong_prefix": "tab:orange", "wrong_z": "tab:purple",
-                    "baseline": "tab:red"}
+CONDITIONS = ("qz_mean", "qz_sample", "prior", "wrong_z")
+CONDITION_COLORS = {"qz_mean": "tab:green", "qz_sample": "tab:olive",
+                    "prior": "tab:blue", "wrong_z": "tab:purple"}
+
+COLLAPSE_KL = 1e-3       # rule 1: all-block KL below this = posterior collapse
+MIN_BLOCK_COSINE = 0.5   # rule 1: any block's qz_mean cosine below this disqualifies
+TOP1_TIE_PP = 0.02       # rule 2: within 2 pp → consistency tie-break
+CONSISTENCY_TIE_REL = 0.10  # rule 2: within 10 % relative → option_d
 
 
 # ----------------------------------------------------------------------
@@ -79,6 +80,9 @@ class EvalRun:
     def splits(self) -> list[str]:
         return list(self.metrics.get("splits", {}).keys())
 
+    def split(self, split: str) -> dict:
+        return self.metrics["splits"][split]
+
     def get(self, split: str, condition: str, key: str, default=float("nan")):
         try:
             return self.metrics["splits"][split]["conditions"][condition][key]
@@ -87,82 +91,96 @@ class EvalRun:
 
 
 # ----------------------------------------------------------------------
-# Milestone checks (mirrors evaluate.write_summary semantics)
+# Headline numbers + decision rule
 # ----------------------------------------------------------------------
 
-def milestone_checks(run: EvalRun, split: str) -> dict:
-    """Phase-7 milestone checks for one (run, split).
-
-    Returns dict with:
-      - ``ordering_pass``     : qz > prior > wrong_prefix ≈ baseline
-      - ``floor_pass``        : qz top-1 > baseline pred_concentration
-      - ``qz_vs_prior_gap``   : qz_top1 − prior_top1 (latent contribution)
-      - ``qz_vs_wrong_gap``   : qz_top1 − wrong_prefix_top1 (prefix contribution)
-    """
-    qz = run.get(split, "qz", "top1_agreement")
-    pr = run.get(split, "prior", "top1_agreement")
-    wp = run.get(split, "wrong_prefix", "top1_agreement")
-    bl = run.get(split, "baseline", "top1_agreement")
-    floor = run.get(split, "baseline", "pred_concentration")
-    ordering_pass = (
-        not any(np.isnan([qz, pr, wp, bl]))
-        and qz > pr > wp
-        and abs(wp - bl) < 0.05  # "wrong_prefix ≈ baseline" within 5pp
-    )
-    floor_pass = (not np.isnan(qz)) and (not np.isnan(floor)) and (qz > floor)
+def run_summary(run: EvalRun, split: str) -> dict:
+    """Headline numbers for one (run, split)."""
+    nan = float("nan")
+    d = run.split(split)
+    ls = d.get("latent_stats", {})
+    qz_cos = run.get(split, "qz_mean", "recon_cosine", default=[nan])
+    real = d.get("real_consistency", {})
     return {
-        "qz_top1": qz, "prior_top1": pr,
-        "wrong_prefix_top1": wp, "baseline_top1": bl,
-        "baseline_pred_concentration": floor,
-        "ordering_pass": bool(ordering_pass),
-        "floor_pass": bool(floor_pass),
-        "qz_vs_prior_gap": float(qz - pr),
-        "qz_vs_wrong_gap": float(qz - wp),
+        "qz_top1": run.get(split, "qz_mean", "top1_agreement"),
+        "qz_top5": run.get(split, "qz_mean", "top5_overlap"),
+        "qz_kl_TS": run.get(split, "qz_mean", "kl_teacher_student"),
+        "qz_sample_top1": run.get(split, "qz_sample", "top1_agreement"),
+        "prior_top1": run.get(split, "prior", "top1_agreement"),
+        "wrong_z_top1": run.get(split, "wrong_z", "top1_agreement"),
+        "qz_min_block_cosine": float(np.min(qz_cos)),
+        "qz_mean_block_cosine": float(np.mean(qz_cos)),
+        "qz_median_rel_err": float(np.median(run.get(split, "qz_mean", "recon_rel_err", default=[nan]))),
+        "qz_consistency_cross_median": run.get(split, "qz_mean", "consistency_cross_median"),
+        "qz_consistency_intra_median": run.get(split, "qz_mean", "consistency_intra_median"),
+        "real_consistency_cross_median": real.get("cross_median", nan),
+        "real_consistency_intra_median": real.get("intra_median", nan),
+        "kl_block": ls.get("kl_block", []),
+        "kl_total": float(np.sum(ls.get("kl_block", [nan]))),
+        "active_units_total": int(np.sum(ls.get("active_units_block", [0]))),
     }
 
 
-# ----------------------------------------------------------------------
-# Cross-run comparison
-# ----------------------------------------------------------------------
-
-def comparison_table(runs: Iterable[EvalRun]) -> dict:
-    """Side-by-side cross-run summary for both train and val splits."""
-    out = {"runs": []}
+def decision_rule(runs: list[EvalRun], split: str = "val") -> dict:
+    """Apply the pre-registered rev-7 option_4-vs-option_d rule. Returns winner + rationale."""
+    steps: list[str] = []
+    qualified, disq = [], []
     for r in runs:
-        run_summary = {
-            "name": r.name,
-            "mode": r.mode,
-            "splits": {},
-        }
-        for split in r.splits:
-            checks = milestone_checks(r, split)
-            run_summary["splits"][split] = {
-                **checks,
-                "qz_ce_TS": r.get(split, "qz", "ce_teacher_student"),
-                "qz_ppl_TS": r.get(split, "qz", "perplexity_TS"),
-                "qz_kl_TS": r.get(split, "qz", "kl_teacher_student"),
-                "qz_terminal_mse_unnorm": r.get(split, "qz", "terminal_mse_unnorm"),
-            }
-        out["runs"].append(run_summary)
+        s = run_summary(r, split)
+        reasons = []
+        kl = s["kl_block"]
+        if kl and all(k < COLLAPSE_KL for k in kl):
+            reasons.append(f"posterior collapse (all-block KL < {COLLAPSE_KL:g})")
+        if s["qz_min_block_cosine"] < MIN_BLOCK_COSINE:
+            reasons.append(f"block cosine {s['qz_min_block_cosine']:.3f} < {MIN_BLOCK_COSINE}")
+        (disq if reasons else qualified).append((r, s))
+        steps.append(f"{r.name} ({r.mode}): " + ("DISQUALIFIED — " + "; ".join(reasons) if reasons else "qualified"))
+
+    if not qualified:
+        return {"split": split, "winner": None, "winner_mode": None, "decided_by": "all disqualified",
+                "steps": steps, "disqualified": [r.name for r, _ in disq]}
+    qualified.sort(key=lambda rs: -rs[1]["qz_top1"])
+    if len(qualified) == 1:
+        r, s = qualified[0]
+        steps.append(f"only qualified run → {r.name}")
+        return {"split": split, "winner": r.name, "winner_mode": r.mode, "decided_by": "sole qualifier",
+                "steps": steps, "disqualified": [x.name for x, _ in disq]}
+
+    (a, sa), (b, sb) = qualified[0], qualified[1]
+    gap = sa["qz_top1"] - sb["qz_top1"]
+    steps.append(f"top-1: {a.name}={sa['qz_top1']:.4f} vs {b.name}={sb['qz_top1']:.4f} (gap {gap * 100:.2f} pp)")
+    if gap > TOP1_TIE_PP:
+        winner, by = a, "teacher top-1"
+    else:
+        ca, cb = sa["qz_consistency_cross_median"], sb["qz_consistency_cross_median"]
+        rel = abs(ca - cb) / max(min(ca, cb), 1e-12)
+        steps.append(f"within {TOP1_TIE_PP * 100:.0f} pp → cross-block consistency median: "
+                     f"{a.name}={ca:.4g} vs {b.name}={cb:.4g} (rel diff {rel * 100:.1f}%)")
+        if rel > CONSISTENCY_TIE_REL:
+            winner, by = (a if ca < cb else b), "cross-block consistency"
+        else:
+            d_runs = [x for x in (a, b) if x.mode == "option_d"]
+            winner = d_runs[0] if d_runs else a
+            by = "option_d tie-break"
+            steps.append(f"within {CONSISTENCY_TIE_REL * 100:.0f}% relative → option_d tie-break")
+    steps.append(f"winner: {winner.name} ({winner.mode}) by {by}")
+    return {"split": split, "winner": winner.name, "winner_mode": winner.mode, "decided_by": by,
+            "steps": steps, "disqualified": [x.name for x, _ in disq]}
+
+
+def comparison_table(runs: list[EvalRun]) -> dict:
+    out: dict = {"runs": []}
+    for r in runs:
+        entry = {"name": r.name, "mode": r.mode, "step": r.metrics.get("step"), "splits": {}}
+        for sp in r.splits:
+            entry["splits"][sp] = run_summary(r, sp)
+        if {"train", "val"} <= set(r.splits):
+            entry["train_val_top1_gap"] = entry["splits"]["train"]["qz_top1"] - entry["splits"]["val"]["qz_top1"]
+        out["runs"].append(entry)
+    val_runs = [r for r in runs if "val" in r.splits]
+    if val_runs:
+        out["decision"] = decision_rule(val_runs, "val")
     return out
-
-
-def decision_summary(runs: list[EvalRun], split: str = "val") -> dict:
-    """Pick a winner per the Phase-7 milestone and report the rationale."""
-    rows = []
-    for r in runs:
-        m = milestone_checks(r, split)
-        rows.append({
-            "name": r.name, "mode": r.mode,
-            "qz_top1": m["qz_top1"],
-            "ordering_pass": m["ordering_pass"],
-            "floor_pass": m["floor_pass"],
-            "qz_vs_prior_gap": m["qz_vs_prior_gap"],
-            "qz_vs_wrong_gap": m["qz_vs_wrong_gap"],
-        })
-    # Primary ranking: qz_top1 on the chosen split (higher is better).
-    rows.sort(key=lambda r: -r["qz_top1"])
-    return {"split": split, "ranked": rows, "winner": rows[0]["name"] if rows else None}
 
 
 # ----------------------------------------------------------------------
@@ -170,46 +188,39 @@ def decision_summary(runs: list[EvalRun], split: str = "val") -> dict:
 # ----------------------------------------------------------------------
 
 def write_comparison_summary(runs: list[EvalRun], out_dir: Path) -> Path:
-    """Write comparison.txt — human-readable side-by-side."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    lines = ["Phase 7 eval comparison", "=" * 60, ""]
-    for split in sorted({s for r in runs for s in r.splits}):
-        lines.append(f"--- split: {split} ---")
-        lines.append(f"{'run':<22} {'mode':<10} {'qz_top1':>8} {'prior':>8} {'wrong':>8} "
-                     f"{'base':>8} {'qz-pri':>8} {'qz-wrg':>8} {'ord':>4} {'flr':>4}")
+    table = comparison_table(runs)
+    lines = ["rev-7 eval comparison", "=" * 60, ""]
+    for sp in sorted({s for r in runs for s in r.splits}):
+        lines.append(f"--- split: {sp} ---")
+        lines.append(f"{'run':<16} {'mode':<9} {'qz_top1':>7} {'top5':>6} {'kl_TS':>7} {'smp_top1':>8} "
+                     f"{'prior':>6} {'wrong_z':>7} {'cos_min':>7} {'cons_x':>8} {'floor_x':>8} {'KL_tot':>7} {'AU':>5}")
         for r in runs:
-            if split not in r.splits:
+            if sp not in r.splits:
                 continue
-            c = milestone_checks(r, split)
+            s = run_summary(r, sp)
             lines.append(
-                f"{r.name:<22} {r.mode:<10} {c['qz_top1']:>8.4f} {c['prior_top1']:>8.4f} "
-                f"{c['wrong_prefix_top1']:>8.4f} {c['baseline_top1']:>8.4f} "
-                f"{c['qz_vs_prior_gap']:>+8.4f} {c['qz_vs_wrong_gap']:>+8.4f} "
-                f"{'PASS' if c['ordering_pass'] else 'fail':>4} "
-                f"{'PASS' if c['floor_pass'] else 'fail':>4}"
+                f"{r.name:<16} {r.mode:<9} {s['qz_top1']:>7.4f} {s['qz_top5']:>6.3f} {s['qz_kl_TS']:>7.3g} "
+                f"{s['qz_sample_top1']:>8.4f} {s['prior_top1']:>6.3f} {s['wrong_z_top1']:>7.3f} "
+                f"{s['qz_min_block_cosine']:>7.3f} {s['qz_consistency_cross_median']:>8.3g} "
+                f"{s['real_consistency_cross_median']:>8.3g} {s['kl_total']:>7.2f} {s['active_units_total']:>5d}"
             )
         lines.append("")
-
-    # Decision summary on val
-    if any("val" in r.splits for r in runs):
-        ds = decision_summary([r for r in runs if "val" in r.splits], split="val")
-        lines.append("--- decision summary (val) ---")
-        lines.append(f"winner (highest val qz_top1): {ds['winner']}")
+    gaps = [(e["name"], e["train_val_top1_gap"]) for e in table["runs"] if "train_val_top1_gap" in e]
+    if gaps:
+        lines.append("train → val qz_top1 gap: " + ", ".join(f"{n}={g:+.4f}" for n, g in gaps))
         lines.append("")
-        lines.append("notes:")
-        lines.append("  - 'ord' = check 1 (qz > prior > wrong_prefix ≈ baseline)")
-        lines.append("  - 'flr' = check 2 (qz_top1 > baseline pred_concentration; marginal-mode floor)")
-        lines.append("  - 'qz-pri' = how much the latent is contributing (qz over prior)")
-        lines.append("  - 'qz-wrg' = how much the prefix is contributing (qz over wrong_prefix)")
-        lines.append("  - check 1 can fail by 'wrong > prior' (z dominates prefix) OR 'wrong != baseline' (z leaks through wrong prefix)")
-        lines.append("    — the second is informative not pathological")
+    if "decision" in table:
+        dec = table["decision"]
+        lines.append("--- pre-registered decision rule (val) ---")
+        lines.extend(f"  {s}" for s in dec["steps"])
         lines.append("")
-
+    lines.append("columns: cons_x = qz_mean median cross-block consistency error; floor_x = same on real (fp16) traces;")
+    lines.append("         KL_tot = Σ_blocks per-item KL (nats); AU = active units summed over blocks.")
     text = "\n".join(lines)
     (out_dir / "comparison.txt").write_text(text)
+    (out_dir / "comparison.json").write_text(json.dumps(table, indent=2))
     print(text, flush=True)
-
-    (out_dir / "comparison.json").write_text(json.dumps(comparison_table(runs), indent=2))
     return out_dir / "comparison.txt"
 
 
@@ -217,85 +228,82 @@ def write_comparison_summary(runs: list[EvalRun], out_dir: Path) -> Path:
 # Plots
 # ----------------------------------------------------------------------
 
-def _grouped_bar(
-    ax,
-    runs: list[EvalRun],
-    split: str,
-    key: str,
-    title: str,
-    *,
-    log_y: bool = False,
-) -> None:
-    """Grouped bar chart: x=condition, group=run, value=metric."""
-    n_runs = len(runs)
-    width = 0.8 / max(1, n_runs)
+def plot_compare(runs: list[EvalRun], out_dir: Path) -> Path:
+    """Teacher top-1 by condition (x), runs grouped, one panel per split."""
+    splits = sorted({s for r in runs for s in r.splits})
+    fig, axes = plt.subplots(1, len(splits), figsize=(6 * len(splits), 4), squeeze=False)
+    width = 0.8 / max(1, len(runs))
     x = np.arange(len(CONDITIONS))
-    for i, r in enumerate(runs):
-        vals = [r.get(split, c, key) for c in CONDITIONS]
-        offset = (i - (n_runs - 1) / 2) * width
-        ax.bar(x + offset, vals, width=width, label=r.name, alpha=0.85)
-        for xi, v in zip(x + offset, vals):
-            if not np.isnan(v):
-                ax.text(xi, v, f"{v:.3g}", ha="center", va="bottom", fontsize=6, rotation=0)
-    ax.set_xticks(x)
-    ax.set_xticklabels(CONDITIONS, fontsize=8)
-    ax.set_title(f"{title}  ({split})", fontsize=10)
-    ax.tick_params(labelsize=8)
-    ax.grid(True, alpha=0.3, axis="y")
-    if log_y:
-        ax.set_yscale("log")
-    ax.legend(fontsize=7)
-
-
-def plot_compare(runs: list[EvalRun], out_dir: Path) -> list[Path]:
-    """One figure per metric × split, runs grouped within."""
-    out_paths = []
-    splits = sorted({s for r in runs for s in r.splits})
-    metrics = [
-        ("top1_agreement", "top-1 agreement (teacher vs student)", "top1", False),
-        ("ce_teacher_student", "CE(teacher_argmax, student_logits)", "ce", False),
-        ("perplexity_TS", "perplexity (teacher-student)", "ppl", True),
-        ("terminal_mse_unnorm", "terminal MSE (unnormalized)", "tmse", True),
-    ]
-    for metric_key, label, slug, log_y in metrics:
-        fig, axes = plt.subplots(1, len(splits), figsize=(5 * len(splits), 4), squeeze=False)
-        for col, sp in enumerate(splits):
-            _grouped_bar(axes[0, col], runs, sp, metric_key, label, log_y=log_y)
-        fig.tight_layout()
-        out_path = out_dir / f"compare_{slug}.png"
-        fig.savefig(out_path, dpi=130, bbox_inches="tight")
-        plt.close(fig)
-        out_paths.append(out_path)
-    return out_paths
-
-
-def plot_per_block_compare(runs: list[EvalRun], out_dir: Path,
-                           n_layers: int = 12) -> Path:
-    """Per-block unnormalized recon MSE under qz condition, one line per run.
-
-    Tells us where the gap between runs lives in the activation stack.
-    """
-    splits = sorted({s for r in runs for s in r.splits})
-    fig, axes = plt.subplots(1, len(splits), figsize=(6 * len(splits), 5), squeeze=False)
     for col, sp in enumerate(splits):
         ax = axes[0, col]
-        for r in runs:
-            vals = r.get(sp, "qz", "recon_mse_unnorm", default=None)
-            if vals is None or not isinstance(vals, list):
-                continue
-            ax.plot(range(len(vals)), vals, "o-", label=f"{r.name} ({r.mode})",
-                    alpha=0.85, markersize=4)
-        ax.set_title(f"qz per-block unnorm recon MSE  ({sp})", fontsize=10)
-        ax.set_xlabel("block")
-        ax.set_ylabel("MSE")
-        ax.set_yscale("log")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        for i, r in enumerate(runs):
+            vals = [r.get(sp, c, "top1_agreement") for c in CONDITIONS] if sp in r.splits else [np.nan] * len(CONDITIONS)
+            xs = x + (i - (len(runs) - 1) / 2) * width
+            ax.bar(xs, vals, width=width, label=r.name, alpha=0.85)
+            for xi, v in zip(xs, vals):
+                if not np.isnan(v):
+                    ax.text(xi, v, f"{v:.3f}", ha="center", va="bottom", fontsize=6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(CONDITIONS, fontsize=8)
+        ax.set_title(f"teacher top-1 agreement ({sp})", fontsize=10)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.legend(fontsize=7)
     fig.tight_layout()
-    out_path = out_dir / "compare_per_block_qz.png"
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    path = out_dir / "compare_top1.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
-    return out_path
+    return path
+
+
+def plot_per_block_compare(runs: list[EvalRun], out_dir: Path, split: str = "val") -> Path:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    for r in runs:
+        if split not in r.splits:
+            continue
+        lbl = f"{r.name} ({r.mode})"
+        axes[0].plot(r.get(split, "qz_mean", "recon_cosine", default=[]), "o-", label=lbl, markersize=4)
+        axes[1].plot(r.get(split, "qz_mean", "recon_rel_err", default=[]), "o-", label=lbl, markersize=4)
+    axes[0].axhline(MIN_BLOCK_COSINE, color="r", ls=":", lw=1, label="disqualify < 0.5")
+    axes[0].set_title(f"qz_mean per-block cosine ({split})", fontsize=10)
+    axes[1].set_title(f"qz_mean per-block rel. error ({split})", fontsize=10)
+    axes[1].set_yscale("log")
+    for ax in axes:
+        ax.set_xlabel("block")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    path = out_dir / "compare_per_block.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_consistency_compare(runs: list[EvalRun], out_dir: Path, split: str = "val") -> Path:
+    names = ("c_attn", "c_fc", "mlp_proj", "ln_1", "ln_2")
+    fig, axes = plt.subplots(1, len(names), figsize=(4 * len(names), 4), squeeze=False)
+    floor_drawn = False
+    for r in runs:
+        if split not in r.splits:
+            continue
+        pb = r.get(split, "qz_mean", "consistency", default={}).get("per_block")
+        real = r.split(split).get("real_consistency", {}).get("per_block")
+        for i, n in enumerate(names):
+            if pb:
+                axes[0, i].plot(pb[n]["median"], "o-", label=f"{r.name}", markersize=3)
+            if real and not floor_drawn:
+                axes[0, i].plot(real[n]["median"], "k--", label="real (fp16 floor)")
+        floor_drawn = floor_drawn or bool(real)
+    for i, n in enumerate(names):
+        axes[0, i].set_title(f"{n}: median rel. err ({split})", fontsize=9)
+        axes[0, i].set_yscale("log")
+        axes[0, i].set_xlabel("block")
+        axes[0, i].grid(True, alpha=0.3)
+    axes[0, 0].legend(fontsize=7)
+    fig.tight_layout()
+    path = out_dir / "compare_consistency.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return path
 
 
 # ----------------------------------------------------------------------
@@ -323,15 +331,12 @@ def main() -> int:
     for spec in args.run:
         name, path = _parse_run_arg(spec)
         runs.append(EvalRun.from_dir(name, path))
-        print(f"loaded {name} ← {path}  (mode={runs[-1].mode}, splits={runs[-1].splits})",
-              flush=True)
+        print(f"loaded {name} ← {path}  (mode={runs[-1].mode}, splits={runs[-1].splits})", flush=True)
 
     write_comparison_summary(runs, out_dir)
-    bar_paths = plot_compare(runs, out_dir)
-    per_block_path = plot_per_block_compare(runs, out_dir)
-    print(f"\nplots:", flush=True)
-    for p_ in bar_paths + [per_block_path]:
-        print(f"  {p_}", flush=True)
+    paths = [plot_compare(runs, out_dir), plot_per_block_compare(runs, out_dir),
+             plot_consistency_compare(runs, out_dir)]
+    print("\nplots:", *[f"  {p_}" for p_ in paths], sep="\n", flush=True)
     print(f"\nsummary: {out_dir / 'comparison.txt'}", flush=True)
     return 0
 

@@ -1,11 +1,8 @@
-"""Smoke tests for the eval-results analyzer.
+"""rev-7 eval-results analyzer: synthetic ``rev7_eval`` metrics → table, plots, decision rule.
 
-Synthesizes a metrics.json with the exact shape produced by
-``specdec_af.evaluate.write_summary`` (no training required) and verifies:
-
-- Loading + milestone-check semantics (PASS/FAIL on ordering and floor).
-- Comparison summary writes both ``comparison.txt`` and ``comparison.json``.
-- All four cross-run plots produce non-trivial PNGs.
+The decision-rule tests pin every branch of the pre-registered rule
+(agent_plan_rev7.md §5): disqualification (collapse / block cosine < 0.5),
+clear top-1 win, consistency tie-break, option_d tie-break.
 """
 from __future__ import annotations
 
@@ -17,166 +14,101 @@ import pytest
 from specdec_af.analysis.eval_results import (
     EvalRun,
     comparison_table,
-    decision_summary,
-    milestone_checks,
+    decision_rule,
     plot_compare,
+    plot_consistency_compare,
     plot_per_block_compare,
+    run_summary,
     write_comparison_summary,
 )
 
 
-def _make_metrics(*, mode: str, top1_qz: float, top1_prior: float,
-                  top1_wrong: float, top1_baseline: float,
-                  pred_conc_baseline: float = 0.15) -> dict:
-    """Build a metrics.json dict matching specdec_af.evaluate's schema."""
-    def cond(top1: float, base_ce: float = 2.0, n_term: int = 100) -> dict:
-        return {
-            "recon_mse_normalized": [0.5] * 12,
-            "recon_mse_unnorm": [1.0 + 0.1 * i for i in range(12)],
-            "recon_cosine": [0.9 - 0.01 * i for i in range(12)],
-            "recon_loss_native": 0.5,
-            "terminal_mse_unnorm": 1.0 / max(top1, 0.01),  # inverse-ish
-            "n_terminal": n_term,
-            "top1_agreement": top1,
-            "ce_teacher_student": base_ce,
-            "perplexity_TS": 2.71828 ** base_ce,
-            "kl_teacher_student": 0.8,
-            "pred_concentration": pred_conc_baseline if top1 == top1_baseline else 0.18,
-        }
-
+def _cond(top1: float, cross: float = 0.05, min_cos: float = 0.9) -> dict:
+    per_block = {n: {"median": [cross] * 12, "mean": [cross] * 12}
+                 for n in ("c_attn", "c_fc", "mlp_proj", "ln_1", "ln_2")}
     return {
-        "checkpoint": "/fake/path.pt",
-        "cache_dir": "/fake/cache",
-        "mode": mode,
-        "n_params": 70_000_000,
-        "n_chunks_requested": 1024,
-        "seed": 42,
-        "conditions": ["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
-        "splits": {
-            "val": {
-                "n_chunks_sampled": 1024,
-                "conditions": {
-                    "qz": cond(top1_qz),
-                    "prior": cond(top1_prior),
-                    "wrong_prefix": cond(top1_wrong),
-                    # rev-6: wrong_z slots between wrong_prefix and baseline.
-                    # Synthesize as halfway between qz and prior — plausible
-                    # value, the analyzer just needs the key to exist.
-                    "wrong_z": cond((top1_qz + top1_prior) / 2),
-                    "baseline": cond(top1_baseline),
-                },
-            },
-        },
+        "top1_agreement": top1, "top5_overlap": min(1.0, top1 + 0.2), "kl_teacher_student": 1.0,
+        "ce_teacher_student": 2.0, "pred_concentration": 0.1, "n_terminal": 100,
+        "recon_cosine": [min_cos] + [0.95] * 11, "recon_rel_err": [0.3] * 12,
+        "recon_mse_normalized": [0.2] * 12,
+        "consistency_cross_median": cross, "consistency_intra_median": cross,
+        "consistency": {"per_block": per_block, "cross_median": cross, "intra_median": cross},
     }
 
 
-def _write_run(tmp_path: Path, name: str, metrics: dict) -> Path:
+def _metrics(mode: str, top1: float, *, cross: float = 0.05, min_cos: float = 0.9,
+             kl: float = 5.0, train_top1: float | None = None) -> dict:
+    def split(t1):
+        return {
+            "n_positions": 5000,
+            "latent_stats": {"kl_block": [kl] * 12, "active_units_block": [40] * 12},
+            "real_consistency": {"cross_median": 3e-4, "intra_median": 3e-4,
+                                 "per_block": {n: {"median": [3e-4] * 12} for n in
+                                               ("c_attn", "c_fc", "mlp_proj", "ln_1", "ln_2")}},
+            "conditions": {
+                "qz_mean": _cond(t1, cross, min_cos), "qz_sample": _cond(t1 - 0.05, cross, min_cos),
+                "prior": _cond(0.04, 0.5), "wrong_z": _cond(0.02, 0.4),
+            },
+        }
+    splits = {"val": split(top1)}
+    if train_top1 is not None:
+        splits["train"] = split(train_top1)
+    return {"format": "rev7_eval", "checkpoint": "/x/final.pt", "mode": mode, "step": 60000, "splits": splits}
+
+
+def _run(tmp_path: Path, name: str, metrics: dict) -> EvalRun:
     d = tmp_path / name
-    d.mkdir(parents=True)
+    d.mkdir()
     (d / "metrics.json").write_text(json.dumps(metrics))
-    return d
+    return EvalRun.from_dir(name, d)
 
 
-def test_load_eval_run(tmp_path):
-    d = _write_run(tmp_path, "r1",
-                   _make_metrics(mode="option_4", top1_qz=0.30, top1_prior=0.20,
-                                 top1_wrong=0.05, top1_baseline=0.05))
-    run = EvalRun.from_dir("r1", d)
-    assert run.mode == "option_4"
-    assert run.splits == ["val"]
-    assert run.get("val", "qz", "top1_agreement") == 0.30
+def test_clear_top1_win(tmp_path):
+    a = _run(tmp_path, "opt4", _metrics("option_4", 0.45))
+    d = _run(tmp_path, "optd", _metrics("option_d", 0.40))
+    dec = decision_rule([a, d])
+    assert dec["winner"] == "opt4" and dec["decided_by"] == "teacher top-1"
 
 
-def test_milestone_checks_pass(tmp_path):
-    """qz > prior > wrong ≈ baseline AND qz > floor → both PASS."""
-    d = _write_run(tmp_path, "good",
-                   _make_metrics(mode="option_4", top1_qz=0.30, top1_prior=0.20,
-                                 top1_wrong=0.05, top1_baseline=0.05,
-                                 pred_conc_baseline=0.15))
-    run = EvalRun.from_dir("good", d)
-    m = milestone_checks(run, "val")
-    assert m["ordering_pass"] is True
-    assert m["floor_pass"] is True
-    assert m["qz_vs_prior_gap"] == pytest.approx(0.10)
-    assert m["qz_vs_wrong_gap"] == pytest.approx(0.25)
+def test_within_2pp_consistency_decides(tmp_path):
+    a = _run(tmp_path, "opt4", _metrics("option_4", 0.410, cross=0.03))
+    d = _run(tmp_path, "optd", _metrics("option_d", 0.420, cross=0.06))
+    dec = decision_rule([a, d])
+    assert dec["winner"] == "opt4" and dec["decided_by"] == "cross-block consistency"
 
 
-def test_milestone_checks_floor_fail(tmp_path):
-    """qz < baseline_pred_concentration → floor FAIL even if ordering PASSes."""
-    d = _write_run(tmp_path, "below_floor",
-                   _make_metrics(mode="option_4", top1_qz=0.10, top1_prior=0.05,
-                                 top1_wrong=0.02, top1_baseline=0.02,
-                                 pred_conc_baseline=0.25))
-    run = EvalRun.from_dir("below_floor", d)
-    m = milestone_checks(run, "val")
-    assert m["ordering_pass"] is True
-    assert m["floor_pass"] is False
+def test_within_2pp_and_10pct_goes_to_option_d(tmp_path):
+    a = _run(tmp_path, "opt4", _metrics("option_4", 0.425, cross=0.050))
+    d = _run(tmp_path, "optd", _metrics("option_d", 0.410, cross=0.053))
+    dec = decision_rule([a, d])
+    assert dec["winner"] == "optd" and dec["decided_by"] == "option_d tie-break"
 
 
-def test_milestone_checks_ordering_fail_z_dominates(tmp_path):
-    """qz > wrong > prior → 'z dominates prefix' → ordering FAIL.
+def test_disqualification(tmp_path):
+    bad_cos = _run(tmp_path, "opt4", _metrics("option_4", 0.60, min_cos=0.45))
+    ok = _run(tmp_path, "optd", _metrics("option_d", 0.40))
+    dec = decision_rule([bad_cos, ok])
+    assert dec["winner"] == "optd" and dec["disqualified"] == ["opt4"]
 
-    The actual option_d_v2 pattern: encoder leaks via z, wrong_prefix > prior.
-    """
-    d = _write_run(tmp_path, "z_dom",
-                   _make_metrics(mode="option_d", top1_qz=0.32, top1_prior=0.05,
-                                 top1_wrong=0.25, top1_baseline=0.03))
-    run = EvalRun.from_dir("z_dom", d)
-    m = milestone_checks(run, "val")
-    assert m["ordering_pass"] is False  # because wrong > prior
-    assert m["floor_pass"] is True
+    collapsed = _run(tmp_path, "c", _metrics("option_d", 0.50, kl=1e-4))
+    dec2 = decision_rule([collapsed])
+    assert dec2["winner"] is None and "collapse" in dec2["steps"][0]
 
 
-def test_comparison_writes_artifacts(tmp_path):
-    runs = []
-    for name, top1_qz in [("r_low", 0.18), ("r_high", 0.32)]:
-        d = _write_run(tmp_path, name,
-                       _make_metrics(mode="option_4", top1_qz=top1_qz,
-                                     top1_prior=top1_qz * 0.6,
-                                     top1_wrong=0.05, top1_baseline=0.04))
-        runs.append(EvalRun.from_dir(name, d))
+def test_table_summary_and_plots(tmp_path):
+    a = _run(tmp_path, "opt4", _metrics("option_4", 0.45, train_top1=0.55))
+    d = _run(tmp_path, "optd", _metrics("option_d", 0.40, train_top1=0.47))
+    s = run_summary(a, "val")
+    assert s["qz_top1"] == 0.45 and s["kl_total"] == pytest.approx(60.0) and s["active_units_total"] == 480
+    table = comparison_table([a, d])
+    assert table["runs"][0]["train_val_top1_gap"] == pytest.approx(0.10)
+    assert table["decision"]["winner"] == "opt4"
 
-    out_dir = tmp_path / "out"
-    write_comparison_summary(runs, out_dir)
-    assert (out_dir / "comparison.txt").exists()
-    assert (out_dir / "comparison.json").exists()
-
-    # Decision summary picks the higher val qz_top1
-    ds = decision_summary(runs, split="val")
-    assert ds["winner"] == "r_high"
-
-
-def test_plots(tmp_path):
-    runs = []
-    for name, top1 in [("a", 0.2), ("b", 0.3)]:
-        d = _write_run(tmp_path, name,
-                       _make_metrics(mode="option_4", top1_qz=top1,
-                                     top1_prior=top1 * 0.6,
-                                     top1_wrong=0.05, top1_baseline=0.04))
-        runs.append(EvalRun.from_dir(name, d))
-
-    out_dir = tmp_path / "plots"
-    out_dir.mkdir()
-    paths = plot_compare(runs, out_dir)
-    assert len(paths) == 4  # top1, ce, ppl, tmse
-    for p in paths:
+    out = tmp_path / "cmp"
+    write_comparison_summary([a, d], out)
+    text = (out / "comparison.txt").read_text()
+    assert "pre-registered decision rule" in text and "winner: opt4" in text
+    assert json.loads((out / "comparison.json").read_text())["decision"]["winner"] == "opt4"
+    for p in (plot_compare([a, d], out), plot_per_block_compare([a, d], out),
+              plot_consistency_compare([a, d], out)):
         assert p.exists() and p.stat().st_size > 1000
-
-    pb = plot_per_block_compare(runs, out_dir)
-    assert pb.exists() and pb.stat().st_size > 1000
-
-
-def test_comparison_table_structure(tmp_path):
-    d = _write_run(tmp_path, "r1",
-                   _make_metrics(mode="option_d", top1_qz=0.32, top1_prior=0.05,
-                                 top1_wrong=0.25, top1_baseline=0.03))
-    runs = [EvalRun.from_dir("r1", d)]
-    tbl = comparison_table(runs)
-    assert "runs" in tbl
-    assert len(tbl["runs"]) == 1
-    r = tbl["runs"][0]
-    assert r["name"] == "r1"
-    assert r["mode"] == "option_d"
-    assert "val" in r["splits"]
-    assert "ordering_pass" in r["splits"]["val"]
-    assert "qz_vs_prior_gap" in r["splits"]["val"]
