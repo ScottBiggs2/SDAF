@@ -10,8 +10,8 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/eval-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/eval-%j.err
 
-# Phase 7 evaluation — load a trained VAE checkpoint and run 4-condition
-# ablation (qz / prior / wrong_prefix / baseline) on train + val subsets.
+# Phase 7 evaluation — load a trained VAE checkpoint and run the condition
+# ablation (rev-7 interim: qz / prior / wrong_z) on train + val subsets.
 # Outputs CE / perplexity / top-1 agreement / per-block MSE + figures.
 #
 # Required env vars (override at sbatch time):

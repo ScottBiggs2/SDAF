@@ -10,14 +10,13 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.err
 
-# Phase 5 overfit-a-batch sweep — gate that resolves option-4-vs-D, plus
-# diagnostic ablation of whether prefix conditioning is actually being used.
+# Phase 5 overfit-a-batch sweep — option-4-vs-D sanity on one fixed batch.
+# rev-7: unconditional VAE; the ablation is now wrong_z (rolled mu) instead of wrong_prefix.
 # See specdec_af_gpt2_impl_plan_v1.md §"Open design decisions".
 #
 # Prereq: cache + chunk_norm_stats.pt from submit_collect.sh.
 #
-# Each log step now reports BOTH a `correct-prefix` and a `wrong-prefix` (shuffled)
-# eval pass, with:
+# Each log step reports BOTH a `qz` and a `wrong_z` (rolled mu) eval pass, with:
 #   - unnormalized terminal-slot MSE (cross-mode comparison)
 #   - top-1 agreement between teacher and student lm_head outputs (terminal items)
 #   - CE(teacher_argmax, student_logits) (terminal items)

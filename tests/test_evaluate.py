@@ -1,7 +1,7 @@
 """Smoke test for Phase-7 evaluation end-to-end.
 
 Builds a mini cache + trains a 25-step checkpoint, then runs the evaluator
-on val (a tiny shard) with all 4 conditions. Checks output structure and
+on val (a tiny shard) with all conditions. Checks output structure and
 that condition ordering is at least computed without errors.
 """
 from __future__ import annotations
@@ -64,8 +64,6 @@ def trained_run(tmp_path_factory):
         val_max_batches=4, n_steps_override=25, seed=0,
         num_workers=0, pin_memory=False,
         grad_clip_norm=None,
-        prefix_n_attn_blocks=1, prefix_n_heads=4, prefix_d_ff=512,
-        prefix_ctx_len=16,
         lr_warmup_steps=0,
     )
     summary = train(cdir, odir, cfg, device=torch.device("cpu"))
@@ -78,7 +76,7 @@ def test_evaluate_end_to_end(trained_run, tmp_path):
     results = evaluate_checkpoint(
         trained_run["checkpoint"], trained_run["cache_dir"],
         splits=["val"], n_chunks=16, val_shards=1, seed=0,
-        conditions=["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
+        conditions=["qz", "prior", "wrong_z"],
         device=torch.device("cpu"),
         skip_lm_head=False,
     )
@@ -87,7 +85,7 @@ def test_evaluate_end_to_end(trained_run, tmp_path):
     assert results["mode"] == "option_4"
     assert "val" in results["splits"]
     conds = results["splits"]["val"]["conditions"]
-    assert set(conds.keys()) == {"qz", "prior", "wrong_prefix", "wrong_z", "baseline"}
+    assert set(conds.keys()) == {"qz", "prior", "wrong_z"}
 
     # Each condition has full metric dict
     for cond, m in conds.items():
@@ -130,7 +128,7 @@ def test_micro_batching_equivalent(trained_run, tmp_path):
     """rev-5: micro-batched eval is numerically equivalent to whole-batch eval.
     rev-6: extended to cover the new wrong_z condition (two-pass forward).
 
-    Run all 5 conditions twice — once unbatched, once with micro_batch_size=4
+    Run all conditions twice — once unbatched, once with micro_batch_size=4
     against a 16-chunk batch. The recon_mse_normalized arrays should match
     within fp tolerance for every condition (proves the pre-computed full-
     batch rolls + seeded prior z stay bit-identical under chunking).
@@ -138,7 +136,7 @@ def test_micro_batching_equivalent(trained_run, tmp_path):
     common = dict(
         cache_dir=trained_run["cache_dir"],
         splits=["val"], n_chunks=16, val_shards=1, seed=0,
-        conditions=["qz", "prior", "wrong_prefix", "wrong_z", "baseline"],
+        conditions=["qz", "prior", "wrong_z"],
         device=torch.device("cpu"),
         skip_lm_head=True,
     )
@@ -146,7 +144,7 @@ def test_micro_batching_equivalent(trained_run, tmp_path):
     r_micro = evaluate_checkpoint(
         trained_run["checkpoint"], **common, micro_batch_size=4,
     )
-    for cond in ("qz", "prior", "wrong_prefix", "wrong_z", "baseline"):
+    for cond in ("qz", "prior", "wrong_z"):
         a = r_whole["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
         b = r_micro["splits"]["val"]["conditions"][cond]["recon_mse_normalized"]
         # Float-tolerance comparison element-wise. The chunked path may have

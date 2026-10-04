@@ -1,14 +1,14 @@
-"""Phase 7 (modified) evaluation — train + val subsets, 4 ablation conditions,
+"""Phase 7 (modified) evaluation — train + val subsets, ablation conditions,
 plus downstream lm_head metrics (CE, perplexity, next-token agreement, KL).
 
 Loads a checkpoint produced by ``specdec_af.training.train``, evaluates on
-``train`` and/or ``val`` subsets of the cache, and runs four conditions per
-split:
+``train`` and/or ``val`` subsets of the cache, and runs these conditions per
+split (rev-7 interim: unconditional VAE, prefix conditions removed; the full
+rev-7 fidelity suite replaces this module in Stage 3):
 
-  - ``qz``           : encoder z (= mu, deterministic), correct prefix
-  - ``prior``        : z ~ N(0, I), correct prefix
-  - ``wrong_prefix`` : encoder z (correct prefix to encoder), shuffled prefix to decoder
-  - ``baseline``     : z ~ N(0, I), shuffled prefix
+  - ``qz``      : encoder z (= mu, deterministic)
+  - ``prior``   : z ~ N(0, I)
+  - ``wrong_z`` : a different item's encoder mu (rolled by 1), own block_id
 
 Metrics per (split, condition):
 
@@ -79,10 +79,8 @@ from specdec_af.training.overfit_sweep import load_lm_head_only
 
 
 _ENV_RE = re.compile(r"\$\{([^}]+)\}")
-Condition = Literal["qz", "prior", "wrong_prefix", "wrong_z", "baseline"]
-ALL_CONDITIONS: tuple[Condition, ...] = (
-    "qz", "prior", "wrong_prefix", "wrong_z", "baseline",
-)
+Condition = Literal["qz", "prior", "wrong_z"]
+ALL_CONDITIONS: tuple[Condition, ...] = ("qz", "prior", "wrong_z")
 
 
 def expand_env(s: str) -> str:
@@ -124,10 +122,6 @@ def sample_batch_from_dataset(
     return {
         "chunk_raw": torch.stack([it["chunk_raw"] for it in items]).to(device),
         "block_ids": torch.stack([it["block_id"] for it in items]).to(device),
-        "i_idx": torch.stack([it["i_idx"] for it in items]).to(device),
-        "k_val": torch.stack([it["k_val"] for it in items]).to(device),
-        "prefix_ids": torch.stack([it["prefix_ids"] for it in items]).to(device),
-        "target_token": torch.stack([it["target_token"] for it in items]).to(device),
     }
 
 
@@ -138,8 +132,6 @@ def sample_batch_from_dataset(
 @torch.no_grad()
 def forward_under_condition(
     vae,
-    prefix_encoder,
-    cond_assembler,
     chunk_norm: ChunkNorm,
     batch: dict,
     *,
@@ -148,73 +140,40 @@ def forward_under_condition(
     micro_batch_size: int | None = None,
 ) -> Tensor:
     """Returns ``recon`` under the named condition. ``z = mu`` (deterministic)
-    for encoder-z conditions; ``z ~ N(0, I)`` for prior conditions.
+    for ``qz``; ``z ~ N(0, I)`` for ``prior``; rolled ``mu`` for ``wrong_z``.
 
-    Wrong-prefix conditions shuffle ``prefix_ids`` via ``torch.roll(., 1, 0)``
-    before passing to the decoder; the encoder always sees the correct prefix
-    (matches Phase-7 plan: "encoder z, shuffled prefix"). Under rev-4 this
-    shuffles **token sequences**, not pre-computed activation features —
-    numerically non-comparable with v1–v3 evaluations.
-
-    rev-6 adds ``wrong_z``: the decoder gets the correct prefix but a *rolled*
-    ``z`` (a different chunk's encoder mu). This is the diagnostic counterpart
-    to ``wrong_prefix`` — if recon degrades meaningfully under wrong_z, the
-    cond pathway is contributing; if it stays good, z is doing all the work.
-
-    ``micro_batch_size`` (rev-5): if set and ``< B``, the PE / VAE forward is
+    ``micro_batch_size`` (rev-5): if set and ``< B``, the VAE forward is
     chunked into sub-batches of this size and recons are concatenated. Full-
-    batch quantities (the ``torch.roll`` shuffles and the seeded prior z)
-    are computed once over the whole batch and then sliced, so the result is
-    bit-identical to the unbatched path when ``micro_batch_size >= B``.
+    batch quantities (the ``wrong_z`` roll and the seeded prior z) are
+    computed once over the whole batch and then sliced, so the result is
+    equivalent to the unbatched path.
     """
     chunk_raw = batch["chunk_raw"]
     block_ids = batch["block_ids"]
-    i_idx = batch["i_idx"]
-    k_val = batch["k_val"]
-    prefix_ids = batch["prefix_ids"]
     B = chunk_raw.shape[0]
-
-    # Pre-compute full-batch quantities (preserves cross-batch semantics under
-    # micro-batching).
-    if condition in ("wrong_prefix", "baseline"):
-        prefix_ids_for_decoder = torch.roll(prefix_ids, shifts=1, dims=0)
-    else:
-        prefix_ids_for_decoder = prefix_ids
-
     mbs = B if micro_batch_size is None or micro_batch_size >= B else int(micro_batch_size)
 
-    if condition in ("prior", "baseline"):
+    if condition == "prior":
         g = torch.Generator(device=chunk_raw.device).manual_seed(seed)
         z_full = torch.randn(B, vae.d_latent, device=chunk_raw.device, generator=g)
     elif condition == "wrong_z":
-        # Two-pass: encoder over full batch (in micro-batches), gather mu, roll
-        # by 1 across the batch. Decoder still gets the correct prefix below.
         mus: list[Tensor] = []
         for start in range(0, B, mbs):
-            end = min(start + mbs, B)
-            sl = slice(start, end)
-            cnorm_slice = chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl])
-            mu, _ = vae.encode(cnorm_slice)
+            sl = slice(start, min(start + mbs, B))
+            mu, _ = vae.encode(chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl]))
             mus.append(mu)
         z_full = torch.roll(torch.cat(mus, dim=0), shifts=1, dims=0)
     else:
-        z_full = None  # encoder produces z per slice for qz / wrong_prefix
+        z_full = None  # qz: encoder mu per slice
 
     recons = []
     for start in range(0, B, mbs):
-        end = min(start + mbs, B)
-        sl = slice(start, end)
-        cnorm_slice = chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl])
-        if z_full is None:  # qz / wrong_prefix: z = encoder.mu (single-pass)
-            mu, _ = vae.encode(cnorm_slice)  # rev-6: encoder ignores cond
-            z = mu
+        sl = slice(start, min(start + mbs, B))
+        if z_full is None:
+            z, _ = vae.encode(chunk_norm.forward_per_item(chunk_raw[sl], block_ids[sl]))
         else:
             z = z_full[sl]
-        cond_for_decoder = cond_assembler(
-            prefix_encoder(prefix_ids_for_decoder[sl]),
-            i_idx[sl], block_ids[sl], k_val[sl],
-        )
-        recons.append(vae.decode(z, cond_for_decoder))
+        recons.append(vae.decode(z, block_ids[sl]))
 
     return torch.cat(recons, dim=0)
 
@@ -357,8 +316,6 @@ def compute_all_metrics(
 
 def evaluate_split(
     vae,
-    prefix_encoder,
-    cond_assembler,
     chunk_norm: ChunkNorm,
     ds: WindowChunkDataset,
     lm_head: nn.Module | None,
@@ -375,7 +332,7 @@ def evaluate_split(
     out = {"n_chunks_sampled": int(batch["chunk_raw"].shape[0]), "conditions": {}}
     for cond in conditions:
         recon = forward_under_condition(
-            vae, prefix_encoder, cond_assembler, chunk_norm, batch,
+            vae, chunk_norm, batch,
             condition=cond, seed=seed, micro_batch_size=micro_batch_size,
         )
         out["conditions"][cond] = compute_all_metrics(
@@ -399,8 +356,6 @@ def evaluate_checkpoint(
 ) -> dict:
     loaded = load_vae_checkpoint(checkpoint_path, device=device)
     vae = loaded["vae"]
-    pe = loaded["prefix_encoder"]
-    ca = loaded["cond_assembler"]
     chunk_norm = loaded["chunk_norm"]
     mode = loaded["mode"]
 
@@ -415,9 +370,7 @@ def evaluate_checkpoint(
         "checkpoint": str(checkpoint_path),
         "cache_dir": str(cache_dir),
         "mode": mode,
-        "n_params": int(sum(p.numel() for p in vae.parameters())
-                         + sum(p.numel() for p in pe.parameters())
-                         + sum(p.numel() for p in ca.parameters())),
+        "n_params": int(sum(p.numel() for p in vae.parameters())),
         "n_chunks_requested": n_chunks,
         "seed": seed,
         "conditions": conditions,
@@ -430,7 +383,7 @@ def evaluate_checkpoint(
             raise ValueError(f"unknown split {sp!r}")
         print(f"\n=== split: {sp} ({len(split_map[sp])} items) ===", flush=True)
         results["splits"][sp] = evaluate_split(
-            vae, pe, ca, chunk_norm, split_map[sp], lm_head,
+            vae, chunk_norm, split_map[sp], lm_head,
             mode=mode, n_chunks=n_chunks, seed=seed,
             conditions=conditions, device=device,
             micro_batch_size=micro_batch_size,
@@ -478,21 +431,6 @@ def write_summary(results: dict, out_dir: Path) -> Path:
                 f"{m.get('terminal_mse_unnorm', float('nan')):>12.4g} "
                 f"{m.get('pred_concentration', float('nan')):>10.4f}"
             )
-        # Phase-7 milestone diagnostic
-        qz = sp_data["conditions"].get("qz", {})
-        prior = sp_data["conditions"].get("prior", {})
-        wp = sp_data["conditions"].get("wrong_prefix", {})
-        bl = sp_data["conditions"].get("baseline", {})
-        if all([qz, prior, wp, bl]):
-            ordering = (qz.get("top1_agreement", 0) > prior.get("top1_agreement", 0) >
-                        wp.get("top1_agreement", 0) >= bl.get("top1_agreement", 0))
-            floor = bl.get("pred_concentration", 0)
-            qz_top1 = qz.get("top1_agreement", 0)
-            lines.append("")
-            lines.append(f"  milestone checks:")
-            lines.append(f"    1. qz > prior > wrong_prefix ≈ baseline : {'PASS' if ordering else 'FAIL'}")
-            lines.append(f"    2. qz top1 ({qz_top1:.4f}) > baseline pred_concentration ({floor:.4f}) : "
-                         f"{'PASS' if qz_top1 > floor else 'FAIL'}")
         lines.append("")
 
     text = "\n".join(lines)
@@ -513,7 +451,7 @@ def plot_bars(results: dict, out_dir: Path) -> Path:
 
     fig, axes = plt.subplots(len(metrics), len(splits), figsize=(5 * len(splits), 4 * len(metrics)),
                              squeeze=False)
-    color_map = {"qz": "tab:green", "prior": "tab:blue", "wrong_prefix": "tab:orange", "baseline": "tab:red"}
+    color_map = {"qz": "tab:green", "prior": "tab:blue", "wrong_z": "tab:purple"}
     for row, (key, label) in enumerate(metrics):
         for col, sp in enumerate(splits):
             ax = axes[row, col]
@@ -538,7 +476,7 @@ def plot_per_block(results: dict, out_dir: Path, n_layers: int = N_LAYERS_DEFAUL
     """Per-block recon MSE (unnormalized) across blocks, one line per condition."""
     splits = list(results["splits"].keys())
     fig, axes = plt.subplots(1, len(splits), figsize=(6 * len(splits), 5), squeeze=False)
-    color_map = {"qz": "tab:green", "prior": "tab:blue", "wrong_prefix": "tab:orange", "baseline": "tab:red"}
+    color_map = {"qz": "tab:green", "prior": "tab:blue", "wrong_z": "tab:purple"}
     for col, sp in enumerate(splits):
         ax = axes[0, col]
         for cond, m in results["splits"][sp]["conditions"].items():

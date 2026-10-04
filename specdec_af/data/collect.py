@@ -244,7 +244,7 @@ def main() -> int:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     ctx_len = cfg["trace"]["ctx_len"]
-    k = cfg["trace"]["k"]
+    k = cfg["trace"].get("k", 1)  # rev-7: trace.k removed from config; v1 collector stays k=1
     n_windows = args.n_windows if args.n_windows is not None else cfg["corpus"]["n_windows"]
     n_cal = args.n_calibration_windows if args.n_calibration_windows is not None else cfg["corpus"]["n_calibration_windows"]
     split = args.split or cfg["corpus"]["split"]

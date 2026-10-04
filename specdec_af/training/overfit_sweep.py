@@ -1,15 +1,14 @@
-"""Phase 5 overfit-a-batch sweep — resolves the option-4-vs-D decision +
-diagnoses whether prefix conditioning is actually being used.
+"""Phase 5 overfit-a-batch sweep — option-4-vs-D sanity on one fixed batch.
 
-For each mode in ``--modes``, train a freshly-initialized ``CondVAE`` +
-``PrefixEncoder`` + ``ConditionAssembler`` on **one fixed batch** for
-``--n-steps`` steps. At each log step, run two eval passes (deterministic,
-no_grad) under:
+For each mode in ``--modes``, train a freshly-initialized ``TraceVAE`` on
+**one fixed batch** for ``--n-steps`` steps. At each log step, run two eval
+passes (deterministic, no_grad) under:
 
-  - ``correct``       — the batch's true ``prefix_ids`` (rev-4: token IDs)
-  - ``wrong_prefix``  — ``prefix_ids`` rolled by 1 across the batch
-                         (decoder-only cond corruption, per Phase 7's
-                         ``wrong_prefix`` ablation)
+  - ``qz``       — decoder gets the item's own encoder ``mu``
+  - ``wrong_z``  — decoder gets ``mu`` rolled by 1 across the batch (a
+                   different item's z, own block_id). rev-7: replaces the
+                   rev-4..6 ``wrong_prefix`` ablation; with the unconditional
+                   VAE, z must carry the content, so this should collapse.
 
 For each eval pass we log:
 
@@ -57,8 +56,7 @@ from specdec_af.models.chunk_index import (
     TERMINAL_BLOCK,
 )
 from specdec_af.models.chunk_norm import ChunkNorm
-from specdec_af.models.prefix_encoder import PrefixEncoder
-from specdec_af.models.vae import ConditionAssembler, CondVAE
+from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import save_vae_checkpoint
 from specdec_af.training.losses import (
     Mode,
@@ -133,27 +131,17 @@ def load_overfit_batch_from_cache(
     """Load shard 0, flatten ``[B, k, J, D]`` → ``[B*k*J, D]``, sample ``n_chunks``."""
     shard = torch.load(cache_dir / "windows" / "shard_0000.pt", map_location="cpu", weights_only=True)
     chunks = shard["chunks"].to(torch.float32)
-    pids = shard["prefix_ids"].to(torch.long)  # [B_w, ctx_len]
     B_w, k, J, D = chunks.shape
 
     rng = torch.Generator().manual_seed(seed)
     n_chunks = min(n_chunks, B_w * k * J)
     flat_idx = torch.randperm(B_w * k * J, generator=rng)[:n_chunks]
-    win_idx = flat_idx // (k * J)
-    inner = flat_idx % (k * J)
-    i_idx = inner // J
-    block_ids = inner % J
+    block_ids = flat_idx % J
 
     chunk_raw = chunks.reshape(-1, D)[flat_idx]
-    prefix_ids = pids[win_idx]
-    k_val = torch.full((n_chunks,), k, dtype=torch.long)
-
     return {
         "chunk_raw": chunk_raw.to(device),
         "block_ids": block_ids.to(device),
-        "i_idx": i_idx.to(device),
-        "k_val": k_val.to(device),
-        "prefix_ids": prefix_ids.to(device),
     }
 
 
@@ -163,10 +151,8 @@ def make_synthetic_batch(
     d_chunk: int = 9984,
     seed: int = 42,
     device: torch.device | str = "cpu",
-    vocab_size: int = 50257,
-    ctx_len: int = 128,
 ) -> dict:
-    """Synthetic overfit batch for the local CPU smoke (rev-4: token IDs)."""
+    """Synthetic overfit batch for the local CPU smoke."""
     g = torch.Generator().manual_seed(seed)
     block_ids = torch.randint(0, n_layers, (n_chunks,), generator=g)
     std_per_block = torch.linspace(0.5, 5.0, n_layers)
@@ -181,16 +167,9 @@ def make_synthetic_batch(
     chunk_raw[block_ids != 0, bin_s:bin_e] = 0.0
     chunk_raw[block_ids != (n_layers - 1), bout_s:bout_e] = 0.0
 
-    prefix_ids = torch.randint(0, vocab_size, (n_chunks, ctx_len), generator=g, dtype=torch.long)
-    i_idx = torch.zeros(n_chunks, dtype=torch.long)
-    k_val = torch.ones(n_chunks, dtype=torch.long)
-
     return {
         "chunk_raw": chunk_raw.to(device),
         "block_ids": block_ids.to(device),
-        "i_idx": i_idx.to(device),
-        "k_val": k_val.to(device),
-        "prefix_ids": prefix_ids.to(device),
     }
 
 
@@ -271,29 +250,26 @@ def compute_downstream_metrics(
 
 @torch.no_grad()
 def eval_pass(
-    vae: CondVAE,
-    prefix_encoder: PrefixEncoder,
-    cond_assembler: ConditionAssembler,
+    vae: TraceVAE,
     *,
     chunk_norm_input: Tensor,
     chunk_raw: Tensor,
     block_ids: Tensor,
-    i_idx: Tensor,
-    k_val: Tensor,
-    prefix_ids: Tensor,
     chunk_norm: ChunkNorm,
     mode: Mode,
     lm_head: nn.Module | None,
+    roll_z: bool = False,
 ) -> dict:
-    """Deterministic eval (``z=mu``, no grad) under whatever ``prefix_ids`` is given.
+    """Deterministic eval (``z=mu``, no grad). ``roll_z`` feeds each item the
+    ``mu`` of its batch neighbour (``wrong_z``); block_id stays the item's own.
 
-    Returns a dict suitable for embedding under ``history[step]['eval_correct']``
-    or ``history[step]['eval_wrong']``.
+    Returns a dict suitable for embedding under ``history[step]['eval_qz']``
+    or ``history[step]['eval_wrong_z']``.
     """
-    prefix_emb = prefix_encoder(prefix_ids)
-    cond = cond_assembler(prefix_emb, i_idx, block_ids, k_val)
-    mu, _logvar = vae.encode(chunk_norm_input)  # rev-6: encoder ignores cond
-    recon = vae.decode(mu, cond)
+    mu, _logvar = vae.encode(chunk_norm_input)
+    if roll_z:
+        mu = torch.roll(mu, shifts=1, dims=0)
+    recon = vae.decode(mu, block_ids)
 
     rl = chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
     tmse = unnormalized_terminal_mse(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
@@ -314,31 +290,13 @@ def _build_models(
     chunk_norm: ChunkNorm,
     *,
     device: torch.device | str,
-    prefix_n_attn_blocks: int = 2,
-    prefix_n_heads: int = 12,
-    prefix_d_ff: int = 3072,
-    prefix_ctx_len: int = 128,
-    gpt2_model_name: str = "openai-community/gpt2",
-) -> tuple[CondVAE, PrefixEncoder, ConditionAssembler]:
-    """Build trainable stack; copies frozen GPT-2 wte+wpe into PrefixEncoder."""
-    from transformers import GPT2LMHeadModel
-
+) -> TraceVAE:
+    """Build the trainable VAE (rev-7: no PrefixEncoder / GPT-2 load)."""
     decoder_output_space = "raw" if mode == "option_d" else "normalized"
-    vae = CondVAE(decoder_output_space=decoder_output_space).to(device)
+    vae = TraceVAE(decoder_output_space=decoder_output_space).to(device)
     if mode == "option_d":
         vae.init_decoder_out_for_raw_space(chunk_norm.std.to(device))
-    prefix_encoder = PrefixEncoder(
-        ctx_len=prefix_ctx_len,
-        n_attn_blocks=prefix_n_attn_blocks,
-        n_heads=prefix_n_heads,
-        d_ff=prefix_d_ff,
-    )
-    gpt2 = GPT2LMHeadModel.from_pretrained(gpt2_model_name).eval()
-    prefix_encoder.load_gpt2_embeddings(gpt2)
-    del gpt2
-    prefix_encoder = prefix_encoder.to(device)
-    cond = ConditionAssembler().to(device)
-    return vae, prefix_encoder, cond
+    return vae
 
 
 def run_one_mode(
@@ -352,75 +310,41 @@ def run_one_mode(
     log_every: int,
     seed: int,
     lm_head: nn.Module | None = None,
-    eval_wrong_prefix: bool = True,
+    eval_wrong_z: bool = True,
     save_path: Path | None = None,
     training_config: dict | None = None,
-    prefix_n_attn_blocks: int = 2,
-    prefix_n_heads: int = 12,
-    prefix_d_ff: int = 3072,
-    prefix_ctx_len: int = 128,
     grad_clip_norm: float | None = None,
 ) -> dict:
     """Train one mode for ``n_steps`` on the fixed ``batch``.
 
     Logs at step 0 and every ``log_every`` steps (and the final step). Each
     log entry includes ``train_recon`` (stochastic z), ``kl``, and
-    ``eval_correct``/``eval_wrong`` dicts from :func:`eval_pass`.
+    ``eval_qz``/``eval_wrong_z`` dicts from :func:`eval_pass`.
     """
     torch.manual_seed(seed)
-    vae, prefix_encoder, cond_assembler = _build_models(
-        mode, chunk_norm, device=device,
-        prefix_n_attn_blocks=prefix_n_attn_blocks,
-        prefix_n_heads=prefix_n_heads,
-        prefix_d_ff=prefix_d_ff,
-        prefix_ctx_len=prefix_ctx_len,
-    )
+    vae = _build_models(mode, chunk_norm, device=device)
 
-    params = [
-        p for p in (
-            *vae.parameters(),
-            *prefix_encoder.parameters(),
-            *cond_assembler.parameters(),
-        ) if p.requires_grad
-    ]
+    params = [p for p in vae.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
     opt = torch.optim.Adam(params, lr=lr)
 
     chunk_raw = batch["chunk_raw"]
     block_ids = batch["block_ids"]
-    i_idx = batch["i_idx"]
-    k_val = batch["k_val"]
-    prefix_ids = batch["prefix_ids"]
-    prefix_ids_wrong = (
-        torch.roll(prefix_ids, shifts=1, dims=0) if eval_wrong_prefix else None
-    )
-
     chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
 
     def _log_step(step: int, train_recon_val: float, kl_val: float) -> dict:
-        eval_correct = eval_pass(
-            vae, prefix_encoder, cond_assembler,
-            chunk_norm_input=chunk_norm_input,
-            chunk_raw=chunk_raw, block_ids=block_ids,
-            i_idx=i_idx, k_val=k_val,
-            prefix_ids=prefix_ids,
+        common = dict(
+            chunk_norm_input=chunk_norm_input, chunk_raw=chunk_raw, block_ids=block_ids,
             chunk_norm=chunk_norm, mode=mode, lm_head=lm_head,
         )
         entry: dict = {
             "step": int(step),
             "train_recon": train_recon_val,
             "kl": kl_val,
-            "eval_correct": eval_correct,
+            "eval_qz": eval_pass(vae, **common),
         }
-        if prefix_ids_wrong is not None:
-            entry["eval_wrong"] = eval_pass(
-                vae, prefix_encoder, cond_assembler,
-                chunk_norm_input=chunk_norm_input,
-                chunk_raw=chunk_raw, block_ids=block_ids,
-                i_idx=i_idx, k_val=k_val,
-                prefix_ids=prefix_ids_wrong,
-                chunk_norm=chunk_norm, mode=mode, lm_head=lm_head,
-            )
+        if eval_wrong_z:
+            entry["eval_wrong_z"] = eval_pass(vae, **common, roll_z=True)
         return entry
 
     history: list[dict] = []
@@ -428,17 +352,13 @@ def run_one_mode(
 
     # Step 0 baseline (before any training).
     with torch.no_grad():
-        prefix_emb0 = prefix_encoder(prefix_ids)
-        cond_vec0 = cond_assembler(prefix_emb0, i_idx, block_ids, k_val)
-        out0 = vae(chunk_norm_input, cond_vec0)
+        out0 = vae(chunk_norm_input, block_ids)
         rec_loss0 = chunk_recon_loss(out0["recon"], chunk_raw, block_ids, chunk_norm, mode=mode).item()
         kl0 = kl_divergence(out0["mu"], out0["logvar"]).item()
     history.append(_log_step(0, rec_loss0, kl0))
 
     for step in range(1, n_steps + 1):
-        prefix_emb = prefix_encoder(prefix_ids)
-        cond_vec = cond_assembler(prefix_emb, i_idx, block_ids, k_val)
-        out = vae(chunk_norm_input, cond_vec)
+        out = vae(chunk_norm_input, block_ids)
         recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=mode)
         kl = kl_divergence(out["mu"], out["logvar"])
         loss = recon_loss  # beta = 0 for overfit-a-batch
@@ -455,9 +375,7 @@ def run_one_mode(
 
     if save_path is not None:
         save_vae_checkpoint(
-            save_path,
-            vae=vae, prefix_encoder=prefix_encoder,
-            cond_assembler=cond_assembler, chunk_norm=chunk_norm,
+            save_path, vae=vae, chunk_norm=chunk_norm,
             mode=mode, step=n_steps,
             training_config=training_config or {},
         )
@@ -467,9 +385,6 @@ def run_one_mode(
         "n_steps": n_steps,
         "lr": lr,
         "n_params": int(n_params),
-        "prefix_n_attn_blocks": prefix_n_attn_blocks,
-        "prefix_n_heads": prefix_n_heads,
-        "prefix_d_ff": prefix_d_ff,
         "grad_clip_norm": grad_clip_norm,
         "wall_seconds": wall,
         "history": history,
@@ -489,22 +404,19 @@ def run_sweep(
     log_every: int = 25,
     seed: int = 42,
     lm_head: nn.Module | None = None,
-    eval_wrong_prefix: bool = True,
+    eval_wrong_z: bool = True,
     checkpoints_dir: Path | None = None,
     training_config: dict | None = None,
-    prefix_n_attn_blocks: int = 2,
-    prefix_n_heads: int = 12,
-    prefix_d_ff: int = 3072,
-    prefix_ctx_len: int = 128,
     grad_clip_norm: float | None = None,
 ) -> dict:
     out = {
         "modes": [],
         "n_chunks": int(batch["chunk_raw"].shape[0]),
         "device": str(device),
-        "eval_wrong_prefix": bool(eval_wrong_prefix),
+        "eval_wrong_z": bool(eval_wrong_z),
         "lm_head_available": lm_head is not None,
     }
+    nan = float("nan")
     for mode in modes:
         print(f"\n== mode: {mode} ==", flush=True)
         save_path = checkpoints_dir / f"{mode}.pt" if checkpoints_dir is not None else None
@@ -512,24 +424,20 @@ def run_sweep(
             mode, batch, chunk_norm,
             n_steps=n_steps, lr=lr, device=device,
             log_every=log_every, seed=seed,
-            lm_head=lm_head, eval_wrong_prefix=eval_wrong_prefix,
+            lm_head=lm_head, eval_wrong_z=eval_wrong_z,
             save_path=save_path, training_config=training_config,
-            prefix_n_attn_blocks=prefix_n_attn_blocks,
-            prefix_n_heads=prefix_n_heads,
-            prefix_d_ff=prefix_d_ff,
-            prefix_ctx_len=prefix_ctx_len,
             grad_clip_norm=grad_clip_norm,
         )
         f = result["final"]
-        ec = f["eval_correct"]
-        ew = f.get("eval_wrong", {})
+        eq = f["eval_qz"]
+        ew = f.get("eval_wrong_z", {})
         print(
             f"  final step {f['step']}:\n"
             f"    train_recon={f['train_recon']:.4g}  kl={f['kl']:.4g}\n"
-            f"    correct: terminal_mse={ec['terminal_mse_unnorm']:.4g}  "
-            f"top1={ec.get('top1', float('nan')):.4f}  ce={ec.get('ce', float('nan')):.4g}\n"
-            f"    wrong:   terminal_mse={ew.get('terminal_mse_unnorm', float('nan')):.4g}  "
-            f"top1={ew.get('top1', float('nan')):.4f}  ce={ew.get('ce', float('nan')):.4g}\n"
+            f"    qz:      terminal_mse={eq['terminal_mse_unnorm']:.4g}  "
+            f"top1={eq.get('top1', nan):.4f}  ce={eq.get('ce', nan):.4g}\n"
+            f"    wrong_z: terminal_mse={ew.get('terminal_mse_unnorm', nan):.4g}  "
+            f"top1={ew.get('top1', nan):.4f}  ce={ew.get('ce', nan):.4g}\n"
             f"    n_params={result['n_params']:,}  wall={result['wall_seconds']:.1f}s",
             flush=True,
         )
@@ -542,51 +450,42 @@ def write_summary(results: dict, output_dir: Path) -> Path:
     json_path = output_dir / "results.json"
     json_path.write_text(json.dumps(results, indent=2))
 
+    nan = float("nan")
     lines = [
-        "Phase 5 overfit-a-batch sweep — summary",
+        "Phase 5 overfit-a-batch sweep — summary (rev-7: unconditional VAE)",
         "",
         f"n_chunks={results['n_chunks']}  device={results['device']}",
-        f"wrong_prefix_ablation={results['eval_wrong_prefix']}  lm_head_metrics={results['lm_head_available']}",
+        f"wrong_z_ablation={results['eval_wrong_z']}  lm_head_metrics={results['lm_head_available']}",
         "",
-        f"{'mode':<10} {'tmse_corr':>11} {'tmse_wrong':>11} {'top1_corr':>10} "
-        f"{'top1_wrong':>10} {'ce_corr':>9} {'ce_wrong':>9} {'n_params':>11}",
+        f"{'mode':<10} {'tmse_qz':>11} {'tmse_wrongz':>11} {'top1_qz':>10} "
+        f"{'top1_wrongz':>11} {'ce_qz':>9} {'ce_wrongz':>9} {'n_params':>11}",
     ]
     rows = []
     for m in results["modes"]:
         f = m["final"]
-        ec = f["eval_correct"]
-        ew = f.get("eval_wrong", {})
-        rows.append({
-            "mode": m["mode"],
-            "tmse_corr": ec["terminal_mse_unnorm"],
-            "tmse_wrong": ew.get("terminal_mse_unnorm", float("nan")),
-            "top1_corr": ec.get("top1", float("nan")),
-            "top1_wrong": ew.get("top1", float("nan")),
-            "ce_corr": ec.get("ce", float("nan")),
-            "ce_wrong": ew.get("ce", float("nan")),
-            "n_params": m["n_params"],
-        })
+        eq = f["eval_qz"]
+        ew = f.get("eval_wrong_z", {})
+        rows.append({"mode": m["mode"], "tmse_qz": eq["terminal_mse_unnorm"]})
         lines.append(
-            f"{m['mode']:<10} {ec['terminal_mse_unnorm']:>11.4g} "
-            f"{ew.get('terminal_mse_unnorm', float('nan')):>11.4g} "
-            f"{ec.get('top1', float('nan')):>10.4f} "
-            f"{ew.get('top1', float('nan')):>10.4f} "
-            f"{ec.get('ce', float('nan')):>9.4g} "
-            f"{ew.get('ce', float('nan')):>9.4g} "
+            f"{m['mode']:<10} {eq['terminal_mse_unnorm']:>11.4g} "
+            f"{ew.get('terminal_mse_unnorm', nan):>11.4g} "
+            f"{eq.get('top1', nan):>10.4f} "
+            f"{ew.get('top1', nan):>11.4f} "
+            f"{eq.get('ce', nan):>9.4g} "
+            f"{ew.get('ce', nan):>9.4g} "
             f"{m['n_params']:>11,}"
         )
 
-    # Winner = lowest terminal MSE under correct prefix; option_d tie-break.
-    sortable = sorted(rows, key=lambda r: (r["tmse_corr"], 0 if r["mode"] == "option_d" else 1))
+    # Winner = lowest qz terminal MSE; option_d tie-break.
+    sortable = sorted(rows, key=lambda r: (r["tmse_qz"], 0 if r["mode"] == "option_d" else 1))
     winner = sortable[0]["mode"] if sortable else None
 
     lines.append("")
-    lines.append(f"winner (lowest correct-prefix terminal MSE; option_d tie-break): {winner}")
+    lines.append(f"winner (lowest qz terminal MSE; option_d tie-break): {winner}")
     lines.append("")
     lines.append("Diagnostic notes:")
-    lines.append("  - top1_corr ≈ top1_wrong → decoder is NOT using prefix conditioning.")
-    lines.append("  - top1_corr >> top1_wrong → conditioning is informative (good).")
-    lines.append("  - ce_wrong >> ce_corr   → same signal, softer measurement.")
+    lines.append("  - top1_qz >> top1_wrongz → z carries the content (expected for the unconditional VAE).")
+    lines.append("  - top1_qz ≈ top1_wrongz  → decoder ignores z (posterior collapse / marginal-mode output).")
     lines.append("")
 
     summary_path = output_dir / "summary.txt"
@@ -616,14 +515,10 @@ def main() -> int:
                    help="even in smoke mode, load GPT-2 lm_head for downstream metrics")
     p.add_argument("--no-downstream-metrics", action="store_true",
                    help="skip lm_head load; no CE / top-1 metrics")
-    p.add_argument("--no-wrong-prefix", action="store_true",
-                   help="skip the wrong-prefix ablation eval")
+    p.add_argument("--no-wrong-z", action="store_true",
+                   help="skip the wrong-z ablation eval")
     p.add_argument("--no-save", action="store_true",
                    help="skip writing per-mode checkpoints")
-    p.add_argument("--prefix-n-attn-blocks", type=int, default=2)
-    p.add_argument("--prefix-n-heads", type=int, default=12)
-    p.add_argument("--prefix-d-ff", type=int, default=3072)
-    p.add_argument("--prefix-ctx-len", type=int, default=128)
     p.add_argument("--grad-clip-norm", type=float, default=None,
                    help="max L2 norm for grad clip; None or 0 = disabled")
     args = p.parse_args()
@@ -633,9 +528,7 @@ def main() -> int:
     print(f"modes={args.modes}  n_chunks={args.n_chunks}  n_steps={args.n_steps}  lr={args.lr}", flush=True)
 
     if args.smoke:
-        batch = make_synthetic_batch(
-            args.n_chunks, seed=args.seed, device=device, ctx_len=args.prefix_ctx_len,
-        )
+        batch = make_synthetic_batch(args.n_chunks, seed=args.seed, device=device)
         chunk_norm = fit_chunk_norm_from_batch(batch["chunk_raw"], batch["block_ids"]).to(device)
         output_dir = Path("./outputs/overfit_sweep_smoke")
         load_lm = args.smoke_with_lm_head and not args.no_downstream_metrics
@@ -669,21 +562,12 @@ def main() -> int:
         n_steps=args.n_steps, lr=args.lr, device=device,
         log_every=args.log_every, seed=args.seed,
         lm_head=lm_head,
-        eval_wrong_prefix=not args.no_wrong_prefix,
+        eval_wrong_z=not args.no_wrong_z,
         checkpoints_dir=checkpoints_dir,
         training_config={
             "lr": args.lr, "n_chunks": args.n_chunks, "n_steps": args.n_steps,
-            "seed": args.seed,
-            "prefix_n_attn_blocks": args.prefix_n_attn_blocks,
-            "prefix_n_heads": args.prefix_n_heads,
-            "prefix_d_ff": args.prefix_d_ff,
-            "prefix_ctx_len": args.prefix_ctx_len,
-            "grad_clip_norm": args.grad_clip_norm,
+            "seed": args.seed, "grad_clip_norm": args.grad_clip_norm,
         },
-        prefix_n_attn_blocks=args.prefix_n_attn_blocks,
-        prefix_n_heads=args.prefix_n_heads,
-        prefix_d_ff=args.prefix_d_ff,
-        prefix_ctx_len=args.prefix_ctx_len,
         grad_clip_norm=args.grad_clip_norm,
     )
     write_summary(results, output_dir)

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 class WindowChunkDataset(Dataset):
@@ -110,3 +110,29 @@ def make_train_val_split(
     train = WindowChunkDataset(cache_dir, shard_indices=list(range(n_train)))
     val = WindowChunkDataset(cache_dir, shard_indices=list(range(n_train, n_total)))
     return train, val
+
+
+class EpochShuffleSampler(Sampler[int]):
+    """rev-7: deterministic per-epoch shuffle with cheap fast-forward for ``--resume``.
+
+    The permutation for epoch ``e`` is a pure function of ``(seed, e)``, so a
+    resumed run can call ``set_epoch(e, skip=n)`` and continue exactly where
+    an interrupted run stopped without touching any data.
+    """
+
+    def __init__(self, n: int, seed: int) -> None:
+        self.n = int(n)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.skip = 0
+
+    def set_epoch(self, epoch: int, skip: int = 0) -> None:
+        self.epoch = int(epoch)
+        self.skip = int(skip)
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed * 1_000_003 + self.epoch)
+        return iter(torch.randperm(self.n, generator=g)[self.skip:].tolist())
+
+    def __len__(self) -> int:
+        return max(0, self.n - self.skip)

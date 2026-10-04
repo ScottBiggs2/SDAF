@@ -12,18 +12,13 @@ model:
   d_model: 768
 
 trace:
-  k: 1
-  ctx_len: 128
+  ctx_len: 128            # v1 window prefix length (collect.py); unused by the rev-7 VAE
   d_chunk: 9984
   J: 12
 
 vae:
   d_latent: 128           # rev-5: bumped from 64. Z_trace per token = 12 × 128 = 1536-d.
-  cond_dim:
-    prefix: 512
-    token_pos: 64
-    block: 64
-    k: 16
+  d_block: 64             # rev-7: block_embed is the decoder's only condition (D(z, block_id)).
 
 corpus:
   name: "wikitext"
@@ -40,11 +35,10 @@ training:
   epochs: 100
   beta_max: 0.01          # was 1.0; reduced to avoid posterior collapse (see outputs/analysis_0516/)
   beta_anneal_epochs: 60  # was 30; slower ramp gives encoder room to find latent structure
+  beta_anneal_steps: null # rev-7: β ramp in optimizer steps; overrides beta_anneal_epochs when set
+  n_steps: null           # rev-7: step budget (null = epochs × steps/epoch)
   free_bits: 0.1          # Kingma+ 2016: per-dim KL floor in nats. 0.0 = disabled. Keeps KL > 0.
   grad_clip_norm: 1.0     # rev-4: standard fix for option_d spike pattern. null/0 = disabled.
-  prefix_n_attn_blocks: 2 # rev-4 token-PE: GPT-2-style transformer blocks over the prefix.
-  prefix_n_heads: 12      # matches GPT-2 small per-block geometry.
-  prefix_d_ff: 3072       # 4 * d_model.
   seed: 42
 
 cluster:
