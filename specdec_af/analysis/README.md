@@ -281,3 +281,73 @@ done
 ground" — the redundant-pathway pathology that made v2/v4 comparison
 unfair is gone. The val `qz_top1` winner with healthy `qz_vs_wrong_prefix`
 gap is the option_4 vs option_d call.
+
+## rev-7 (unconditional trace VAE + cache v2) — Stage A / Stage B
+
+rev-7 pivots to the latent-diffusion split (see `agent_plan_rev7.md`): the VAE is
+a pure per-block compressor `E(chunk) → z`, `D(z, block_id) → chunk`; all
+prefix conditioning moves to the next plan's latent generator. Checkpoint
+`format_version` 3 — every pre-rev-7 checkpoint fails fast with
+`IncompatibleVAEConditioningError`. The v1 cache and the rev-1..6 eval
+schema (`qz` / `wrong_prefix` / `baseline`, milestone ordering) are retired;
+the sections above describe them for history only.
+
+**Data:** `cache_v2/` (`specdec_af.data.collect_v2`): 16 sampled positions per
+256-token sequence, whole-sequence shards of `chunks.npy` fp16
+`[N_pos, 12, 9984]`. Val shards are pinned in `cache_v2/split.json` at first
+collection; Stage-B shards are appended to train, so val is identical across
+Stage A and Stage B. **Explorer /scratch is purge-prone** (the v1 cache and
+the conda env were lost before rev-7) — pull eval outputs promptly.
+
+**Launch (one command per step; job ids go in `outputs/rev7_joblog.md`):**
+
+```bash
+sbatch scripts/slurm/submit_collect_v2_smoke.sh                 # 64 seq → cache_v2_smoke/
+sbatch scripts/slurm/submit_collect_v2.sh                       # Stage A: 100k positions
+for m in opt4:option_4 optd:option_d; do                        # Stage A training (resumable)
+  RUN_NAME=rev7A_${m%%:*} MODE=${m##*:} N_STEPS=60000 BETA_ANNEAL_STEPS=24000 \
+    sbatch scripts/slurm/submit_train.sh
+done
+# If a job hits the wall budget it checkpoints and exits; resubmit the same command
+# (RESUME=auto is the default) or chain: sbatch --dependency=afterany:<jobid> ...
+for r in rev7A_opt4 rev7A_optd; do RUN_NAME=$r sbatch scripts/slurm/submit_evaluate.sh; done
+RUN_NAME=<winner run> sbatch scripts/slurm/submit_export_latents.sh
+```
+
+**Pull:**
+
+```bash
+for r in rev7A_opt4 rev7A_optd; do
+  mkdir -p "outputs/from_hpc/$r" "outputs/from_hpc/eval/$r"
+  scp explorer:/scratch/biggs.s/specdec_af/outputs/train/$r/{training_log.csv,training_summary.json} "outputs/from_hpc/$r/"
+  scp -r "explorer:/scratch/biggs.s/specdec_af/outputs/eval/$r/*" "outputs/from_hpc/eval/$r/"
+done
+scp explorer:/scratch/biggs.s/specdec_af/cache_v2/{scale_variation.json,roundtrip.json,split.json,collection_*.json} outputs/from_hpc/cache_v2/
+```
+
+**Analyze:**
+
+```bash
+python -m specdec_af.analysis.training_logs \
+  --run rev7A_opt4=outputs/from_hpc/rev7A_opt4 --run rev7A_optd=outputs/from_hpc/rev7A_optd \
+  --out outputs/analysis_rev7A
+python -m specdec_af.analysis.eval_results \
+  --run rev7A_opt4=outputs/from_hpc/eval/rev7A_opt4 --run rev7A_optd=outputs/from_hpc/eval/rev7A_optd \
+  --out outputs/eval_analysis_rev7A
+```
+
+**What to read in `comparison.txt`:**
+
+1. The pre-registered decision block (`decision_rule`): disqualification
+   (all-block KL < 1e-3, or any block with qz_mean cosine < 0.5) → val
+   qz_mean top-1 (2 pp tie band) → median cross-block consistency error (10 %
+   relative tie band) → option_d. Apply it as written; no post-hoc tuning.
+2. `cons_x` vs `floor_x`: reconstruction consistency against the real-data
+   fp16 floor (≈3e-4). A recon is "weight-consistent" only relative to that.
+3. `prior` top-1 is informational (aggregate-posterior vs N(0, I) gap that the
+   generator must close); `wrong_z` should collapse to the marginal-mode floor.
+4. Train → val qz_top1 gap vs v4 (option_4 v2 went 0.51 → 0.19): more
+   positions should shrink it.
+5. Per-run `summary.txt` latent table + `latent_spectra.png` /
+   `cross_block_corr.png`: AU counts, spectra and cross-block coupling are
+   the inputs to the latent-diffusion design.
