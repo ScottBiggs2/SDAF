@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=specdec-export
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:v100-sxm2:1   # rev-7: pinned to 32 GB V100s (avoid T4 / 16 GB OOM surprises)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

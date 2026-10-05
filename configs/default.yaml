@@ -56,7 +56,7 @@ training:
 
 cluster:
   partition: "gpu"
-  gres: "gpu:v100-pcie:1"
+  gres: "gpu:v100-sxm2:1"  # rev-7: train/eval/export sbatch scripts pin this
   time: "04:00:00"
   mem: "32G"
   cpus_per_task: 4
