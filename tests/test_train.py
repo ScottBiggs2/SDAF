@@ -289,8 +289,7 @@ class _FakeRun:
 def _fake_wandb(runs: list, fail: bool = False):
     import types
 
-    mod = types.ModuleType("wandb")
-    mod.util = types.SimpleNamespace(generate_id=lambda: f"id{len(runs)}")
+    mod = types.ModuleType("wandb")  # no wandb.util: removed in wandb 0.30; train.py must not need it
 
     def init(**kw):
         if fail:
@@ -333,3 +332,25 @@ def test_wandb_failure_does_not_stop_training(cache_dir_with_stats, tmp_path, mo
     s = train(cache_dir_with_stats, tmp_path / "wbfail", _resume_cfg(3, wandb_project="p"),
               device=torch.device("cpu"))
     assert s["complete"] and s["n_steps_completed"] == 3
+
+
+def test_wandb_backfill_replays_csv(cache_dir_with_stats, tmp_path, monkeypatch):
+    import sys
+
+    from specdec_af.training.wandb_backfill import backfill_run
+
+    cpu = torch.device("cpu")
+    run_dir = tmp_path / "bf"
+    train(cache_dir_with_stats, run_dir, _resume_cfg(10), device=cpu)  # no wandb
+    runs: list = []
+    monkeypatch.setitem(sys.modules, "wandb", _fake_wandb(runs))
+    assert backfill_run(run_dir, "p") == 10
+    (run,) = runs
+    assert run.kw["name"] == "bf" and run.kw["config"]["backfilled_from_csv"] is True
+    assert [s for s, d in run.logged if "train/recon" in d] == list(range(10))
+    live_keys = {"train/recon", "train/kl", "train/total", "train/beta", "train/lr", "train/epoch"}
+    assert live_keys <= set(run.logged[0][1])
+    assert any("val/recon" in d for _, d in run.logged)
+    assert run.summary["complete"] is True and "final_val/recon" in run.summary
+    with pytest.raises(FileExistsError):
+        backfill_run(run_dir, "p")

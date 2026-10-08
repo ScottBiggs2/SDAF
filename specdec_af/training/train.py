@@ -55,6 +55,7 @@ import os
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -232,7 +233,8 @@ class WandbLogger:
         try:
             import wandb  # lazy: optional dependency
             id_path = run_dir / "wandb_run_id.txt"
-            run_id = id_path.read_text().strip() if id_path.exists() else wandb.util.generate_id()
+            # Own id generation: wandb.util.generate_id was removed in wandb 0.30.
+            run_id = id_path.read_text().strip() if id_path.exists() else uuid.uuid4().hex[:12]
             self.run = wandb.init(
                 project=project, entity=entity or None, name=run_name, id=run_id,
                 resume="allow", config=config, dir=os.environ.get("WANDB_DIR") or str(run_dir),
