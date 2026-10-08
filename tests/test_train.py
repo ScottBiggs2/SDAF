@@ -273,3 +273,63 @@ def test_resume_auto_picks_latest_and_drops_stale_rows(cache_dir_with_stats, tmp
     # A further auto-resume against the completed run is a no-op.
     again = train(cache_dir_with_stats, run_dir, _resume_cfg(12), device=cpu, resume_from="auto")
     assert again["resumed_from"].endswith("final.pt") and again["n_steps_completed"] == 12
+
+
+class _FakeRun:
+    def __init__(self, **kw):
+        self.kw, self.logged, self.summary, self.url = kw, [], {}, "fake://run"
+
+    def log(self, data, step):
+        self.logged.append((step, dict(data)))
+
+    def finish(self):
+        pass
+
+
+def _fake_wandb(runs: list, fail: bool = False):
+    import types
+
+    mod = types.ModuleType("wandb")
+    mod.util = types.SimpleNamespace(generate_id=lambda: f"id{len(runs)}")
+
+    def init(**kw):
+        if fail:
+            raise RuntimeError("no network")
+        runs.append(_FakeRun(**kw))
+        return runs[-1]
+
+    mod.init = init
+    return mod
+
+
+def test_wandb_logging_and_resume_reuses_run_id(cache_dir_with_stats, tmp_path, monkeypatch):
+    import sys
+
+    runs: list = []
+    monkeypatch.setitem(sys.modules, "wandb", _fake_wandb(runs))
+    cpu = torch.device("cpu")
+    run_dir = tmp_path / "wb"
+    train(cache_dir_with_stats, run_dir, _resume_cfg(10, wandb_project="p", wandb_entity="me"), device=cpu)
+    train(cache_dir_with_stats, run_dir, _resume_cfg(20, wandb_project="p"), device=cpu,
+          resume_from="auto")
+
+    assert len(runs) == 2
+    assert runs[0].kw["id"] == runs[1].kw["id"] == (run_dir / "wandb_run_id.txt").read_text()
+    assert runs[0].kw["project"] == "p" and runs[0].kw["entity"] == "me" and runs[0].kw["resume"] == "allow"
+    assert runs[0].kw["name"] == "wb"
+    steps = [s for s, d in runs[0].logged + runs[1].logged if "train/recon" in d]
+    assert steps == list(range(20))  # log_every=1, continuous across the resume
+    first = next(d for s, d in runs[0].logged if "train/recon" in d)
+    assert {"train/kl", "train/beta", "train/lr", "train/grad_norm_preclip"} <= set(first)
+    assert any(k.startswith("block_recon/b") for k in first)
+    assert any("val/recon" in d for _, d in runs[1].logged)
+    assert runs[1].summary["complete"] is True and "final_val/recon" in runs[1].summary
+
+
+def test_wandb_failure_does_not_stop_training(cache_dir_with_stats, tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "wandb", _fake_wandb([], fail=True))
+    s = train(cache_dir_with_stats, tmp_path / "wbfail", _resume_cfg(3, wandb_project="p"),
+              device=torch.device("cpu"))
+    assert s["complete"] and s["n_steps_completed"] == 3

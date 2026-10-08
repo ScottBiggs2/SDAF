@@ -23,6 +23,12 @@ interrupted run stopped. ``auto``
 picks ``final.pt`` or the latest ``step_*.pt`` in the run's checkpoint dir
 (fresh start if none) — use it for chained sbatch jobs under the 8h limit.
 
+rev-7 ``--wandb-project``: optional Weights & Biases logging (train losses,
+β, lr, grad norm, per-block diagnostics, val metrics, final summary). The
+wandb run id is stored in ``wandb_run_id.txt`` in the run dir, so resumed /
+chained jobs continue the *same* wandb run. wandb failures warn and never
+stop training.
+
 Outputs under ``${output_dir}/train/{run_name}/``:
   - ``training_log.csv``  — per-log-step row with per-block metrics
   - ``checkpoints/step_NNNNNN.pt`` — periodic checkpoints (resumable)
@@ -209,6 +215,59 @@ class CSVLogger:
         self._fh.close()
 
 
+class WandbLogger:
+    """Thin optional wrapper around ``wandb``; every call is a no-op when disabled.
+
+    Resume-aware: the run id lives in ``<run_dir>/wandb_run_id.txt`` and is
+    reused with ``resume="allow"``, so a resumed job appends to the same run.
+    (Steps an interrupted job logged past its last checkpoint are re-logged
+    after resume; wandb drops the duplicates with a warning.)
+    """
+
+    def __init__(self, project: str | None, *, run_dir: Path, run_name: str,
+                 config: dict, entity: str | None = None) -> None:
+        self.run = None
+        if not project:
+            return
+        try:
+            import wandb  # lazy: optional dependency
+            id_path = run_dir / "wandb_run_id.txt"
+            run_id = id_path.read_text().strip() if id_path.exists() else wandb.util.generate_id()
+            self.run = wandb.init(
+                project=project, entity=entity or None, name=run_name, id=run_id,
+                resume="allow", config=config, dir=os.environ.get("WANDB_DIR") or str(run_dir),
+            )
+            id_path.write_text(run_id)
+            print(f"wandb: logging to {getattr(self.run, 'url', None) or project} (id={run_id})", flush=True)
+        except Exception as e:  # never let logging kill a multi-hour job
+            print(f"  WARN: wandb disabled ({type(e).__name__}: {e})", flush=True)
+            self.run = None
+
+    def log(self, data: dict, step: int) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.log(data, step=step)
+        except Exception as e:
+            print(f"  WARN: wandb.log failed ({type(e).__name__}: {e})", flush=True)
+
+    def summary(self, data: dict) -> None:
+        if self.run is None:
+            return
+        try:
+            for k, v in data.items():
+                self.run.summary[k] = v
+        except Exception as e:
+            print(f"  WARN: wandb summary failed ({type(e).__name__}: {e})", flush=True)
+
+    def finish(self) -> None:
+        if self.run is not None:
+            try:
+                self.run.finish()
+            except Exception:
+                pass
+
+
 # ----------------------------------------------------------------------
 # Validation
 # ----------------------------------------------------------------------
@@ -284,6 +343,8 @@ class TrainConfig:
     # rev-7 additions
     beta_anneal_steps: int | None = None  # overrides beta_anneal_epochs when set
     max_wall_seconds: float | None = None  # checkpoint + exit cleanly past this budget
+    wandb_project: str | None = None       # None = no wandb logging
+    wandb_entity: str | None = None
     shard_buffer: int = 4                  # shards shuffled together per buffer
     val_positions: int | None = 5000       # fixed val set size (positions; × 12 items)
 
@@ -421,6 +482,13 @@ def train(
     csv_logger = CSVLogger(output_dir / "training_log.csv", csv_fields,
                            resume_step=step if resume_path is not None else None)
 
+    wb = WandbLogger(cfg.wandb_project, entity=cfg.wandb_entity, run_dir=output_dir,
+                     run_name=output_dir.name,
+                     config={**cfg.__dict__, "steps_per_epoch": steps_per_epoch,
+                             "total_steps": total_steps, "beta_anneal_steps_eff": anneal_steps,
+                             "n_params": n_params, "train_items": train_ds.n_items,
+                             "val_positions": val_ds.n_positions, "cache_dir": str(cache_dir)})
+
     t0 = time.time()
     out_of_time = False
     resumed_complete = step >= total_steps
@@ -443,8 +511,9 @@ def train(
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            grad_norm = None
             if cfg.grad_clip_norm is not None and cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=cfg.grad_clip_norm)
             opt.step()
             if scheduler is not None:
                 scheduler.step()
@@ -463,6 +532,17 @@ def train(
                                 recon_loss.item(), kl.item(), loss.item(),
                                 diag, N_LAYERS_DEFAULT)
                 csv_logger.log(row)
+                wb_row = {"train/recon": row["recon_loss"], "train/kl": row["kl_loss"],
+                          "train/total": row["total_loss"], "train/beta": beta,
+                          "train/lr": effective_lr, "train/epoch": epoch}
+                if grad_norm is not None:
+                    wb_row["train/grad_norm_preclip"] = float(grad_norm)
+                for pfx in ("recon", "kl", "mu_norm", "logvar_mean"):
+                    for b in range(N_LAYERS_DEFAULT):
+                        v = row[f"{pfx}_b{b}"]
+                        if v == v:  # skip NaN (block absent from batch)
+                            wb_row[f"block_{pfx}/b{b:02d}"] = v
+                wb.log(wb_row, step=idx)
                 if idx % (cfg.log_every * 10) == 0:
                     print(
                         f"  step {idx:>6}  epoch {epoch:>3}  beta={beta:.3f}  "
@@ -477,6 +557,7 @@ def train(
                 )
                 vmetrics["step"] = step
                 val_history.append(vmetrics)
+                wb.log({f"val/{k[4:]}": v for k, v in vmetrics.items() if k.startswith("val_")}, step=step - 1)
                 print(
                     f"    [val @ step {step}] recon={vmetrics['val_recon']:.4g}  "
                     f"kl={vmetrics['val_kl']:.4g}  "
@@ -538,6 +619,11 @@ def train(
     }
     if not resumed_complete:
         (output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2))
+    wb.summary({"complete": complete, "n_steps_completed": step,
+                "wall_seconds": summary["wall_seconds"],
+                **({f"final_val/{k[4:]}": v for k, v in final_val.items() if k.startswith("val_")}
+                   if final_val else {})})
+    wb.finish()
     print(f"\nDONE  step={step}/{total_steps}  complete={complete}  "
           f"wall={summary['wall_seconds']:.1f}s", flush=True)
     if final_val is not None:
@@ -550,6 +636,11 @@ def train(
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
+
+def _wandb_project(cli: str | None, raw_cfg: dict) -> str | None:
+    proj = cli if cli is not None else raw_cfg.get("logging", {}).get("wandb_project")
+    return None if not proj or str(proj).lower() == "none" else str(proj)
+
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -584,6 +675,10 @@ def main() -> int:
                    help="linear LR warmup over the first N steps; 0 = no warmup")
     p.add_argument("--resume", type=str, default=None,
                    help="rev-7: checkpoint path to resume from, or 'auto' (latest in run dir)")
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="rev-7: log to this W&B project (default: logging.wandb_project in config; "
+                        "'none' disables)")
+    p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--max-wall-minutes", type=float, default=None,
                    help="rev-7: checkpoint and exit cleanly after this many minutes")
     p.add_argument("--num-workers", type=int, default=2)
@@ -621,6 +716,8 @@ def main() -> int:
         beta_anneal_steps=args.beta_anneal_steps if args.beta_anneal_steps is not None
                            else tr.get("beta_anneal_steps"),
         max_wall_seconds=args.max_wall_minutes * 60 if args.max_wall_minutes is not None else None,
+        wandb_project=_wandb_project(args.wandb_project, raw_cfg),
+        wandb_entity=args.wandb_entity or raw_cfg.get("logging", {}).get("wandb_entity"),
         shard_buffer=args.shard_buffer or raw_cfg["cache_v2"].get("shard_buffer", 4),
         val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
     )

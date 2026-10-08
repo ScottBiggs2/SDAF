@@ -54,6 +54,10 @@ training:
   grad_clip_norm: 1.0     # rev-4: standard fix for option_d spike pattern. null/0 = disabled.
   seed: 42
 
+logging:                  # rev-7
+  wandb_project: null     # set via --wandb-project / WANDB_PROJECT in sbatch (null = off, e.g. local/tests)
+  wandb_entity: null      # null = the account's default entity
+
 cluster:
   partition: "gpu"
   gres: "gpu:v100-sxm2:1"  # rev-7: train/eval/export sbatch scripts pin this

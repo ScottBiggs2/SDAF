@@ -28,6 +28,9 @@
 #                          so a resubmitted / dependency-chained job continues the same run.
 #   MAX_WALL_MINUTES    — rev-7: checkpoint + exit cleanly after N minutes. Default: 225
 #                          (15 min headroom under the 4h --time).
+#   WANDB_PROJECT       — rev-7: W&B project (default specdec-af-gpt2; "none" disables).
+#   WANDB_ENTITY        — rev-7: W&B entity (default: account default). Run name = RUN_NAME;
+#                          resumed jobs continue the same W&B run (id in the run dir).
 #
 # Example (rev-7 Stage A):
 #   RUN_NAME=rev7A_opt4 MODE=option_4 N_STEPS=60000 BETA_ANNEAL_STEPS=24000 sbatch scripts/slurm/submit_train.sh
@@ -52,6 +55,7 @@ MODE="${MODE:-option_4}"
 RUN_NAME="${RUN_NAME:-k1_${MODE//option_/option}}"
 RESUME="${RESUME:-auto}"
 MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-225}"
+WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"
 
 mkdir -p "${REPO_DIR}/logs"
 
@@ -59,6 +63,8 @@ export HF_HOME="${SCRATCH}/huggingface_cache"
 export HF_DATASETS_CACHE="${SCRATCH}/huggingface_cache/datasets"
 export TRANSFORMERS_CACHE="${SCRATCH}/huggingface_cache/transformers"
 export SCRATCH
+export WANDB_DIR="${SCRATCH}/specdec_af/wandb"   # keep W&B run files off /home
+mkdir -p "$WANDB_DIR"
 
 if command -v module &>/dev/null; then
   module load anaconda3 || module load miniconda3 || true
@@ -79,6 +85,7 @@ echo "GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-(config default)}"
 echo "N_STEPS=${N_STEPS:-(config default)}"
 echo "BETA_ANNEAL_STEPS=${BETA_ANNEAL_STEPS:-(config default)}"
 echo "RESUME=$RESUME  MAX_WALL_MINUTES=$MAX_WALL_MINUTES"
+echo "WANDB_PROJECT=$WANDB_PROJECT  WANDB_ENTITY=${WANDB_ENTITY:-(default)}"
 echo "SCRATCH=$SCRATCH"
 echo "====================="
 
@@ -93,6 +100,8 @@ if [[ -n "${N_STEPS:-}" ]]; then EXTRA_ARGS+=(--n-steps "$N_STEPS"); fi
 if [[ -n "${BETA_ANNEAL_STEPS:-}" ]]; then EXTRA_ARGS+=(--beta-anneal-steps "$BETA_ANNEAL_STEPS"); fi
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
+EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
+if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 
 python -m specdec_af.training.train \
   --config configs/default.yaml \
