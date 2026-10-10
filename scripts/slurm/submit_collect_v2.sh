@@ -19,10 +19,15 @@
 #
 # Stage B continuation (only after Scott approves disk). Reuses Stage-A ChunkNorm
 # (calibration is skipped when chunk_norm_stats.pt exists) and the pinned split:
-#     N_SEQ=25000 SEQ_OFFSET=6250 SEED_OFFSET=1 sbatch scripts/slurm/submit_collect_v2.sh
+#     N_SEQ=12524 SEQ_OFFSET=6250  SEED_OFFSET=1 STAGE=main sbatch scripts/slurm/submit_collect_v2.sh
+#     N_SEQ=12524 SEQ_OFFSET=18774 SEED_OFFSET=1 STAGE=main sbatch --dependency=afterok:<prev> ...
+#   (12,524 = 202 shards × 62 seq; each job ≈ 1.3 h). Then check Stage-B shards without
+#   touching Stage A's roundtrip.json:
+#     STAGE=roundtrip ROUNDTRIP_SHARDS="shard_0101 shard_0504" sbatch scripts/slurm/submit_collect_v2.sh
 #
 # Env vars: N_SEQ, SEQ_OFFSET (sequences to skip), SEED_OFFSET, SHARD_OFFSET
-# (default: after the last existing shard), STAGE (all|calibration|main|roundtrip|scale-variation).
+# (default: after the last existing shard), STAGE (all|calibration|main|roundtrip|scale-variation),
+# ROUNDTRIP_SHARDS (space-separated; results → roundtrip_<shard>.json).
 
 set -euo pipefail
 
@@ -63,6 +68,8 @@ if [[ -n "${N_SEQ:-}" ]]; then EXTRA_ARGS+=(--n-seq "$N_SEQ"); fi
 if [[ -n "${SEQ_OFFSET:-}" ]]; then EXTRA_ARGS+=(--seq-offset "$SEQ_OFFSET"); fi
 if [[ -n "${SEED_OFFSET:-}" ]]; then EXTRA_ARGS+=(--seed-offset "$SEED_OFFSET"); fi
 if [[ -n "${SHARD_OFFSET:-}" ]]; then EXTRA_ARGS+=(--shard-offset "$SHARD_OFFSET"); fi
+# shellcheck disable=SC2206
+if [[ -n "${ROUNDTRIP_SHARDS:-}" ]]; then EXTRA_ARGS+=(--roundtrip-shard ${ROUNDTRIP_SHARDS}); fi
 
 python -m specdec_af.data.collect_v2 \
   --config configs/default.yaml \

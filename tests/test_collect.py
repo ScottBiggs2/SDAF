@@ -195,6 +195,8 @@ def test_v2_roundtrip_gate_and_scale_variation(v2_cache, gpt2):
     rt = cache_roundtrip_check_v2(gpt2, v2_cache, device="cpu", n_check=16)
     assert rt["ok"], rt
     assert rt["n_checked"] == 16 and rt["top1_match_rate"] == 1.0
+    rt2 = cache_roundtrip_check_v2(gpt2, v2_cache, device="cpu", n_check=4, shard="shard_0001")
+    assert rt2["ok"] and rt2["shard"] == "shard_0001"
 
     out = save_scale_variation(v2_cache, output_path=v2_cache.parent / "sv_v2.json")
     data = json.loads(out.read_text())

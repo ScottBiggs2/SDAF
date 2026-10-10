@@ -304,14 +304,17 @@ def write_split(cache_dir: Path | str, val_shards: int) -> dict:
 @torch.no_grad()
 def cache_roundtrip_check_v2(
     model, cache_dir: Path | str, *, device: torch.device | str = "cpu", n_check: int = 64,
+    shard: str | None = None,
 ) -> dict:
     """Gate: ``lm_head(terminal slot)`` top-1 == a fresh forward's top-1 at that position.
 
-    Uses the first ``n_check`` positions of the first shard. Returns a dict with
+    Uses the first ``n_check`` positions of ``shard`` (default: the first shard).
+    Returns a dict with
     ``ok`` (every position matches), match rate, max |Δlogit| and, for any
     mismatch, the teacher's top-1/top-2 margin (fp16 near-ties show up here).
     """
-    path = list_shards(cache_dir)[0]
+    shards = list_shards(cache_dir)
+    path = shards[0] if shard is None else next(p for p in shards if p.name == shard)
     chunks = np.load(path / "chunks.npy", mmap_mode="r")
     seq_tokens = np.load(path / "seq_tokens.npy")
     pos_seq_idx = np.load(path / "pos_seq_idx.npy")
@@ -373,6 +376,9 @@ def main() -> int:
     p.add_argument("--seed-offset", type=int, default=0, help="added to cache_v2.seed (Stage B)")
     p.add_argument("--val-shards", type=int, default=None)
     p.add_argument("--n-roundtrip", type=int, default=64)
+    p.add_argument("--roundtrip-shard", nargs="+", default=None,
+                   help="Stage B: check these shards; results go to roundtrip_<shard>.json "
+                        "(roundtrip.json from Stage A is never overwritten)")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--split", type=str, default=None)
     p.add_argument("--cpu", action="store_true")
@@ -433,9 +439,15 @@ def main() -> int:
 
     if args.stage in ("all", "roundtrip"):
         print("== Round-trip gate ==", flush=True)
-        rt = cache_roundtrip_check_v2(model, cache_dir, device=device, n_check=args.n_roundtrip)
-        (cache_dir / "roundtrip.json").write_text(json.dumps(rt, indent=2))
-        if not rt["ok"]:
+        failed = False
+        for shard in args.roundtrip_shard or [None]:
+            rt = cache_roundtrip_check_v2(model, cache_dir, device=device, n_check=args.n_roundtrip,
+                                          shard=shard)
+            out = cache_dir / ("roundtrip.json" if shard is None else f"roundtrip_{shard}.json")
+            out.write_text(json.dumps(rt, indent=2))
+            print(f"  -> {out.name}", flush=True)
+            failed |= not rt["ok"]
+        if failed:
             print("ROUND-TRIP FAILED", flush=True)
             return 2
 
