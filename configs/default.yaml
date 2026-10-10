@@ -20,6 +20,8 @@ trace:
 vae:
   d_latent: 128           # rev-5: bumped from 64. Z_trace per token = 12 × 128 = 1536-d.
   d_block: 64             # rev-7: block_embed is the decoder's only condition (D(z, block_id)).
+  decoder_output_space: raw  # rev-7 Gate 4: option_d (raw) won the pre-registered rule, val top-1 0.483 vs 0.411.
+                             # Default --mode in train.py ("raw" → option_d, "normalized" → option_4).
 
 cache_v2:                 # rev-7: many sampled positions per sequence (collect_v2)
   seq_len: 256

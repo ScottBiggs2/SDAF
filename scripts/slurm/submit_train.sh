@@ -13,7 +13,7 @@
 # Phase 6: full training run of the unconditional trace VAE (rev-7) on the cache.
 #
 # Env vars (override at sbatch time):
-#   MODE                — option_4 (default) or option_d
+#   MODE                — option_4 or option_d (default: config vae.decoder_output_space)
 #   RUN_NAME            — output directory under outputs/train/, default k1_${mode}
 #   BETA_MAX            — KL weight ceiling. Default: from configs/default.yaml (0.01 in rev-3).
 #                          Set explicitly for sweeps: BETA_MAX=0.05 sbatch ...
@@ -51,8 +51,8 @@ set -euo pipefail
 ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
 REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 SCRATCH="${SCRATCH:-/scratch/biggs.s}"
-MODE="${MODE:-option_4}"
-RUN_NAME="${RUN_NAME:-k1_${MODE//option_/option}}"
+MODE="${MODE:-}"  # empty → train.py uses vae.decoder_output_space from the config (rev-7: raw = option_d)
+RUN_NAME="${RUN_NAME:-rev7_${MODE:-default}}"
 RESUME="${RESUME:-auto}"
 MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-225}"
 WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"
@@ -98,6 +98,7 @@ if [[ -n "${FREE_BITS:-}" ]]; then EXTRA_ARGS+=(--free-bits "$FREE_BITS"); fi
 if [[ -n "${GRAD_CLIP_NORM:-}" ]]; then EXTRA_ARGS+=(--grad-clip-norm "$GRAD_CLIP_NORM"); fi
 if [[ -n "${N_STEPS:-}" ]]; then EXTRA_ARGS+=(--n-steps "$N_STEPS"); fi
 if [[ -n "${BETA_ANNEAL_STEPS:-}" ]]; then EXTRA_ARGS+=(--beta-anneal-steps "$BETA_ANNEAL_STEPS"); fi
+if [[ -n "${MODE:-}" ]]; then EXTRA_ARGS+=(--mode "$MODE"); fi
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
@@ -105,7 +106,6 @@ if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY
 
 python -m specdec_af.training.train \
   --config configs/default.yaml \
-  --mode "$MODE" \
   --run-name "$RUN_NAME" \
   --log-every 50 \
   --val-every-steps 1000 \

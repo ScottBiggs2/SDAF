@@ -8,7 +8,41 @@
 
 ## Change log
 
-### rev. 6 (current)
+### rev. 7 (current)
+
+Full spec: `agent_plan_rev7.md`. Branch `rev7-uncond-vae`; job log `outputs/rev7_joblog.md`.
+
+- **Unconditional trace VAE (latent-diffusion split).** Prefix conditioning is gone: `TraceVAE` = `E(chunk_norm) → z`, `D(z, block_id) → chunk`. `block_embed = nn.Embedding(12, 64)` is the decoder's only condition (decoder d_in 784 → 192). Prefix/token information now has to live in `z`; conditioning on context moves to the latent-space generator (later stage). `ConditionAssembler`, `token_pos_embed`, `k_embed` and the `--prefix-*` plumbing are removed (`prefix_encoder.py` kept, unused).
+- **Checkpoint format_version 2 → 3** (`IncompatibleVAEConditioningError` for older checkpoints). Checkpoints carry full `train_state` (optimizer, scheduler, epoch/batch position, RNG, val history) for exact `--resume PATH|auto`; `--max-wall-minutes` checkpoints and exits cleanly.
+- **Cache v2.** seq_len 256, 16 sampled positions per sequence from [32, 255], whole-sequence shards (62 seq = 992 positions), pinned val shards in `split.json`. Stage A = 100k positions (101 shards, 22.3 GiB; round-trip 64/64; terminal CV 0.259 vs v1 0.256). `TraceShardDataset` gives exact-resume iteration for any worker count.
+- **Eval suite rewritten** (`evaluate.py`): conditions `qz_mean`, `qz_sample`, `prior`, `wrong_z`; per (block, slot) recon; teacher top-1/top-5/KL; GPT-2 weight-consistency identities vs the real-trace fp16 floor (`analysis/consistency.py`); latent stats (KL, active units, spectra, cross-block |corr|). `export_latents.py` for the generator stage.
+- **Optional W&B logging** (`--wandb-project`, resume-aware run id); `training/wandb_backfill.py` replays CSV logs for runs trained without it.
+- **Stage A result: option_d pinned** (`vae.decoder_output_space: raw`; `train.py --mode` now defaults from it). See the decision register row and the tradeoff below.
+
+**Stage A numbers** (60k steps, batch 256, β ramp to 0.01 over 24k steps, rev-6 hyperparameters; eval on 5,000 val positions, `outputs/from_hpc/eval/rev7A_*`, comparison `outputs/from_hpc/rev7A_compare/`):
+
+| val (train) | option_4 | option_d |
+|---|---:|---:|
+| qz_mean teacher top-1 | 0.411 (0.427) | **0.483** (0.495) |
+| top-5 overlap | 0.479 | **0.530** |
+| KL(teacher ‖ student) | 1.30 | **1.06** |
+| prior / wrong_z top-1 | 0.031 / 0.042 | 0.037 / 0.048 |
+| recon cosine, mean / worst block | 0.933 / 0.875 | 0.926 / 0.868 |
+| block-11 (terminal) cosine | **0.982** | 0.889 |
+| terminal-slot MSE, raw units (training val) | **0.222** | 1.388 |
+| cross-block consistency error, median (real fp16 floor 2.6e-4) | **0.372** | 0.429 |
+| Σ-block KL (nats) / active units (of 12×128) | 1,396 / 504 | 2,300 / 936 |
+| train → val top-1 gap (v4: +18.9 pp / +6.0 pp) | +1.6 pp | +1.2 pp |
+
+**The option_4 vs option_d tradeoff (read before reusing this decision).**
+- *What differs.* Both encoders see `(x − μ)/σ`. option_4's decoder emits normalized values and the model applies `× σ + μ` in its inference path; its loss is raw-space MSE, i.e. normalized error weighted by **σ²**, so high-variance elements (deep blocks, attn/mlp proj outputs, GPT-2's outlier dims) dominate. option_d's decoder emits raw activations; σ appears only as a `1/σ²` loss weight, i.e. **uniform** normalized error, and no fixed scale sits in the inference path.
+- *What each wins.* Each wins what its loss rewards. option_4: raw-scale fidelity (terminal raw MSE 6× lower, block-11 cosine 0.98 vs 0.89, recon error rising with depth). option_d: downstream behaviour (+7.3 pp top-1, lower teacher KL, recon error flat across blocks). Untested hypothesis: `ln_f` removes scale before `lm_head`, so logits depend on all dims, not the few large ones that dominate option_4's loss.
+- *Which criterion decided.* The rev-7 pre-registered rule (val teacher top-1; 2 pp tie zone → consistency; 10% → option_d) selects option_d by 7.3 pp. **The older Phase-5 criterion (lowest raw terminal-slot MSE) would have selected option_4.** The choice therefore commits the project to "faithful downstream behaviour" over "faithful raw activations" as the VAE's target.
+- *Confound: effective β differs.* Both used β = 0.01, but the recon losses live on different scales, so KL was relatively cheaper for option_d: it used ~1.6× more KL and 78 vs 42 active units per block. Part of the top-1 gap may be latent capacity rather than output space. A matched-KL option_4 control was not run (Scott's call, Gate 4).
+- *Revisit if:* later stages need raw-activation fidelity (e.g. weight-space / consistency-based uses where option_4 is ahead), or a matched-KL control closes the top-1 gap.
+- *Shared limitation.* Both runs violate GPT-2's weight-consistency identities ~1,500× above the real-trace floor; neither yet produces self-consistent traces.
+
+### rev. 6 (superseded by rev. 7)
 
 - **Decoder-only conditioning.** Encoder loses `cond` entirely. `Encoder.__init__(d_chunk, d_latent)` (no `d_cond`); `Encoder.forward(chunk_norm)`; `CondVAE.encode(chunk_norm)`. Decoder unchanged — still gets `(z, cond)`. `CondVAE.forward(chunk_norm, cond)` signature preserved, only the internal plumbing changes.
 - **Why:** the chunk fed to the VAE encoder is GPT-2's forward pass on `(prefix + window)`, so it already encodes prefix-derived info densely. We were *also* conditioning the encoder on `prefix_emb` from the same tokens, giving the optimizer two correlated paths into `(mu, logvar)`. It collapsed onto chunk and ignored cond. v4 evidence: `qz` and `wrong_prefix` produced bit-identical metrics in optiond_v4 (top1=0.4086 ≡ 0.4086 across CE, ppl, KL, terminal_mse on 8192 sampled chunks). After this rev, cond is the *only* path for prefix info into the decoder — the optimizer is forced to use it.
@@ -125,13 +159,15 @@ Self-contained list of what's settled and what isn't. New decisions and their re
 
 | Decision | Status | Resolved at | Resolution mechanism |
 |---|---|---|---|
-| **Normalization: option 4 (ChunkNorm + unnormalized-space loss) vs option D (raw decoder output, σ as loss weight)** | OPEN | Phase 5 | Overfit-a-batch sweep. Pick whichever drives lowest **unnormalized-space** terminal-slot recon error. Phase 3 CV diagnostic informs the prior. |
+| **Normalization: option 4 (ChunkNorm + unnormalized-space loss) vs option D (raw decoder output, σ as loss weight)** | **DECIDED: option D** (`vae.decoder_output_space: raw`) | rev-7 Gate 4 | rev-7 pre-registered rule on Stage A (60k steps each): val teacher top-1 **0.483 (D) vs 0.411 (4)**, 7.3 pp, outside the 2 pp tie zone; neither disqualified. **Tradeoff:** option 4 is better on raw-scale fidelity (terminal raw MSE 0.22 vs 1.39, block-11 cosine 0.98 vs 0.89, consistency 0.37 vs 0.43); the superseded Phase-5 criterion (raw terminal MSE) would have picked option 4. **Confound:** same β on different loss scales gave D ~1.6× more KL / 78 vs 42 active units per block; no matched-KL control was run. Full write-up in the rev-7 changelog. |
+| **VAE selection criterion: teacher top-1 (downstream behaviour) over raw terminal-slot MSE** | DECIDED | rev-7 | Pre-registered in `agent_plan_rev7.md` §5. Supersedes the Phase-5 raw-MSE criterion. Commits the VAE target to what GPT-2 does with the trace rather than raw activation fidelity. |
+| **Unconditional VAE: `D(z, block_id)`, no prefix conditioning** | DECIDED | rev-7 | Latent-diffusion split: context conditioning moves to the latent generator. Supersedes the rev-6 decoder-only prefix conditioning. |
 | `prefix_features` source = stacked `mlp_proj_out` across blocks (B, 12·768) | SUPERSEDED | rev-4 | Replaced by token-ID PrefixEncoder. The activations-based MLP path is deleted; v2 checkpoints fail-fast on load. |
 | **PE input modality: token IDs** (rev-4 commitment) — frozen GPT-2 `wte+wpe` → 2 pre-LN transformer blocks → last-token-pool → 512-d | DECIDED | rev-4 | Architectural commitment, not coordinate change: removes the inference-time teacher dependency, unblocking AR rollouts (E3) and clean OOD evals (E2). |
 | **PE attention backend: `F.scaled_dot_product_attention(is_causal=True)`** with manual QKV projections | DECIDED | rev-5 | Fixes eval OOM at n_chunks=8192. FlashAttention / memory-efficient kernel dispatch is automatic. Same param count as the rev-4 `nn.MultiheadAttention` setup; only state_dict naming differs. |
 | **`d_latent` per-chunk latent dim: 128** | DECIDED | rev-5 | Bumped from rev-3's implicit 64. Z_trace = 12×128 = 1536-d per token. Conservative 2x bump; +98K VAE params. 256 stays available as a follow-on ablation if 128 underfits. |
 | **Encoder conditions on `cond` (prefix_emb + block + i + k)** | SUPERSEDED | rev-6 | Replaced by decoder-only conditioning. The chunk already encodes prefix-derived info (it's GPT-2's forward pass on prefix+window), so dual-conditioning the encoder created a redundant pathway that the optimizer collapsed onto chunk, killing the cond pathway. v4 evidence: optiond_v4 had qz ≡ wrong_prefix on five metrics. |
-| **Encoder = `q(z \| chunk)` only; Decoder = `p(chunk \| z, cond)`** (textbook conditional VAE) | DECIDED | rev-6 | Forces cond onto the gradient path: it's the only place prefix info enters at decode time. Also more aligned with CFM stackability — shared block-agnostic encoder produces per-block latents with consistent geometry. |
+| **Encoder = `q(z \| chunk)` only; Decoder = `p(chunk \| z, cond)`** (textbook conditional VAE) | SUPERSEDED | rev-7 | Replaced by the unconditional `D(z, block_id)` (rev-7). Original rationale (rev-6): Forces cond onto the gradient path: it's the only place prefix info enters at decode time. Also more aligned with CFM stackability — shared block-agnostic encoder produces per-block latents with consistent geometry. |
 | **`wrong_z` eval condition added** (decoder gets correct prefix, rolled z) | DECIDED | rev-6 | Direct diagnostic for cond-pathway liveness, complementary to `wrong_prefix`. Not in the milestone gate (informational). |
 | `embed_out` hooked on `transformer.drop` output | DECIDED | Phase 1 | Identity in `model.eval()`. Frozen-teacher inference is always eval. Re-evaluate if teacher is ever fine-tuned (dropout would otherwise silently contaminate the chunk). |
 | `lm_head_out` excluded from the trace; applied externally to terminal slot | DECIDED | rev-2 | Promotion to a slot is the first lever if Phase 7 check 2 (above-marginal-mode floor) is soft. |

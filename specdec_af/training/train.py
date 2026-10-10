@@ -647,7 +647,9 @@ def _wandb_project(cli: str | None, raw_cfg: dict) -> str | None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--config", type=str, default="configs/default.yaml")
-    p.add_argument("--mode", choices=["option_4", "option_d", "option_1"], default="option_4")
+    p.add_argument("--mode", choices=["option_4", "option_d", "option_1"], default=None,
+                   help="default: from vae.decoder_output_space in config (raw → option_d, "
+                        "normalized → option_4)")
     p.add_argument("--run-name", type=str, default="rev7_default")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -691,6 +693,9 @@ def main() -> int:
 
     raw_cfg = load_config(args.config)
     tr = raw_cfg["training"]
+    if args.mode is None:
+        space = raw_cfg["vae"].get("decoder_output_space", "normalized")
+        args.mode = {"raw": "option_d", "normalized": "option_4"}[space]
     cache_dir = Path(expand_env(raw_cfg["paths"]["cache_dir"]))
     output_dir = Path(expand_env(raw_cfg["paths"]["output_dir"])) / "train" / args.run_name
 
