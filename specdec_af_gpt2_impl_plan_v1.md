@@ -42,6 +42,8 @@ Full spec: `agent_plan_rev7.md`. Branch `rev7-uncond-vae`; job log `outputs/rev7
 - *Revisit if:* later stages need raw-activation fidelity (e.g. weight-space / consistency-based uses where option_4 is ahead), or a matched-KL control closes the top-1 gap.
 - *Shared limitation.* Both runs violate GPT-2's weight-consistency identities ~1,500× above the real-trace floor; neither yet produces self-consistent traces.
 
+**Stage B (option_d, 500k positions, 200k steps; `rev7B_optd`):** val top-1 **0.518** (train 0.525, gap +0.6 pp), teacher KL 0.89, cross-block consistency 0.350 (now below option_4's Stage A 0.372), all 1,536 latent units active (KL 2,810 nats). Latents exported for the full cache. Full write-up: `outputs/rev7_report.md`.
+
 ### rev. 6 (superseded by rev. 7)
 
 - **Decoder-only conditioning.** Encoder loses `cond` entirely. `Encoder.__init__(d_chunk, d_latent)` (no `d_cond`); `Encoder.forward(chunk_norm)`; `CondVAE.encode(chunk_norm)`. Decoder unchanged — still gets `(z, cond)`. `CondVAE.forward(chunk_norm, cond)` signature preserved, only the internal plumbing changes.
