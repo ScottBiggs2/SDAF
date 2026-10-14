@@ -501,12 +501,17 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
     paths = []
     for key, title in (("resid_rel", "residual-stream relative error"), ("lens_kl", "logit-lens KL vs clean")):
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        grids = {mode: _grid(res, key, mode) for mode in ("vae", "noise")}
+        logs = [np.log10(np.clip(g, 1e-6, None)) for g, _ in grids.values() if g.size]
+        finite = np.concatenate([x[np.isfinite(x) & (x > -6)] for x in logs]) if logs else np.array([0.0])
+        vmin, vmax = float(finite.min()), float(finite.max())  # shared scale: panels are comparable
         for ax, mode in zip(axes, ("vae", "noise")):
-            g, labels = _grid(res, key, mode)
+            g, labels = grids[mode]
             if g.size == 0:
                 ax.axis("off")
                 continue
-            im = ax.imshow(np.log10(np.clip(g, 1e-6, None)), aspect="auto", cmap="magma")
+            im = ax.imshow(np.ma.masked_less_equal(np.log10(np.clip(g, 1e-6, None)), -6), aspect="auto",
+                           cmap="magma", vmin=vmin, vmax=vmax)
             ax.set_yticks(range(len(labels)), labels, fontsize=8)
             ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
             ax.set_xlabel("measured at output of block")
