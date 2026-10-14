@@ -192,6 +192,11 @@ def _downstream_metrics(student_logits: Tensor, teacher_logits: Tensor) -> dict[
         "top1": (s_arg == t_arg).float(),
         "top5_overlap": (s_top5.unsqueeze(-1) == t_top5.unsqueeze(-2)).any(-1).float().mean(-1),
         "kl": (log_p_t.exp() * (log_p_t - log_p_s)).sum(-1),
+        # Speculative-decoding acceptance probability of q=student as a draft for p=teacher:
+        # α = Σ min(p, q) = 1 − TV(p, q). Top-1 agreement is the greedy special case.
+        # (float64: fp32 rounding over the 50k vocab is ~1e-5.)
+        "acceptance": torch.minimum(F.softmax(teacher_logits.double(), -1),
+                                    F.softmax(student_logits.double(), -1)).sum(-1).float(),
         "ce": F.cross_entropy(student_logits, t_arg, reduction="none"),
         "student_argmax": s_arg,
     }
@@ -215,6 +220,7 @@ class _TeacherAcc:
             "top1_agreement": float(cat["top1"].mean()),
             "top5_overlap": float(cat["top5_overlap"].mean()),
             "kl_teacher_student": float(cat["kl"].mean()),
+            "acceptance": float(cat["acceptance"].mean()),
             "ce_teacher_student": float(cat["ce"].mean()),
             "pred_concentration": float(torch.bincount(cat["student_argmax"]).max().item() / n),
         }
@@ -407,11 +413,12 @@ def write_summary(results: dict, out_dir: Path) -> Path:
     ]
     for sp, d in results["splits"].items():
         lines.append(f"--- split: {sp}  ({d['n_positions']} positions) ---")
-        lines.append(f"{'condition':<10} {'top1':>7} {'top5':>6} {'kl_TS':>8} {'ce_TS':>7} "
+        lines.append(f"{'condition':<10} {'top1':>7} {'top5':>6} {'accept':>7} {'kl_TS':>8} {'ce_TS':>7} "
                      f"{'cos_mean':>8} {'cos_min':>8} {'relerr_med':>10} {'cons_intra':>10} {'cons_cross':>10}")
         for cond, m in d["conditions"].items():
             lines.append(
                 f"{cond:<10} {m.get('top1_agreement', nan):>7.4f} {m.get('top5_overlap', nan):>6.3f} "
+                f"{m.get('acceptance', nan):>7.4f} "
                 f"{m.get('kl_teacher_student', nan):>8.4g} {m.get('ce_teacher_student', nan):>7.4g} "
                 f"{np.mean(m['recon_cosine']):>8.4f} {np.min(m['recon_cosine']):>8.4f} "
                 f"{np.median(m['recon_rel_err']):>10.4g} {m['consistency_intra_median']:>10.4g} "
@@ -419,7 +426,7 @@ def write_summary(results: dict, out_dir: Path) -> Path:
             )
         rc = d.get("real_consistency")
         if rc:
-            lines.append(f"{'real(fp16)':<10} {'':>7} {'':>6} {'':>8} {'':>7} {'':>8} {'':>8} {'':>10} "
+            lines.append(f"{'real(fp16)':<10} {'':>7} {'':>6} {'':>7} {'':>8} {'':>7} {'':>8} {'':>8} {'':>10} "
                          f"{rc['intra_median']:>10.4g} {rc['cross_median']:>10.4g}   <- consistency floor")
         ls = d["latent_stats"]
         qz = d["conditions"].get("qz_mean")

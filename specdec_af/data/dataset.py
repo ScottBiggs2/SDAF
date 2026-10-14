@@ -196,6 +196,24 @@ class PositionSet(Dataset):
         out = [np.asarray(self._maps[self.shards[si]][r], dtype=np.float32) for si, r in idx]
         return torch.from_numpy(np.stack(out)) if out else torch.empty(0)
 
+    def meta(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(tokens [n, seq_len] int64, pos [n] int64)`` for positions ``[start, end)``:
+        each position's full source sequence and its index in it."""
+        if not hasattr(self, "_meta"):
+            self._meta: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        toks, pos = [], []
+        for si, r in self.index[start:end]:
+            m = self._meta.get(int(si))
+            if m is None:
+                d = self.shards[si]
+                m = (np.load(d / "seq_tokens.npy"), np.load(d / "pos_seq_idx.npy"), np.load(d / "pos.npy"))
+                self._meta[int(si)] = m
+            seq_tokens, pos_seq_idx, p = m
+            toks.append(seq_tokens[pos_seq_idx[r]])
+            pos.append(int(p[r]))
+        return (torch.from_numpy(np.stack(toks).astype(np.int64)),
+                torch.tensor(pos, dtype=torch.long))
+
 
 def read_split(cache_dir: Path | str, val_shards: int | None = None) -> tuple[list[Path], list[Path]]:
     """``(train_shards, val_shards)``. Uses pinned ``split.json`` if present,

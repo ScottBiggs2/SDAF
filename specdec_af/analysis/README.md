@@ -351,3 +351,63 @@ python -m specdec_af.analysis.eval_results \
 5. Per-run `summary.txt` latent table + `latent_spectra.png` /
    `cross_block_corr.png`: AU counts, spectra and cross-block coupling are
    the inputs to the latent-diffusion design.
+
+## Block substitution (where does the VAE round trip lose what GPT-2 needs?)
+
+`specdec_af/analysis/substitution.py`. For each val position p, one forward of the real GPT-2 on `seq[:p+1]`.
+At the active blocks, the block output at p is replaced by `r_b + attn_proj' + mlp_proj'`, and GPT-2 computes the remaining blocks itself.
+Earlier positions are untouched, and the logits at p depend only on positions ≤ p, so each measurement is exact.
+
+| Condition | Replacement at the active block(s) |
+|---|---|
+| `clean` | none (reference) |
+| `vae_b` | block b's live chunk → ChunkNorm → encoder μ → decoder |
+| `identity_b` | the real contributions through the same splice path (sanity: KL ≈ 0) |
+| `meanabl_b` | per-block dataset means (lower anchor for fraction of loss recovered) |
+| `noise_b` | real + isotropic noise with the same per-slot norm as the VAE error |
+| `stack_closed` | `vae` at every block in sequence; each block runs on the perturbed residual |
+| `stack_identity` | `identity` at every block (sanity) |
+| `stack_open` | no GPT-2 continuation; residuals rebuilt from the decoded trace alone |
+
+Metrics vs clean at every block output l:
+- per-slot relative error and cosine
+- residual-stream relative error and cosine
+- logit-lens KL, TV and top-1
+
+Final logits: KL, top-1/5, acceptance α = Σ min(p, q) = 1 − TV, CE on the real next token, ΔCE, and fraction of loss recovered vs `meanabl_b`.
+
+```bash
+# smoke (separate OUT_DIR; the script refuses to overwrite metrics.json)
+RUN_NAME=rev7B_optd N_POSITIONS=64 OUT_DIR=/scratch/biggs.s/specdec_af/outputs/substitution/rev7B_optd_smoke \
+  sbatch scripts/slurm/submit_substitution.sh
+# full run, 5,000 val positions, with residual dumps for the SAE analysis below
+RUN_NAME=rev7B_optd DUMP_RESIDUALS=1 sbatch scripts/slurm/submit_substitution.sh
+```
+
+How to read the outputs:
+- `grid_resid_rel.png` / `grid_lens_kl.png`: substituted block × measured block. Shows where divergence starts and whether it grows or heals downstream.
+- `per_block_final.png`: vae vs noise vs meanabl per block. If vae is below noise, the VAE's error sits in directions GPT-2 is less sensitive to than random.
+
+## SAE feature preservation (planned, not built)
+
+Goal: which *kinds* of information the round trip drops, using pretrained sparse autoencoders as a fixed feature basis.
+
+- **SAEs:** SAELens release `gpt2-small-res-jb`, residual-stream SAEs on `blocks.{l}.hook_resid_pre` for l = 0…11, ~24.6k features each (verify release name and dictionary size before use).
+- **Input:** the substitution run with `DUMP_RESIDUALS=1` writes `residuals/{clean,vae_b,stack_closed,stack_open}.npy`, each `[N, 13, 768]` fp16.
+  - Index l = 0…11 is resid_pre of block l (the SAE hook point).
+  - Index 12 is the final residual.
+  - No new GPU forwards are needed.
+- **Metrics per layer, clean vs substituted:**
+  - feature recall: features active on clean that stay active
+  - precision
+  - activation correlation over co-active features
+  - SAE reconstruction error on each, as a floor
+
+  All of these are binned by feature firing frequency (from the clean set), and reported for features at the substituted block vs downstream blocks.
+- **Questions it answers:**
+  - Does the VAE drop rare features first?
+  - Are positional / token-identity features preserved?
+  - Do features lost at block b come back by block b + k (self-repair)?
+- **Logistics:**
+  - Add `sae-lens` as an optional extra (`pip install -e .[sae]`). Check that its torch/transformers pins are compatible with torch 2.5.1 / transformers 4.57 before installing into the cluster env.
+  - SAE weights download to `HF_HOME` on /scratch.
