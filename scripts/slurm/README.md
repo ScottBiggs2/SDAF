@@ -260,3 +260,19 @@ du -sh /scratch/biggs.s/huggingface_cache/
 | `RuntimeError: cache round-trip failed`   | shard write corrupted, or `chunk_index.SLOT_OFFSETS` drifted from Phase 1 hook widths |
 | job killed at `~01:30:00`                 | hit `--time` cap; bump in sbatch header                                   |
 | job killed early on login node            | you ran the python CLI directly on a login node — use sbatch or `srun --pty` |
+
+## rev-8 — streaming producer-consumer (`specdec_af/data/stream.py`)
+
+Training traces are generated on the fly by a frozen GPT-2 on the training GPU
+instead of read from cache v2; val + ChunkNorm stats still come from the cache.
+
+```bash
+sbatch scripts/slurm/submit_pretokenize.sh            # once: WikiText-103 → stream.tokens_path (CPU, ≈ 470 MB)
+sbatch scripts/slurm/submit_stream_check.sh           # verify vs cache shards + throughput bench
+# VAE on the stream (step budget required; resume is exact):
+RUN_NAME=rev8_vae_stream N_STEPS=200000 BETA_ANNEAL_STEPS=80000 sbatch scripts/slurm/submit_train.sh
+# rev-7 reproduction from the cache:
+DATA_SOURCE=cache RUN_NAME=... sbatch scripts/slurm/submit_train.sh
+# A100 instead of V100:
+sbatch --gres=gpu:a100:1 scripts/slurm/submit_train.sh
+```

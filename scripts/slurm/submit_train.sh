@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=specdec-train
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:v100-sxm2:1   # rev-7: pinned to 32 GB V100s (avoid T4 / 16 GB OOM surprises)
+#SBATCH --gres=gpu:v100-sxm2:1   # rev-7: pinned to 32 GB V100s (avoid T4 / 16 GB OOM surprises); A100: sbatch --gres=gpu:a100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -31,6 +31,9 @@
 #   WANDB_PROJECT       — rev-7: W&B project (default specdec-af-gpt2; "none" disables).
 #   WANDB_ENTITY        — rev-7: W&B entity (default: account default). Run name = RUN_NAME;
 #                          resumed jobs continue the same W&B run (id in the run dir).
+#   DATA_SOURCE         — rev-8: stream (live GPT-2 traces on this GPU; needs N_STEPS and
+#                          BETA_ANNEAL_STEPS) or cache (cache-v2 shards, reproduces rev-7).
+#                          Default: training.data_source in the config (stream).
 #
 # Example (rev-7 Stage A):
 #   RUN_NAME=rev7A_opt4 MODE=option_4 N_STEPS=60000 BETA_ANNEAL_STEPS=24000 sbatch scripts/slurm/submit_train.sh
@@ -85,6 +88,7 @@ echo "GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-(config default)}"
 echo "N_STEPS=${N_STEPS:-(config default)}"
 echo "BETA_ANNEAL_STEPS=${BETA_ANNEAL_STEPS:-(config default)}"
 echo "RESUME=$RESUME  MAX_WALL_MINUTES=$MAX_WALL_MINUTES"
+echo "DATA_SOURCE=${DATA_SOURCE:-(config default)}"
 echo "WANDB_PROJECT=$WANDB_PROJECT  WANDB_ENTITY=${WANDB_ENTITY:-(default)}"
 echo "SCRATCH=$SCRATCH"
 echo "====================="
@@ -99,6 +103,7 @@ if [[ -n "${GRAD_CLIP_NORM:-}" ]]; then EXTRA_ARGS+=(--grad-clip-norm "$GRAD_CLI
 if [[ -n "${N_STEPS:-}" ]]; then EXTRA_ARGS+=(--n-steps "$N_STEPS"); fi
 if [[ -n "${BETA_ANNEAL_STEPS:-}" ]]; then EXTRA_ARGS+=(--beta-anneal-steps "$BETA_ANNEAL_STEPS"); fi
 if [[ -n "${MODE:-}" ]]; then EXTRA_ARGS+=(--mode "$MODE"); fi
+if [[ -n "${DATA_SOURCE:-}" ]]; then EXTRA_ARGS+=(--data-source "$DATA_SOURCE"); fi
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
