@@ -98,6 +98,9 @@ The original questions, for the record:
   - live traces and μ match the cache and the export;
   - refill overhead ≤ 15%;
   - stream vs cache VAE parity at 5k steps.
+- **Gate results (10-20, V100):** verify OK. Parity OK: val recon 0.5816 stream vs 0.5841 cache at 5k steps. The stream is **4.3× faster
+  end-to-end** than the disk cache (113 s vs 482 s). Synchronous refill is 55% of *compute-only* step time, so it fails the overhead gate as written,
+  but it is not a bottleneck in practice. The LDM latent buffer builds 16k positions in 7.8 s. Levers if it ever binds are in `outputs/stream_joblog.md`.
 
 ---
 
