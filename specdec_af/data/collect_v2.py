@@ -58,7 +58,7 @@ from specdec_af.data.scale_variation import save_scale_variation
 from specdec_af.models.chunk_index import D_CHUNK, TERMINAL_BLOCK, pack_chunks, unpack_slot
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.hooks import build_hook_batch_from_buffer, register_hooks
-from specdec_af.training.train import expand_env, load_config, pick_device
+from specdec_af.utils.config import expand_env, load_config, pick_device
 
 FORMAT = "cache_v2"
 STREAM_MAIN = 0
