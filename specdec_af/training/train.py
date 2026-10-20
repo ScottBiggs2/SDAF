@@ -23,6 +23,12 @@ interrupted run stopped. ``auto``
 picks ``final.pt`` or the latest ``step_*.pt`` in the run's checkpoint dir
 (fresh start if none) — use it for chained sbatch jobs under the 8h limit.
 
+rev-8 ``--data-source stream``: train batches are generated on the fly by a
+frozen GPT-2 on the training GPU (:mod:`specdec_af.data.stream`; fresh
+positions every pass, val/ChunkNorm still from the cache). Requires
+``--n-steps`` and ``--beta-anneal-steps``; ``epoch`` in logs/checkpoints is
+then the producer chunk index.
+
 rev-7 ``--wandb-project``: optional Weights & Biases logging (train losses,
 β, lr, grad norm, per-block diagnostics, val metrics, final summary). The
 wandb run id is stored in ``wandb_run_id.txt`` in the run dir, so resumed /
@@ -53,7 +59,6 @@ import csv
 import json
 import os
 import random
-import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -61,7 +66,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 from torch.utils.data import DataLoader
 
 from specdec_af.data.dataset import make_trace_split
@@ -69,6 +73,7 @@ from specdec_af.models.chunk_index import N_LAYERS_DEFAULT
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import load_vae_checkpoint, save_vae_checkpoint
+from specdec_af.utils.config import expand_env, load_config, pick_device  # noqa: F401 (re-exported)
 from specdec_af.training.losses import (
     Mode,
     chunk_recon_loss,
@@ -81,33 +86,6 @@ from specdec_af.training.losses import (
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-
-_ENV_RE = re.compile(r"\$\{([^}]+)\}")
-
-
-def expand_env(s: str) -> str:
-    def _sub(m: re.Match) -> str:
-        var = m.group(1)
-        if ":-" in var:
-            name, default = var.split(":-", 1)
-            return os.environ.get(name, default)
-        return os.environ.get(var, "")
-    return _ENV_RE.sub(_sub, s)
-
-
-def pick_device(force_cpu: bool = False) -> torch.device:
-    if force_cpu:
-        return torch.device("cpu")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_config(path: Path | str) -> dict:
-    return yaml.safe_load(Path(path).read_text())
-
 
 def beta_schedule(step: int, beta_max: float, anneal_steps: int) -> float:
     """Linear anneal 0 → beta_max over ``anneal_steps`` optimizer steps."""
@@ -349,6 +327,9 @@ class TrainConfig:
     wandb_entity: str | None = None
     shard_buffer: int = 4                  # shards shuffled together per buffer
     val_positions: int | None = 5000       # fixed val set size (positions; × 12 items)
+    # rev-8 additions
+    data_source: str = "cache"             # "cache" (cache-v2 shards) | "stream" (live GPT-2, data/stream.py)
+    stream: dict | None = None             # stream config (see stream.STREAM_DEFAULTS); data_source="stream"
 
 
 def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device) -> TraceVAE:
@@ -368,12 +349,25 @@ def train(
     device: torch.device,
     val_shards: int | None = None,
     resume_from: Path | str | None = None,
+    gpt2=None,
 ) -> dict:
     """Run the Phase-6 training loop. Returns the final summary dict.
 
     ``resume_from``: a checkpoint path, ``"auto"`` (latest in this run's
     checkpoint dir, fresh start if none), or None.
+
+    rev-8 ``cfg.data_source == "stream"``: train batches come from
+    :class:`~specdec_af.data.stream.StreamingTraceBatches` (live GPT-2 on
+    ``device``; ``gpt2`` optionally injects the frozen model). One "epoch" is
+    then one producer chunk, so the ``(epoch, batch_in_epoch)`` resume state is
+    the stream cursor; ``n_steps_override`` and ``beta_anneal_steps`` are
+    required. Val set and ChunkNorm stats still come from ``cache_dir``.
     """
+    if cfg.data_source not in ("cache", "stream"):
+        raise ValueError(f"data_source={cfg.data_source!r}; expected 'cache' or 'stream'")
+    streaming = cfg.data_source == "stream"
+    if streaming and (cfg.n_steps_override is None or cfg.beta_anneal_steps is None):
+        raise ValueError("data_source='stream' has no epochs: set n_steps and beta_anneal_steps")
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
@@ -392,10 +386,22 @@ def train(
         cache_dir, batch_size=cfg.batch_size, seed=cfg.seed, val_shards=val_shards,
         val_positions=cfg.val_positions, shard_buffer=cfg.shard_buffer,
     )
-    train_loader = DataLoader(
-        train_ds, batch_size=None, num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
-        generator=torch.Generator().manual_seed(cfg.seed),
-    )
+    if streaming:
+        from specdec_af.data.stream import StreamingTraceBatches, build_producer
+        producer = build_producer(cfg.stream or {}, cache_dir, device=device, val_shards=val_shards,
+                                  gpt2=gpt2)
+        train_ds = StreamingTraceBatches(producer, batch_size=cfg.batch_size,
+                                         seed=int((cfg.stream or {}).get("seed", 1236)))
+        train_loader = train_ds  # batches are built on `device`; no DataLoader
+        torch.manual_seed(cfg.seed)  # GPT-2 loading may draw from the RNG; keep VAE init as in cache mode
+        print(f"stream: {len(producer.plan.train_ids)} train sequences "
+              f"(excluding val {producer.plan.exclude}), {producer.plan.chunks_per_pass} chunks/pass "
+              f"of {producer.plan.seqs_per_chunk} sequences × {producer.n_pos} positions", flush=True)
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=None, num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+            generator=torch.Generator().manual_seed(cfg.seed),
+        )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
@@ -431,6 +437,8 @@ def train(
     # Step budget + β ramp length (rev-7: in optimizer steps).
     total_steps_uncapped = steps_per_epoch * cfg.n_epochs
     total_steps = min(total_steps_uncapped, cfg.n_steps_override) if cfg.n_steps_override else total_steps_uncapped
+    if streaming:
+        total_steps = int(cfg.n_steps_override)
     anneal_steps = (cfg.beta_anneal_steps if cfg.beta_anneal_steps is not None
                     else steps_per_epoch * cfg.beta_anneal_epochs)
     print(f"total steps: {total_steps}  ({cfg.n_epochs} epochs × {steps_per_epoch} steps; "
@@ -449,6 +457,9 @@ def train(
             raise ValueError(f"{resume_path} has no train_state; cannot resume from it")
         if loaded["mode"] != cfg.mode:
             raise ValueError(f"resume mode mismatch: ckpt={loaded['mode']} cfg={cfg.mode}")
+        ck_src = loaded["training_config"].get("data_source", "cache")
+        if ck_src != cfg.data_source:
+            raise ValueError(f"resume data_source mismatch: ckpt={ck_src} cfg={cfg.data_source}")
         vae.load_state_dict(loaded["vae"].state_dict())
         opt.load_state_dict(ts["optimizer"])
         if scheduler is not None and ts.get("scheduler") is not None:
@@ -584,6 +595,8 @@ def train(
             batch_in_epoch = 0
 
     csv_logger.close()
+    if streaming:
+        producer.close()  # remove the GPT-2 hooks
 
     complete = step >= total_steps
     if out_of_time and not complete:
@@ -688,6 +701,9 @@ def main() -> int:
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--no-pin-memory", action="store_true")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--data-source", choices=["cache", "stream"], default=None,
+                   help="rev-8: train on cache-v2 shards or live GPT-2 traces "
+                        "(default: training.data_source in config, else cache)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -727,7 +743,11 @@ def main() -> int:
         wandb_entity=args.wandb_entity or raw_cfg.get("logging", {}).get("wandb_entity"),
         shard_buffer=args.shard_buffer or raw_cfg["cache_v2"].get("shard_buffer", 4),
         val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
+        data_source=args.data_source or tr.get("data_source", "cache"),
     )
+    if tcfg.data_source == "stream":
+        from specdec_af.data.stream import stream_cfg_from
+        tcfg.stream = stream_cfg_from(raw_cfg)
 
     device = pick_device(force_cpu=args.cpu)
     print(f"device={device.type}  mode={tcfg.mode}  run={args.run_name}", flush=True)
@@ -735,7 +755,9 @@ def main() -> int:
           f"beta_anneal_steps={tcfg.beta_anneal_steps}  free_bits={tcfg.free_bits}", flush=True)
     print(f"grad_clip_norm={tcfg.grad_clip_norm}  lr={tcfg.lr}  "
           f"lr_warmup_steps={tcfg.lr_warmup_steps}  n_steps={tcfg.n_steps_override}", flush=True)
-    print(f"cache_dir={cache_dir}", flush=True)
+    print(f"cache_dir={cache_dir}  data_source={tcfg.data_source}", flush=True)
+    if tcfg.stream:
+        print(f"stream={tcfg.stream}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
 
     val_shards = args.val_shards or raw_cfg["cache_v2"].get("val_shards")

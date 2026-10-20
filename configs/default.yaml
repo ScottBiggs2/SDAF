@@ -35,6 +35,14 @@ cache_v2:                 # rev-7: many sampled positions per sequence (collect_
   val_positions: 5000     # fixed val set = first 5k positions of the val shards
   shard_buffer: 4         # shards shuffled together per training buffer
 
+stream:                   # rev-8: producer-consumer (specdec_af/data/stream.py); geometry from cache_v2
+  tokens_path: "${SCRATCH:-./outputs}/specdec_af/tokens/wikitext103_train.npy"  # `python -m specdec_af.data.stream pretokenize`
+  seqs_per_chunk: 256     # sequences per producer chunk → 4,096 positions × 12 = 49,152 items = 192 batches of 256
+  micro_bs: 32            # sequences per GPT-2 forward (hook buffer ≈ 3 GB fp32 at 32 × 256 tokens)
+  round_fp16: true        # round live traces to fp16 (the cache-v2 distribution the rev-7 VAE saw)
+  seed: 1236              # plan / shuffle / position seed (cache v2 used 1234 Stage A, 1235 Stage B)
+  latent_chunks_per_buffer: 4  # LDM consumer: 16,384 positions shuffled together
+
 corpus:
   name: "wikitext"
   config: "wikitext-103-raw-v1"
@@ -55,6 +63,7 @@ training:
   free_bits: 0.1          # Kingma+ 2016: per-dim KL floor in nats. 0.0 = disabled. Keeps KL > 0.
   grad_clip_norm: 1.0     # rev-4: standard fix for option_d spike pattern. null/0 = disabled.
   seed: 42
+  data_source: stream     # rev-8: "stream" (live GPT-2) | "cache" (cache-v2 shards; reproduces rev-7)
 
 logging:                  # rev-7
   wandb_project: null     # set via --wandb-project / WANDB_PROJECT in sbatch (null = off, e.g. local/tests)
