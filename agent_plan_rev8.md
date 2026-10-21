@@ -67,7 +67,7 @@ Explorer, V100 (`gpu:v100-sxm2:1`), partition `gpu`, ≤ 8h per job.
 - **Q1:** merge `rev7-uncond-vae` → `main` first, then branch `rev8-ldm` off `main`. Done 10-20 (fast-forward, together with the stream refactor).
 - **Q2:** standard DiT settings (EMA 0.9999, eval on EMA).
 - **Q3:** budgets OK.
-- **Q4:** pending; explained in chat.
+- **Q4:** yes, disjoint halves are in the plan from the start (Scott, 10-20). The split is built in Stage 1 and the runs are Stage 7b.
 - **Q5:** A100s are available. Use one for the Stage-2 bit-exact flash-attn reference fixture. A100s also give bf16, which is MDLM's training precision.
 - **Producer-consumer:** adopted and built 10-20 for both the VAE and the LDM (see §0.5).
 
@@ -122,6 +122,8 @@ The original questions, for the record:
 ## 2. Stage 1 — Data layer + condition masking (local)
 
 **`specdec_af/ldm/data.py`**
+- **Halves split (for 7b):** `ldm.train_half ∈ {all, A, B}` → `SequencePlan(include=...)`, with even / odd global sequence id. The same
+  parity filter applies to `LatentTable` rows via `seq_global_idx`. Test: A ∩ B = ∅, A ∪ B = all train sequences, val untouched.
 - **`ldm.data_source ∈ {stream, static}`** (default `stream`, §0.5). `stream` wraps `data.stream.StreamingLatentBatches`; `static` wraps
   `LatentTable` below. `ConditionSampler` and `z_source` sit on top of either, so the masking code and its tests are shared. Val/eval is
   always the static `LatentTable` val split.
@@ -344,8 +346,14 @@ Scott confirms the winner, which is then pinned as `ldm.z_source` in `configs/de
      It is evaluated under `null` only and compared with the main model's `null`. This is the *naive* GLP comparison (brainstorm D1); the fair replica is §11.
    - `rev8_diag`: the main architecture with `self_attn_mask: diag`, i.e. blocks independent given the condition. This measures what joint modelling across depth buys,
      especially on cross-block consistency.
-3. **(7b, only if Q4 = yes):** `rev8_halfA` / `rev8_halfB` on disjoint train halves, split by sequence id (add an `include` filter, e.g. parity, to `SequencePlan`). Sample both from shared noise under
-   `null` and m = 0. Report the latent distance between paired samples, relative to the distance between independent samples.
+3. **(7b) Disjoint-halves generalization test** (Kadkhodaie et al. 2024). `rev8_halfA` / `rev8_halfB`: same config, seed and steps as the
+   main run's 50k checkpoint, trained on disjoint halves split by sequence-id parity.
+   - Sample both from **shared noise** under `null`, `suffix` m ∈ {0, 8} and identical conditions.
+   - Report the paired-sample latent distance relative to the independent-sample distance, both in z and in decoded teacher-KL terms.
+   - Near-identical paired samples mean the model has learned the density; divergent samples mean memorization.
+   - This is what licenses Stage-7 geometric claims.
+   - Note: on the stream each half still sees ~230k sequences × fresh positions, so generalization is the expected outcome. A
+     static-halves sweep at smaller N (the memorization → generalization transition) is a §11 follow-up.
 4. **`outputs/rev8_report.md`:**
    - what was built;
    - the D14 outcome;
