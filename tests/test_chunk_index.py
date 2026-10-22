@@ -5,7 +5,7 @@
   3. Boundary zero-padding correctness on both boundaries.
   4. Terminal identity through the chunk pipeline (the gate, Phase 2 check 3):
      lm_head(terminal_logits_input(pack(real_hooks))) == model.logits at the
-     window positions.
+     gathered positions.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from specdec_af.models.chunk_index import (
     terminal_logits_input,
     unpack_slot,
 )
-from specdec_af.models.hooks import HOOK_NAMES_PER_BLOCK, collect_hook_dict
+from specdec_af.models.hooks import HOOK_NAMES_PER_BLOCK, gather_hook_positions, register_hooks
 
 
 MODEL_NAME = "openai-community/gpt2"
@@ -131,31 +131,31 @@ def batch(tokenizer):
 
 
 def test_terminal_identity_through_pipeline(model, batch):
-    """lm_head(terminal_logits_input(pack(hooks))) == model.logits at the window positions.
+    """lm_head(terminal_logits_input(pack(hooks))) == model.logits at the gathered positions.
 
-    This is the Phase 1 terminal-identity check, routed through Phase 2's
-    pack/unpack. If it fails the schema's boundary_out interpretation is
-    wrong and no further phase is meaningful.
+    The terminal-identity check routed through pack/unpack. If it fails, the
+    schema's boundary_out interpretation is wrong and nothing downstream is
+    meaningful.
     """
     input_ids, attn_mask = batch
     B, T_full = input_ids.shape
-    prefix_pos = T_full - 3
-    window = slice(prefix_pos + 1, prefix_pos + 1 + 2)  # k = 2 (exercise the window dim)
+    positions = torch.tensor([[T_full - 2, T_full - 1]] * B)  # k = 2 (exercise the position dim)
     k = 2
 
-    out = collect_hook_dict(model, input_ids, attn_mask, window, prefix_pos)
-    chunks = pack_chunks(out.hooks, n_layers=len(model.transformer.h))
+    handles, buffer = register_hooks(model)
+    try:
+        with torch.no_grad():
+            ref = model(input_ids=input_ids, attention_mask=attn_mask)
+        chunks = pack_chunks(gather_hook_positions(buffer, positions), n_layers=len(model.transformer.h))
+    finally:
+        for h in handles:
+            h.remove()
     assert chunks.shape == (B, k, 12, D_CHUNK)
 
     terminal = terminal_logits_input(chunks)
     assert terminal.shape == (B, k, 768)
-
     logits_from_chunks = model.lm_head(terminal)
-
-    with torch.no_grad():
-        ref = model(input_ids=input_ids, attention_mask=attn_mask)
-    ref_logits = ref.logits[:, window, :]
-
+    ref_logits = ref.logits[:, T_full - 2:, :]
     torch.testing.assert_close(logits_from_chunks, ref_logits, atol=ATOL, rtol=RTOL)
 
 

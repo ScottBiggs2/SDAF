@@ -10,16 +10,17 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/train-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/train-%j.err
 
-# Phase 6: full training run of the unconditional trace VAE (rev-7) on the cache.
+# Trace VAE training run (specdec_af.training.train): streamed GPT-2 traces by default
+# (DATA_SOURCE=stream), or the cache-v2 shards (DATA_SOURCE=cache).
 #
 # Env vars (override at sbatch time):
 #   MODE                — option_4 or option_d (default: config vae.decoder_output_space)
-#   RUN_NAME            — output directory under outputs/train/, default k1_${mode}
-#   BETA_MAX            — KL weight ceiling. Default: from configs/default.yaml (0.01 in rev-3).
+#   RUN_NAME            — output directory under outputs/train/, default rev7_${MODE:-default}
+#   BETA_MAX            — KL weight ceiling. Default: from configs/default.yaml (0.01).
 #                          Set explicitly for sweeps: BETA_MAX=0.05 sbatch ...
 #   BETA_ANNEAL_EPOCHS  — epochs to ramp β from 0 → BETA_MAX. Default: from config (60).
 #   FREE_BITS           — per-dim KL floor in nats (Kingma+ 2016). Default: from config (0.1).
-#                          Setting 0.0 disables free-bits (pre-rev-3 behavior).
+#                          Setting 0.0 disables free-bits.
 #   GRAD_CLIP_NORM      — rev-4: max L2 norm for grad clip. Default: from config (1.0).
 #                          Set 0 to disable (e.g. GRAD_CLIP_NORM=0 for the noclip ablation).
 #   N_STEPS             — rev-7: optimizer-step budget. Default: from config (null → epochs).
@@ -47,7 +48,7 @@
 #   - checkpoints/final.pt     — loadable via load_vae_checkpoint (resumable)
 #   - checkpoints/step_NNNNNN.pt — periodic resumable snapshots (every 5k steps)
 #
-# Wall-time reference (rev-6, in-RAM v1 cache): ~80 min on v100-pcie for ≈ 42k steps.
+# Wall-time reference (V100-SXM2, 5k steps): ~2 min streamed, ~8 min from the cache (rev-8 parity runs).
 
 set -euo pipefail
 

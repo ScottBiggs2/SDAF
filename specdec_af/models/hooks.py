@@ -21,9 +21,6 @@ Canonical names (74 total = 2 global + 6 per-block * 12 blocks):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
-
 import torch
 from torch import Tensor
 from torch.utils.hooks import RemovableHandle
@@ -50,32 +47,14 @@ def expected_hook_keys(n_layers: int) -> list[str]:
     return keys
 
 
-@dataclass
-class HookBatch:
-    """Sliced hook outputs for one collected window batch.
-
-    Attributes:
-        hooks: dict keyed by canonical name (global) or ``{name}_l{l}`` (per-block).
-            Each tensor has shape ``[B, k, D_h]`` where ``k`` is the number of
-            window positions selected by ``window_slice`` and ``D_h`` is the
-            hook's intrinsic width (768, 2304, or 3072).
-        prefix_features: ``[B, n_layers * 768]``. ``mlp_proj_out`` (the last
-            theta @ data per block) at ``prefix_pos``, stacked across layers.
-            ``None`` when no ``prefix_pos`` is given (rev-7 cache v2 path).
-    """
-
-    hooks: dict[str, Tensor]
-    prefix_features: Tensor | None
-
-
 def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
     """Attach forward hooks to every theta @ data module of HF GPT-2.
 
     Returns:
         (handles, buffer). ``buffer`` is populated in place each forward pass;
         keys match ``expected_hook_keys(n_layers)``. Caller is responsible for
-        calling ``h.remove()`` on every handle when done (or using
-        :func:`collect_hook_dict` which handles cleanup itself).
+        calling ``h.remove()`` on every handle when done. Use
+        :func:`gather_hook_positions` to read selected positions out of it.
     """
     buffer: dict[str, Tensor] = {}
     handles: list[RemovableHandle] = []
@@ -102,83 +81,12 @@ def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
     return handles, buffer
 
 
-def _slice_positions(t: Tensor, positions: slice | Iterable[int] | Tensor) -> Tensor:
-    """Slice ``[B, T, D]`` along T using a slice, index list, or 1-D tensor."""
-    if isinstance(positions, slice):
-        return t[:, positions, :].contiguous()
-    idx = positions if isinstance(positions, Tensor) else torch.as_tensor(list(positions))
-    return t.index_select(dim=1, index=idx.to(t.device))
+def gather_hook_positions(buffer: dict[str, Tensor], positions: Tensor) -> dict[str, Tensor]:
+    """Per-row gather of a populated hook buffer at ``positions [B, n_pos]``.
 
-
-def _gather_positions(t: Tensor, positions: Tensor) -> Tensor:
-    """Per-row gather ``[B, T, D]`` → ``[B, n_pos, D]`` with ``positions: [B, n_pos]``."""
-    idx = positions.to(device=t.device, dtype=torch.long)
-    return torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
-
-
-def build_hook_batch_from_buffer(
-    buffer: dict[str, Tensor],
-    *,
-    window_slice: slice | Iterable[int] | Tensor | None = None,
-    positions: Tensor | None = None,
-    prefix_pos: int | None = None,
-    n_layers: int,
-) -> HookBatch:
-    """Assemble a HookBatch from a (pre-populated) hook buffer.
-
-    For cache collection, the caller registers hooks once (via
-    :func:`register_hooks`) and re-uses the long-lived buffer across forwards.
-    This helper extracts the selected positions (+ optional prefix features)
-    without re-registering. Every returned tensor is a fresh copy, so
-    subsequent forwards that overwrite the buffer don't mutate the batch.
-
-    Exactly one of:
-      - ``window_slice``: the same positions for every row (v1 cache path).
-      - ``positions``: ``[B, n_pos]`` per-row position indices (rev-7 cache
-        v2), gathered with ``torch.gather`` on the sequence dim.
+    Returns ``{key: [B, n_pos, D_h]}`` with the keys of ``buffer``; every tensor
+    is a fresh copy, so later forwards that overwrite the buffer don't mutate it.
     """
-    if (window_slice is None) == (positions is None):
-        raise ValueError("pass exactly one of window_slice / positions")
-    if positions is not None:
-        hooks = {name: _gather_positions(t, positions) for name, t in buffer.items()}
-    else:
-        hooks = {name: _slice_positions(t, window_slice).clone() for name, t in buffer.items()}
-    prefix_features = None
-    if prefix_pos is not None:
-        prefix_parts = [buffer[f"mlp_proj_out_l{l}"][:, prefix_pos, :] for l in range(n_layers)]
-        prefix_features = torch.cat(prefix_parts, dim=-1).clone()  # [B, n_layers * D]
-    return HookBatch(hooks=hooks, prefix_features=prefix_features)
-
-
-def collect_hook_dict(
-    model,
-    input_ids: Tensor,
-    attention_mask: Tensor | None,
-    window_slice: slice | Iterable[int] | Tensor,
-    prefix_pos: int,
-) -> HookBatch:
-    """Run one frozen forward, return window-sliced hooks + stacked prefix features.
-
-    Hooks are registered and removed within this call. For tight batched
-    collection (Phase 3), call :func:`register_hooks` once and re-use the
-    returned buffer across forwards via :func:`build_hook_batch_from_buffer`.
-
-    Args:
-        model: HF ``GPT2LMHeadModel``.
-        input_ids: ``[B, T_full]``.
-        attention_mask: ``[B, T_full]`` or ``None``.
-        window_slice: positions whose hooks to keep — typically
-            ``slice(prefix_pos + 1, prefix_pos + 1 + k)`` for k-token windows.
-        prefix_pos: position of the last prefix token (T).
-    """
-    handles, buffer = register_hooks(model)
-    try:
-        with torch.no_grad():
-            model(input_ids=input_ids, attention_mask=attention_mask)
-        n_layers = len(model.transformer.h)
-        return build_hook_batch_from_buffer(
-            buffer, window_slice=window_slice, prefix_pos=prefix_pos, n_layers=n_layers,
-        )
-    finally:
-        for h in handles:
-            h.remove()
+    idx = positions.to(device=next(iter(buffer.values())).device, dtype=torch.long)
+    return {name: torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+            for name, t in buffer.items()}

@@ -1,30 +1,36 @@
-"""Unconditional trace VAE for SpecDec-AF GPT-2 chunks.
+"""Trace VAE: one per-block compressor shared across all 12 GPT-2 blocks.
 
-One VAE shared across all 12 transformer blocks. Each forward sees one block's
-normalized chunk (9984-d). The shared weights + ``block_embed`` conditioning
-give the DWF "same structural object seen 12 times per token" pattern — see
-[[project_specdec_af_gpt2]] and [[feedback_framing]].
+Each item is one block's normalized chunk (9984-d, schema in
+:mod:`specdec_af.models.chunk_index`). The same weights see the same
+structural object 12 times per token position (the chunked, shared-autoencoder
+template of weight-space generative models).
 
-rev-7 (latent-diffusion split): the autoencoder is a pure per-block
-compressor. ``E(chunk) → z`` (block-agnostic), ``D(z, block_id) → chunk``.
-The prefix / token-position / lookahead-k conditioning of rev-4..rev-6 is
-gone; all context conditioning moves to the latent generator over
-Z_trace = 12 × d_latent per token (next plan). ``PrefixEncoder`` stays in the
-repo for that stage but is no longer part of this model.
+Conditioning:
 
-The decoder output is interpreted per the Phase-5 normalization decision
-([[project_normalization_decision]]):
+  - **Encoder** ``E(chunk_norm) → (mu, logvar)`` is block-agnostic: it gets no
+    block index, position or prompt.
+  - **Decoder** ``D(z, block_id) → chunk`` is conditioned on the block index
+    and nothing else: ``Decoder.block_embed`` (``nn.Embedding(12, 64)``) is
+    concatenated to ``z`` at the decoder input. ``block_id`` comes from each
+    batch (``batch["block_id"]``) through ``TraceVAE.forward`` / ``decode``.
 
-  - ``decoder_output_space="normalized"`` (option 4): downstream loss applies
-    ``ChunkNorm.invert_per_item`` before MSE, and the terminal-slot SD readout
-    inverts before ``lm_head``.
-  - ``decoder_output_space="raw"``    (option D): downstream loss uses
-    ``ChunkNorm.loss_weight_per_item`` to σ-weight per-element MSE; the
-    terminal-slot SD readout feeds the decoder output directly to ``lm_head``.
+All context conditioning (the prompt) belongs to the latent generator over
+``Z_trace = 12 × d_latent`` per position, not to this model. (The block index
+is also used, without learned parameters, by ``ChunkNorm``'s per-block
+statistics.)
 
-The model architecture is **identical** for the two options; only the
-interpretation of the output and the loss assembly differ. The constructor
-flag pins the intent so downstream code can dispatch cleanly.
+The decoder output space follows the normalization decision (rev-7 Gate 4):
+
+  - ``decoder_output_space="raw"`` (option D, default): the decoder emits raw
+    activations; the loss σ-weights per-element MSE via
+    ``ChunkNorm.loss_weight_per_item``; the terminal slot feeds ``lm_head``
+    directly.
+  - ``decoder_output_space="normalized"`` (option 4): the loss applies
+    ``ChunkNorm.invert_per_item`` before MSE, and the terminal readout inverts
+    before ``lm_head``.
+
+The architecture is identical for the two options; only the interpretation of
+the output and the loss assembly differ.
 """
 from __future__ import annotations
 
@@ -37,12 +43,12 @@ from torch import Tensor
 from specdec_af.models.chunk_index import D_CHUNK, N_LAYERS_DEFAULT
 
 
-D_BLOCK_DEFAULT = 64    # rev-7: the only decoder condition (block_embed width)
-D_LATENT_DEFAULT = 128  # rev-5: bumped from 64 (Z_trace = 12 × d_latent per token)
+D_BLOCK_DEFAULT = 64    # block_embed width: the decoder's only condition
+D_LATENT_DEFAULT = 128  # per block; Z_trace = 12 × d_latent per token
 
 
 class Encoder(nn.Module):
-    """``chunk_norm`` → ``(mu, logvar)``. Block-agnostic and unconditioned (rev-6+).
+    """``chunk_norm`` → ``(mu, logvar)``. Block-agnostic and unconditioned.
 
     Architecture: 3 × (Linear + LayerNorm + GELU) tower d_chunk → 2048 → 1024 → 512,
     then ``mu`` and ``logvar`` heads to ``d_latent``.
@@ -69,11 +75,10 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """``concat(z, block_embed(block_id))`` → ``recon``.
+    """``concat(z, block_embed(block_id))`` → ``recon``: the block-index conditioning.
 
     Architecture: 3 × (Linear + LayerNorm + GELU) tower (d_latent + d_block = 192)
     → 512 → 1024 → 2048, then linear to ``d_chunk``. No final nonlinearity.
-    rev-7: ``block_embed`` is owned here (was in the removed ``ConditionAssembler``).
     """
 
     def __init__(
@@ -140,7 +145,7 @@ class TraceVAE(nn.Module):
         return self.decode(z, block_id)
 
     def init_decoder_out_for_raw_space(self, std_buf: Tensor) -> None:
-        """Optional init trick for option D — see plan Phase 5 design notes.
+        """Output-scale init for option D (raw-space decoder output).
 
         Default ``kaiming_uniform_`` produces unit-ish outputs at step 0, but
         option-D targets are O(σ_pop) per element (≈10 at deep blocks). Scale

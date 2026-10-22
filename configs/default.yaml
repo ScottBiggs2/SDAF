@@ -1,25 +1,15 @@
-# SpecDec-AF GPT-2 Phase 1a defaults.
+# SpecDec-AF GPT-2 defaults (trace VAE + streaming data path).
 # Path strings support ${VAR} / ${VAR:-default} expansion at load time.
 
 paths:
   cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache_v2"   # rev-7: cache v2 (collect_v2)
-  cache_v1_dir: "${SCRATCH:-./outputs}/specdec_af/cache"   # legacy v1 windows (collect.py)
   output_dir: "${SCRATCH:-./outputs}/specdec_af/outputs"
-  log_dir: "${SCRATCH:-./outputs}/specdec_af/logs"
 
 model:
   name: "openai-community/gpt2"
-  n_layers: 12
-  d_model: 768
-
-trace:
-  ctx_len: 128            # v1 window prefix length (collect.py); unused by the rev-7 VAE
-  d_chunk: 9984
-  J: 12
 
 vae:
-  d_latent: 128           # rev-5: bumped from 64. Z_trace per token = 12 × 128 = 1536-d.
-  d_block: 64             # rev-7: block_embed is the decoder's only condition (D(z, block_id)).
+  d_latent: 128           # per block; Z_trace per token = 12 × 128 = 1536-d. (block_embed width 64 is fixed in models/vae.py)
   decoder_output_space: raw  # rev-7 Gate 4: option_d (raw) won the pre-registered rule, val top-1 0.483 vs 0.411.
                              # Default --mode in train.py ("raw" → option_d, "normalized" → option_4).
 
@@ -48,20 +38,18 @@ corpus:
   config: "wikitext-103-raw-v1"
   split: "train"
   streaming: true
-  n_windows: 10000
-  n_calibration_windows: 1000
 
 training:
   batch_size: 256
-  lr: 5.0e-4              # rev-5: lowered from 1.0e-3; paired with warmup below.
-  lr_warmup_steps: 500    # rev-5: linear warmup over the first 500 optimizer steps.
+  lr: 5.0e-4              # paired with the warmup below.
+  lr_warmup_steps: 500    # linear warmup over the first 500 optimizer steps.
   epochs: 100
   beta_max: 0.01          # was 1.0; reduced to avoid posterior collapse (see outputs/analysis_0516/)
   beta_anneal_epochs: 60  # was 30; slower ramp gives encoder room to find latent structure
   beta_anneal_steps: null # rev-7: β ramp in optimizer steps; overrides beta_anneal_epochs when set
   n_steps: null           # rev-7: step budget (null = epochs × steps/epoch)
   free_bits: 0.1          # Kingma+ 2016: per-dim KL floor in nats. 0.0 = disabled. Keeps KL > 0.
-  grad_clip_norm: 1.0     # rev-4: standard fix for option_d spike pattern. null/0 = disabled.
+  grad_clip_norm: 1.0     # guards option_d loss spikes. null/0 = disabled.
   seed: 42
   data_source: stream     # rev-8: "stream" (live GPT-2) | "cache" (cache-v2 shards; reproduces rev-7)
 
@@ -69,9 +57,4 @@ logging:                  # rev-7
   wandb_project: null     # set via --wandb-project / WANDB_PROJECT in sbatch (null = off, e.g. local/tests)
   wandb_entity: null      # null = the account's default entity
 
-cluster:
-  partition: "gpu"
-  gres: "gpu:v100-sxm2:1"  # rev-7: train/eval/export sbatch scripts pin this
-  time: "04:00:00"
-  mem: "32G"
-  cpus_per_task: 4
+# Cluster resources live in scripts/slurm/*.sh (#SBATCH lines), not here.

@@ -9,9 +9,8 @@ A single :class:`ChunkNorm` module supports both Phase-5 normalization paths:
     activations directly; per-element MSE is weighted by ``loss_weight()``
     (= ``mask / std²``); ``invert`` is never called. Loss is σ-weighted.
 
-The choice between options 4 and D is deferred to Phase 5's overfit-a-batch
-sweep — see [[project_normalization_decision]]. Phase 2 ships the substrate
-for both.
+Option D won the rev-7 pre-registered rule and is the default
+(``vae.decoder_output_space: raw``); option 4 remains supported.
 
 Zero-padded boundary slots (slot 0 for blocks 1..L-1, slot 7 for blocks
 0..L-2) have ``std ≈ 0``; we eps-clamp ``std`` to keep ``forward`` finite,

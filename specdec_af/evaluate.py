@@ -129,11 +129,11 @@ def condition_latents(condition: Condition, mu: Tensor, logvar: Tensor, *, seed:
 
 
 def to_raw(recon: Tensor, chunk_norm: ChunkNorm, mode: Mode) -> Tensor:
-    return chunk_norm.invert(recon) if mode in ("option_1", "option_4") else recon
+    return chunk_norm.invert(recon) if mode == "option_4" else recon
 
 
 def to_norm(recon: Tensor, chunk_norm: ChunkNorm, mode: Mode) -> Tensor:
-    return recon if mode in ("option_1", "option_4") else chunk_norm(recon)
+    return recon if mode == "option_4" else chunk_norm(recon)
 
 
 # ----------------------------------------------------------------------

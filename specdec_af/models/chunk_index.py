@@ -72,8 +72,8 @@ def pack_chunks(hook_dict: dict[str, Tensor], n_layers: int = N_LAYERS_DEFAULT) 
     """Pack hooks into the structured chunk tensor.
 
     Args:
-        hook_dict: hooks from :func:`specdec_af.models.hooks.collect_hook_dict`.
-            Each value has shape ``[B, k, D_h]``. Keys: ``embed_out``, ``ln_f_out``,
+        hook_dict: hooks from :func:`specdec_af.models.hooks.gather_hook_positions`.
+            Each value has shape ``[B, k, D_h]`` (``k`` positions per row). Keys: ``embed_out``, ``ln_f_out``,
             and ``{name}_l{l}`` for ``name`` in ``HOOK_NAMES_PER_BLOCK`` and
             ``l in range(n_layers)``.
         n_layers: number of transformer blocks (default 12).
@@ -122,8 +122,7 @@ def unpack_slot(chunks: Tensor, block_id: int, slot_name: str) -> Tensor:
 def terminal_logits_input(chunks: Tensor) -> Tensor:
     """Convenience: slot 7 ('boundary_out') of the last block.
 
-    This is the slot to feed ``lm_head`` for terminal SD readout (after
-    de-normalization in option-4 paths; directly in option-D paths). See
-    [[project_normalization_decision]].
+    This is the slot to feed ``lm_head`` for the next-token readout (after
+    de-normalization in option-4 paths; directly in option-D paths).
     """
     return unpack_slot(chunks, TERMINAL_BLOCK, "boundary_out")

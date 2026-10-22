@@ -11,8 +11,8 @@ A single ``.pt`` carries everything needed to resume training or run eval:
 Stored using ``torch.save``; load with ``weights_only=True`` (the schema is
 entirely nested dicts + tensors + ints + strings — pickle-free).
 
-rev-7 (format_version 3): the VAE is unconditional (``D(z, block_id)``); the
-PrefixEncoder and ConditionAssembler are no longer part of the checkpoint.
+rev-7 (format_version 3): the VAE is unconditional apart from the block index
+(``D(z, block_id)``); older formats are rejected.
 """
 from __future__ import annotations
 
@@ -26,16 +26,6 @@ from specdec_af.models.vae import TraceVAE
 
 
 FORMAT_VERSION = 3
-
-
-class IncompatiblePrefixEncoderError(RuntimeError):
-    """Pre-rev-4 PrefixEncoder config. Kept for backwards-import compatibility."""
-
-
-class IncompatibleVAEEncoderError(RuntimeError):
-    """Pre-rev-6 encoder (conditioned on cond). Kept for backwards-import compatibility;
-    the rev-7 gate raises :class:`IncompatibleVAEConditioningError` for every format < 3.
-    """
 
 
 class IncompatibleVAEConditioningError(RuntimeError):

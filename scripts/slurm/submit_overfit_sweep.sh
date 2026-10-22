@@ -10,11 +10,11 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/overfit-sweep-%j.err
 
-# Phase 5 overfit-a-batch sweep — option-4-vs-D sanity on one fixed batch.
-# rev-7: unconditional VAE; the ablation is now wrong_z (rolled mu) instead of wrong_prefix.
+# Overfit-a-batch sweep: option 4 vs option D on one fixed batch (rev-7 normalization
+# decision; kept as a capacity / plumbing check for new VAE variants).
 # See specdec_af_gpt2_impl_plan_v1.md §"Open design decisions".
 #
-# Prereq: cache + chunk_norm_stats.pt from submit_collect.sh.
+# Prereq: cache v2 + chunk_norm_stats.pt from submit_collect_v2.sh.
 #
 # Each log step reports BOTH a `qz` and a `wrong_z` (rolled mu) eval pass, with:
 #   - unnormalized terminal-slot MSE (cross-mode comparison)
@@ -56,8 +56,7 @@ nvidia-smi -L || true
 echo "SCRATCH=$SCRATCH"
 echo "====================="
 
-# Default sweep: option_4 vs option_d. Include option_1 as a baseline by
-# adding it to the --modes list (slightly more cluster time).
+# Default sweep: option_4 vs option_d.
 python -m specdec_af.training.overfit_sweep \
   --config configs/default.yaml \
   --modes option_4 option_d \

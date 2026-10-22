@@ -1,10 +1,9 @@
-"""Conditional scale variation diagnostic (Phase 3 check 6).
+"""Per-(block, slot) scale-variation diagnostic over a cache-v2 directory.
 
-For each (block j, named slot) in the chunk schema, compute ``||C_{w, j, slot}||_2``
-across all cached windows ``w`` and report the per-(j, slot) mean, std, and
-coefficient of variation (CV = std/mean). This is the empirical input for the
-Phase 5 normalization decision (option 4 vs option D — see
-[[project_normalization_decision]]):
+For each (block j, named slot) in the chunk schema, compute ``||C_{p, j, slot}||_2``
+across all cached positions ``p`` and report the per-(j, slot) mean, std, and
+coefficient of variation (CV = std/mean). This was the empirical input to the
+normalization decision (option 4 vs option D; option D was chosen at rev-7):
 
   - CV < 10%  → option 4 likely fine (fixed-σ inverse is near-lossless).
   - CV > 30%  → option D is the defensible default.
@@ -13,9 +12,8 @@ Phase 5 normalization decision (option 4 vs option D — see
 Padded slots (``boundary_in`` for blocks 1..L-1, ``boundary_out`` for blocks
 0..L-2) are excluded; only their data-bearing blocks appear in the output.
 
-rev-7: reads either cache layout — v2 ``shards/shard_NNNN/chunks.npy``
-(``[N_pos, J, D]``, memory-mapped, streamed in blocks) or v1
-``windows/shard_NNNN.pt`` (``[B, k, J, D]``).
+Reads ``shards/shard_NNNN/chunks.npy`` (``[N_pos, J, D]``), memory-mapped and
+streamed in blocks.
 """
 from __future__ import annotations
 
@@ -38,30 +36,23 @@ def _data_bearing_blocks(slot_name: str, n_layers: int) -> list[int]:
 
 
 def _iter_flat_chunks(cache_dir: Path, block_rows: int = 256):
-    """Yield ``[N, J, D]`` float32 chunk blocks from a v2 or v1 cache."""
-    v2 = sorted(p.parent for p in (cache_dir / "shards").glob("shard_*/meta.json"))
-    if v2:
-        for shard in v2:
-            m = np.load(shard / "chunks.npy", mmap_mode="r")
-            for i in range(0, m.shape[0], block_rows):
-                yield torch.from_numpy(np.asarray(m[i:i + block_rows], dtype=np.float32))
-        return
-    shards = sorted((cache_dir / "windows").glob("shard_*.pt"))
+    """Yield ``[N, J, D]`` float32 chunk blocks from every cache-v2 shard."""
+    shards = sorted(p.parent for p in (cache_dir / "shards").glob("shard_*/meta.json"))
     if not shards:
-        raise FileNotFoundError(f"no v2 shards in {cache_dir / 'shards'} or v1 shards in {cache_dir / 'windows'}")
+        raise FileNotFoundError(f"no cache-v2 shards in {cache_dir / 'shards'}")
     for shard in shards:
-        chunks = torch.load(shard, map_location="cpu", weights_only=True)["chunks"].to(torch.float32)
-        B, k, J, D = chunks.shape
-        yield chunks.reshape(B * k, J, D)
+        m = np.load(shard / "chunks.npy", mmap_mode="r")
+        for i in range(0, m.shape[0], block_rows):
+            yield torch.from_numpy(np.asarray(m[i:i + block_rows], dtype=np.float32))
 
 
 def compute_scale_variation(cache_dir: Path | str) -> dict:
-    """Stream all shards (v2 ``shards/`` or v1 ``windows/``) and accumulate stats.
+    """Stream all shards and accumulate stats.
 
     Returns a dict with structure::
 
         {
-          "n_windows": int,
+          "n_positions": int,
           "n_layers": int,
           "per_slot": {
             "boundary_in":   {"blocks": [0],   "mean_norm": [...], "std_norm": [...], "cv": [...]},
@@ -98,7 +89,7 @@ def compute_scale_variation(cache_dir: Path | str) -> dict:
         counts += chunks_flat.shape[0]
 
     n_total = int(counts.item())
-    out: dict = {"n_windows": n_total, "n_positions": n_total, "n_layers": int(n_layers or N_LAYERS_DEFAULT), "per_slot": {}}
+    out: dict = {"n_positions": n_total, "n_layers": int(n_layers or N_LAYERS_DEFAULT), "per_slot": {}}
 
     for slot in SLOT_NAMES:
         means = sums[slot] / max(n_total, 1)

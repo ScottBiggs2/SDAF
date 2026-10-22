@@ -1,13 +1,12 @@
-"""Tokenization and corpus-iteration helpers for SpecDec-AF data collection.
+"""Tokenization and corpus-iteration helpers.
 
-Two surfaces:
   - :func:`load_wikitext_iter` — streams WikiText-103 raw via HuggingFace
-    ``datasets`` (no token required; public corpus). HF cache should be
-    redirected to ``/scratch`` on Explorer via ``HF_HOME``.
-  - :func:`iter_token_windows` — tokenizer-and-corpus-agnostic. Concatenates
-    tokens from any iterable of strings and yields fixed-length window batches.
-  - :func:`iter_token_sequences` — rev-7 cache v2: same packing, yields whole
-    ``[B, seq_len]`` sequences (positions are sampled inside each sequence).
+    ``datasets`` (public; no token). On Explorer, redirect the HF cache to
+    ``/scratch`` via ``HF_HOME``.
+  - :func:`iter_token_sequences` — tokenizer- and corpus-agnostic packing into
+    non-overlapping ``seq_len``-token sequences (cache v2; positions are sampled
+    inside each sequence). :func:`specdec_af.data.stream.build_token_array`
+    stores exactly this packing as one flat token array.
 """
 from __future__ import annotations
 
@@ -41,51 +40,6 @@ def load_wikitext_iter(
             yield text
 
 
-def iter_token_windows(
-    tokenizer,
-    corpus_iter: Iterable[str],
-    *,
-    ctx_len: int,
-    k: int,
-    batch_size: int,
-) -> Iterator[tuple[Tensor, Tensor]]:
-    """Yield ``(prefix_ids [B, ctx_len], window_ids [B, k])`` batches.
-
-    Concatenates encoded tokens from ``corpus_iter`` into a rolling buffer,
-    slices into non-overlapping windows of length ``ctx_len + k``, and emits
-    them in batches of ``batch_size``. Document boundaries are ignored — this
-    matches how GPT-2 was originally trained on packed sequences and is the
-    right semantics for an activation-trace VAE conditioned on a prefix.
-
-    Stops once ``corpus_iter`` is exhausted; emits a final partial batch if
-    any windows remain.
-    """
-    window_len = ctx_len + k
-    buf: list[int] = []
-    batch_windows: list[list[int]] = []
-
-    def _emit() -> tuple[Tensor, Tensor]:
-        arr = torch.tensor(batch_windows, dtype=torch.long)
-        return arr[:, :ctx_len], arr[:, ctx_len:]
-
-    for text in corpus_iter:
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        buf.extend(ids)
-        # Drain windows from the buffer.
-        i = 0
-        while len(buf) - i >= window_len:
-            batch_windows.append(buf[i:i + window_len])
-            i += window_len
-            if len(batch_windows) == batch_size:
-                yield _emit()
-                batch_windows = []
-        if i:
-            del buf[:i]
-
-    if batch_windows:
-        yield _emit()
-
-
 def iter_token_sequences(
     tokenizer,
     corpus_iter: Iterable[str],
@@ -95,12 +49,24 @@ def iter_token_sequences(
 ) -> Iterator[Tensor]:
     """Yield ``input_ids [B, seq_len]`` batches of packed, non-overlapping sequences.
 
-    Identical packing semantics to :func:`iter_token_windows` (it is that
-    function with ``ctx_len = seq_len - 1, k = 1``, re-joined), so sequence
-    ``n`` of this stream is window ``n`` of a ``ctx_len + k = seq_len`` window
-    stream. Emits a final partial batch if any sequences remain.
+    Encodes each line (``add_special_tokens=False``), concatenates everything
+    into one rolling buffer and cuts consecutive ``seq_len`` windows. Document
+    boundaries are ignored, matching GPT-2's packed training. Sequence ``n`` of
+    this stream is ``tokens[n * seq_len:(n + 1) * seq_len]`` of the
+    concatenated encoding. Emits a final partial batch if any sequences remain.
     """
-    for prefix_ids, window_ids in iter_token_windows(
-        tokenizer, corpus_iter, ctx_len=seq_len - 1, k=1, batch_size=batch_size,
-    ):
-        yield torch.cat([prefix_ids, window_ids], dim=1)
+    buf: list[int] = []
+    rows: list[list[int]] = []
+    for text in corpus_iter:
+        buf.extend(tokenizer.encode(text, add_special_tokens=False))
+        i = 0
+        while len(buf) - i >= seq_len:
+            rows.append(buf[i:i + seq_len])
+            i += seq_len
+            if len(rows) == batch_size:
+                yield torch.tensor(rows, dtype=torch.long)
+                rows = []
+        if i:
+            del buf[:i]
+    if rows:
+        yield torch.tensor(rows, dtype=torch.long)

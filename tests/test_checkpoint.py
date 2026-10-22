@@ -5,9 +5,7 @@ import torch
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import (
-    IncompatiblePrefixEncoderError,
     IncompatibleVAEConditioningError,
-    IncompatibleVAEEncoderError,
     load_vae_checkpoint,
     save_vae_checkpoint,
 )
@@ -102,7 +100,3 @@ def test_load_pre_rev7_checkpoint_raises(tmp_path, fmt):
     with pytest.raises(IncompatibleVAEConditioningError, match="Retrain under rev-7"):
         load_vae_checkpoint(path)
 
-
-def test_legacy_error_classes_still_importable():
-    assert issubclass(IncompatiblePrefixEncoderError, RuntimeError)
-    assert issubclass(IncompatibleVAEEncoderError, RuntimeError)

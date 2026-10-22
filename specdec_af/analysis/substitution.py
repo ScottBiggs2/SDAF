@@ -184,7 +184,7 @@ class SubstitutionHooks:
         bid = torch.full((chunk.shape[0],), l, dtype=torch.long, device=chunk.device)
         mu, _ = self.vae.encode(self.chunk_norm.forward_per_item(chunk, bid))
         out = self.vae.decode(mu, bid)
-        return self.chunk_norm.invert_per_item(out, bid) if self.space in ("option_1", "option_4") else out
+        return self.chunk_norm.invert_per_item(out, bid) if self.space == "option_4" else out
 
     def _replacement(self, l: int, chunk: Tensor) -> tuple[Tensor, Tensor]:
         (sa, ea), (sm, em) = SLOT_OFFSETS["attn_proj_out"], SLOT_OFFSETS["mlp_proj_out"]

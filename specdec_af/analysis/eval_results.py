@@ -19,9 +19,6 @@ by :func:`decision_rule`):
      cross-block consistency error. Also within 10 % relative → ``option_d``
      (standing tie-break: fewer architectural commitments).
 
-The rev-4..6 prefix milestone ordering (qz > prior > wrong_prefix ≈ baseline)
-is gone with the prefix conditions.
-
 Usage::
 
     python -m specdec_af.analysis.eval_results \\

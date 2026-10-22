@@ -57,7 +57,7 @@ from specdec_af.data.dataset import list_shards
 from specdec_af.data.scale_variation import save_scale_variation
 from specdec_af.models.chunk_index import D_CHUNK, TERMINAL_BLOCK, pack_chunks, unpack_slot
 from specdec_af.models.chunk_norm import ChunkNorm
-from specdec_af.models.hooks import build_hook_batch_from_buffer, register_hooks
+from specdec_af.models.hooks import gather_hook_positions, register_hooks
 from specdec_af.utils.config import expand_env, load_config, pick_device
 
 FORMAT = "cache_v2"
@@ -105,8 +105,7 @@ def gather_chunks(model, buffer: dict[str, Tensor], input_ids: Tensor, positions
     """Forward ``input_ids`` and return packed chunks ``[B * n_pos, J, D_CHUNK]`` (fp32, on device)."""
     n_layers = len(model.transformer.h)
     model(input_ids=input_ids)
-    hb = build_hook_batch_from_buffer(buffer, positions=positions, n_layers=n_layers)
-    chunks = pack_chunks(hb.hooks, n_layers=n_layers)  # [B, n_pos, J, D]
+    chunks = pack_chunks(gather_hook_positions(buffer, positions), n_layers=n_layers)  # [B, n_pos, J, D]
     return chunks.reshape(-1, n_layers, chunks.shape[-1])
 
 

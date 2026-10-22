@@ -1,24 +1,21 @@
-"""Per-option loss assembly for the SpecDec-AF VAE.
+"""Per-option loss assembly for the trace VAE.
 
-Three modes, dispatched on the Phase-5 normalization decision register
-([[project_normalization_decision]]):
+Two modes, the two candidates of the rev-7 normalization decision (option D
+won the pre-registered rule and is the default; option 4 is kept as the
+documented alternative):
 
-  - ``"option_1"`` — baseline. Decoder emits normalized; loss is MSE in
-    normalized space (rev-2 default).
   - ``"option_4"`` — decoder emits normalized; loss applies
     ``ChunkNorm.invert_per_item`` first, MSE in **unnormalized** space.
   - ``"option_d"`` — decoder emits **raw**; loss weights per-element MSE by
     ``ChunkNorm.loss_weight_per_item`` (= ``mask / std²``).
 
-Padded slot regions are masked out in every mode. The three modes have
+Padded slot regions are masked out in every mode. The two modes have
 different natural loss magnitudes:
 
-  - option 1 → unit scale (matches β=1.0 calibration).
   - option D → unit scale (σ-weighted MSE ≈ normalized MSE in magnitude).
   - option 4 → σ²-scale (raw-space MSE dominated by deep blocks).
 
-For consistent comparison across modes during the Phase-5 sweep, every mode
-additionally reports an **unnormalized terminal-slot MSE** computed in the
+For comparison across modes, every mode additionally reports an **unnormalized terminal-slot MSE** computed in the
 same units. That's the comparison metric — not the training loss.
 """
 from __future__ import annotations
@@ -32,7 +29,7 @@ from specdec_af.models.chunk_index import BOUNDARY_OUT_SLOT, SLOT_OFFSETS, TERMI
 from specdec_af.models.chunk_norm import ChunkNorm
 
 
-Mode = Literal["option_1", "option_4", "option_d"]
+Mode = Literal["option_4", "option_d"]
 
 
 def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.0) -> Tensor:
@@ -43,14 +40,13 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.0) -> Tensor:
         free_bits: per-dim KL floor in nats (Kingma+ 2016, IAF paper). When >0,
             each latent dim's batch-mean KL is clamped from below to
             ``free_bits``; the optimizer sees no gradient on dims already at the
-            floor, preventing posterior collapse on that dim. Default 0.0 =
-            disabled (matches the rev-2 behavior).
+            floor, preventing posterior collapse on that dim. 0.0 = disabled.
 
     The result is in **per-element** units (mean over batch and latent dim) so
     it's directly comparable to the per-element recon losses in this module.
-    For ``d_latent=64``, the floor in those units is exactly ``free_bits`` —
-    e.g. ``free_bits=0.1`` floors the reported ``kl_loss`` at 0.1 even if every
-    dim has fully collapsed.
+    The floor in those units is exactly ``free_bits`` (for any ``d_latent``):
+    ``free_bits=0.1`` floors the reported ``kl_loss`` at 0.1 even if every dim
+    has fully collapsed.
     """
     # per-dim per-item KL: [B, d_latent]
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
@@ -84,13 +80,8 @@ def chunk_recon_loss(
         chunk_raw: ``[B, d_chunk]`` raw target (unnormalized).
         block_ids: ``[B]`` long.
         chunk_norm: fitted :class:`ChunkNorm`.
-        mode: one of {"option_1", "option_4", "option_d"}.
+        mode: ``"option_4"`` or ``"option_d"``.
     """
-    if mode == "option_1":
-        target = chunk_norm.forward_per_item(chunk_raw, block_ids)
-        mask = chunk_norm.mask_per_item(block_ids)
-        return _masked_mse((recon - target).pow(2), mask)
-
     if mode == "option_4":
         recon_raw = chunk_norm.invert_per_item(recon, block_ids)
         mask = chunk_norm.mask_per_item(block_ids)
@@ -114,11 +105,11 @@ def unnormalized_terminal_mse(
 ) -> Tensor:
     """Unnormalized MSE on the **terminal slot** (j=11, slot ``boundary_out``).
 
-    This is the cross-mode comparison metric for the Phase-5 sweep. Computed
+    This is the cross-mode comparison metric. Computed
     in raw-activation² units regardless of mode. Items not belonging to block
     ``TERMINAL_BLOCK`` are excluded; returns NaN if no terminal items in batch.
     """
-    if mode == "option_1" or mode == "option_4":
+    if mode == "option_4":
         recon_raw = chunk_norm.invert_per_item(recon, block_ids)
     elif mode == "option_d":
         recon_raw = recon

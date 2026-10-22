@@ -1,19 +1,18 @@
-"""Phase 6 training loop for the unconditional trace VAE.
+"""Training loop for the trace VAE (``E(chunk) → z``, ``D(z, block_id) → chunk``).
 
-rev-7: trains ``TraceVAE`` alone (``E(chunk) → z``, ``D(z, block_id) → chunk``)
-on cache v2 (memory-mapped shards via :class:`TraceShardDataset`; fixed val
-set = first ``val_positions`` positions of the pinned val shards). The
-PrefixEncoder / ConditionAssembler of rev-4..rev-6 are gone;
-context conditioning moves to the latent generator (next plan). ``ChunkNorm``
-stats are loaded frozen.
+Each item is one (position, block) chunk; the block index is the decoder's
+only condition. Train data comes from cache v2 (memory-mapped shards via
+:class:`TraceShardDataset`) or the live stream (below); the fixed val set is
+the first ``val_positions`` positions of the pinned val shards. ``ChunkNorm``
+stats are loaded frozen from the cache and stored in every checkpoint.
 
 Loss = ``recon_loss(mode) + beta_t * KL`` where ``beta_t`` linearly anneals
 0 → ``beta_max`` over ``beta_anneal_steps`` optimizer steps (rev-7) or, if
 that is unset, ``beta_anneal_epochs`` epochs.
 
-Mode-dispatch follows Phase 5: ``vae.decoder_output_space`` and the loss
-assembly are pinned by ``--mode``. The mode is also stamped into every
-checkpoint so eval (Phase 7) can route correctly without re-specifying.
+``--mode`` pins ``vae.decoder_output_space`` and the loss assembly (option_d
+= raw output, the default; option_4 = normalized output). The mode is stamped
+into every checkpoint so eval routes correctly without re-specifying.
 
 rev-7 ``--resume PATH|auto``: periodic and final checkpoints carry the full
 training state (optimizer, LR scheduler, epoch + position in epoch, RNG
@@ -316,26 +315,23 @@ class TrainConfig:
     seed: int
     num_workers: int
     pin_memory: bool
-    # rev-4 additions
     grad_clip_norm: float | None  # None or 0 = disabled
-    # rev-5 additions
     lr_warmup_steps: int  # 0 = no warmup
-    # rev-7 additions
     beta_anneal_steps: int | None = None  # overrides beta_anneal_epochs when set
     max_wall_seconds: float | None = None  # checkpoint + exit cleanly past this budget
     wandb_project: str | None = None       # None = no wandb logging
     wandb_entity: str | None = None
     shard_buffer: int = 4                  # shards shuffled together per buffer
     val_positions: int | None = 5000       # fixed val set size (positions; × 12 items)
-    # rev-8 additions
+    d_latent: int = 128                    # per-block latent width (vae.d_latent)
     data_source: str = "cache"             # "cache" (cache-v2 shards) | "stream" (live GPT-2, data/stream.py)
     stream: dict | None = None             # stream config (see stream.STREAM_DEFAULTS); data_source="stream"
 
 
-def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device) -> TraceVAE:
-    """Build the trainable VAE. rev-7: no GPT-2 load (PrefixEncoder removed)."""
+def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device, d_latent: int = 128) -> TraceVAE:
+    """Build the trainable VAE; option_d scales the output layer to the raw target σ."""
     decoder_output_space = "raw" if mode == "option_d" else "normalized"
-    vae = TraceVAE(decoder_output_space=decoder_output_space).to(device)
+    vae = TraceVAE(decoder_output_space=decoder_output_space, d_latent=d_latent).to(device)
     if mode == "option_d":
         vae.init_decoder_out_for_raw_space(chunk_norm.std.to(device))
     return vae
@@ -418,14 +414,14 @@ def train(
     chunk_norm.load_state_dict(torch.load(stats_path, map_location="cpu", weights_only=True))
     chunk_norm = chunk_norm.to(device)
 
-    vae = build_vae(cfg.mode, chunk_norm, device=device)
+    vae = build_vae(cfg.mode, chunk_norm, device=device, d_latent=cfg.d_latent)
     trainable = [p for p in vae.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable)
     n_dec = sum(p.numel() for p in vae.decoder.parameters())
     print(f"trainable params: {n_params:,}  (decoder {n_dec:,})", flush=True)
 
     opt = torch.optim.Adam(trainable, lr=cfg.lr)
-    # rev-5: optional linear warmup. step 0 gets 1/warmup_steps; step >= warmup_steps gets 1.0.
+    # Optional linear warmup: step 0 gets 1/warmup_steps; step >= warmup_steps gets 1.0.
     if cfg.lr_warmup_steps > 0:
         warmup_steps = cfg.lr_warmup_steps
         scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -660,7 +656,7 @@ def _wandb_project(cli: str | None, raw_cfg: dict) -> str | None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--config", type=str, default="configs/default.yaml")
-    p.add_argument("--mode", choices=["option_4", "option_d", "option_1"], default=None,
+    p.add_argument("--mode", choices=["option_4", "option_d"], default=None,
                    help="default: from vae.decoder_output_space in config (raw → option_d, "
                         "normalized → option_4)")
     p.add_argument("--run-name", type=str, default="rev7_default")
@@ -744,6 +740,7 @@ def main() -> int:
         shard_buffer=args.shard_buffer or raw_cfg["cache_v2"].get("shard_buffer", 4),
         val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
         data_source=args.data_source or tr.get("data_source", "cache"),
+        d_latent=int(raw_cfg["vae"].get("d_latent", 128)),
     )
     if tcfg.data_source == "stream":
         from specdec_af.data.stream import stream_cfg_from

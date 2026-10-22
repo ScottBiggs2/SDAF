@@ -1,4 +1,7 @@
-"""Phase 5 overfit-a-batch sweep — option-4-vs-D sanity on one fixed batch.
+"""Overfit-a-batch sanity sweep: option 4 vs option D on one fixed batch.
+
+Used for the rev-7 normalization decision; kept as a quick capacity / plumbing
+check for new VAE variants (e.g. a larger ``d_latent``).
 
 For each mode in ``--modes``, train a freshly-initialized ``TraceVAE`` on
 **one fixed batch** for ``--n-steps`` steps. At each log step, run two eval
@@ -6,9 +9,8 @@ passes (deterministic, no_grad) under:
 
   - ``qz``       — decoder gets the item's own encoder ``mu``
   - ``wrong_z``  — decoder gets ``mu`` rolled by 1 across the batch (a
-                   different item's z, own block_id). rev-7: replaces the
-                   rev-4..6 ``wrong_prefix`` ablation; with the unconditional
-                   VAE, z must carry the content, so this should collapse.
+                   different item's z, own block_id). z must carry the
+                   content, so this should collapse.
 
 For each eval pass we log:
 
@@ -38,8 +40,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import time
 from pathlib import Path
 from typing import Iterable
@@ -47,7 +47,6 @@ from typing import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import yaml
 from torch import Tensor
 
 from specdec_af.models.chunk_index import (
@@ -58,6 +57,7 @@ from specdec_af.models.chunk_index import (
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import save_vae_checkpoint
+from specdec_af.utils.config import expand_env, load_config, pick_device
 from specdec_af.training.losses import (
     Mode,
     chunk_recon_loss,
@@ -69,33 +69,6 @@ from specdec_af.training.losses import (
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-
-_ENV_RE = re.compile(r"\$\{([^}]+)\}")
-
-
-def expand_env(s: str) -> str:
-    def _sub(m: re.Match) -> str:
-        var = m.group(1)
-        if ":-" in var:
-            name, default = var.split(":-", 1)
-            return os.environ.get(name, default)
-        return os.environ.get(var, "")
-    return _ENV_RE.sub(_sub, s)
-
-
-def pick_device(prefer_cuda: bool = True, force_cpu: bool = False) -> torch.device:
-    if force_cpu:
-        return torch.device("cpu")
-    if prefer_cuda and torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_config(config_path: Path | str) -> dict:
-    return yaml.safe_load(Path(config_path).read_text())
-
 
 def load_lm_head_only(
     model_name: str = "openai-community/gpt2",
@@ -229,7 +202,7 @@ def compute_downstream_metrics(
     s, e = SLOT_OFFSETS["boundary_out"]
 
     # Recover raw-space recon according to mode.
-    if mode in ("option_1", "option_4"):
+    if mode == "option_4":
         recon_raw_terminal = chunk_norm.invert_per_item(
             recon[is_terminal], block_ids[is_terminal]
         )[:, s:e]
@@ -285,18 +258,10 @@ def eval_pass(
 # Sweep core
 # ----------------------------------------------------------------------
 
-def _build_models(
-    mode: Mode,
-    chunk_norm: ChunkNorm,
-    *,
-    device: torch.device | str,
-) -> TraceVAE:
-    """Build the trainable VAE (rev-7: no PrefixEncoder / GPT-2 load)."""
-    decoder_output_space = "raw" if mode == "option_d" else "normalized"
-    vae = TraceVAE(decoder_output_space=decoder_output_space).to(device)
-    if mode == "option_d":
-        vae.init_decoder_out_for_raw_space(chunk_norm.std.to(device))
-    return vae
+def _build_models(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device | str) -> TraceVAE:
+    """Build the trainable VAE (same construction as training)."""
+    from specdec_af.training.train import build_vae
+    return build_vae(mode, chunk_norm, device=torch.device(device))
 
 
 def run_one_mode(
@@ -452,7 +417,7 @@ def write_summary(results: dict, output_dir: Path) -> Path:
 
     nan = float("nan")
     lines = [
-        "Phase 5 overfit-a-batch sweep — summary (rev-7: unconditional VAE)",
+        "Overfit-a-batch sweep — summary",
         "",
         f"n_chunks={results['n_chunks']}  device={results['device']}",
         f"wrong_z_ablation={results['eval_wrong_z']}  lm_head_metrics={results['lm_head_available']}",
@@ -502,7 +467,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--config", type=str, default="configs/default.yaml")
     p.add_argument("--modes", nargs="+", default=["option_4", "option_d"],
-                   choices=["option_1", "option_4", "option_d"])
+                   choices=["option_4", "option_d"])
     p.add_argument("--n-chunks", type=int, default=256)
     p.add_argument("--n-steps", type=int, default=1000)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -539,7 +504,7 @@ def main() -> int:
         stats_path = cache_dir / "chunk_norm_stats.pt"
         if not stats_path.exists():
             raise FileNotFoundError(
-                f"missing {stats_path}; run `python -m specdec_af.data.collect --stage calibration` first"
+                f"missing {stats_path}; run `python -m specdec_af.data.collect_v2 --stage calibration` first"
             )
         chunk_norm = ChunkNorm(n_layers=N_LAYERS_DEFAULT)
         chunk_norm.load_state_dict(torch.load(stats_path, map_location="cpu", weights_only=True))

@@ -1,253 +1,93 @@
-# SpecDec-AF GPT-2 — Slurm workflow
+# SpecDec-AF GPT-2 — Slurm workflow (Explorer)
 
 Canonical layout (override per-run with env vars):
 
-| What                | Path                                     | Override          |
-|---------------------|------------------------------------------|-------------------|
-| Repo (code only)    | `/home/biggs.s/sdaf-gpt2/SDAF/`          | `REPO_DIR`        |
-| Conda env           | `/scratch/biggs.s/conda_envs/specdec_af` | `ENV_PREFIX`      |
-| Artifacts root      | `/scratch/biggs.s/`                      | `SCRATCH`         |
-| HF dataset cache    | `${SCRATCH}/huggingface_cache/`          | set in scripts    |
-| Phase-3 cache out   | `${SCRATCH}/specdec_af/cache/`           | `configs/default.yaml` |
-| Slurm logs          | `${REPO_DIR}/logs/`                      | per-script SBATCH |
+| What                | Path                                                   | Override          |
+|---------------------|--------------------------------------------------------|-------------------|
+| Repo (code only)    | `/home/biggs.s/sdaf-gpt2/SDAF/`                        | `REPO_DIR`        |
+| Conda env           | `/scratch/biggs.s/conda_envs/specdec_af`               | `ENV_PREFIX`      |
+| Artifacts root      | `/scratch/biggs.s/`                                    | `SCRATCH`         |
+| HF cache            | `${SCRATCH}/huggingface_cache/`                        | set in scripts    |
+| Cache v2            | `${SCRATCH}/specdec_af/cache_v2/`                      | `paths.cache_dir` |
+| Pre-tokenized corpus| `${SCRATCH}/specdec_af/tokens/wikitext103_train.npy`   | `stream.tokens_path` |
+| Runs / eval / latents | `${SCRATCH}/specdec_af/outputs/{train,eval,latents,substitution}/` | `paths.output_dir` |
+| Slurm logs          | `${REPO_DIR}/logs/`                                    | per-script SBATCH |
 
 `/home` has a quota; nothing large should land there. Each sbatch script sets
-`HF_HOME`, `HF_DATASETS_CACHE`, and `TRANSFORMERS_CACHE` to `${SCRATCH}/huggingface_cache/...`
-before any HF call.
+`HF_HOME`, `HF_DATASETS_CACHE` and `TRANSFORMERS_CACHE` under `${SCRATCH}` before any HF call.
+GPU scripts pin `gpu:v100-sxm2:1`; for an A100 pass `sbatch --gres=gpu:a100:1 ...`.
 
 ---
 
 ## One-time
 
 ```bash
-# Login node OR an interactive job. The script self-detects and warns if
-# you're on a login node where conda may be killed by Explorer policy.
-bash scripts/setup_env.sh
+bash scripts/setup_env.sh           # conda env at ENV_PREFIX, torch (CUDA 12.1), pip install -e .
+sbatch scripts/slurm/submit_smoke.sh  # GPU sanity: one GPT-2 forward
 ```
 
-Creates the conda env at `/scratch/biggs.s/conda_envs/specdec_af`, installs
-torch (CUDA 12.1), and pip-installs the project editable.
+## Data
 
-## Phase 0 — sanity
+The VAE trains on traces generated on the fly by a frozen GPT-2 (`specdec_af/data/stream.py`,
+default `training.data_source: stream`). The disk cache v2 is still needed for the **fixed val
+set** (shards 0095–0100) and the frozen **ChunkNorm statistics** (`chunk_norm_stats.pt`), and it
+reproduces rev-7 with `DATA_SOURCE=cache`.
 
 ```bash
-sbatch scripts/slurm/submit_smoke.sh
+# Pre-tokenize WikiText-103 once (CPU, ~4 min, ~470 MB); sequence i == cache-v2 sequence i.
+sbatch scripts/slurm/submit_pretokenize.sh
+# Gates: tokens / live traces / μ vs cache + export, and producer throughput.
+sbatch scripts/slurm/submit_stream_check.sh
 ```
 
-One forward pass on a GPU node. ~5 min. Output: `logs/smoke-<jobid>.out` with
-`cuda=True`, GPT-2 hidden-state shape, non-NaN loss.
-
-## Phase 3 — cache collection
-
-### Step 1 — HPC smoke (recommended before the full run)
+Cache v2 (already collected; only needed again for a new cache):
 
 ```bash
-sbatch scripts/slurm/submit_collect_smoke.sh
+sbatch scripts/slurm/submit_collect_v2_smoke.sh   # separate dir, 1 shard + gates
+sbatch scripts/slurm/submit_collect_v2.sh         # Stage A; see the script header for Stage B
 ```
 
-Runs the whole Phase 3 pipeline at tiny scale:
-
-  - 32-window calibration → `chunk_norm_stats.pt`
-  - 100-window main collection → 1 shard
-  - round-trip gate on shard 0
-  - scale-variation diagnostic → `scale_variation.json`
-
-~20 min wall (most of it the first-time WikiText download + tokenization
-overhead). Validates the cluster env, the HF download path, and every code
-path in the production job at low cost.
-
-Expected stdout near the end:
-
-```
-== Round-trip sanity ==
-  round-trip: top-1 match rate = 1.000 on 4 window(s)
-  round-trip: max abs logit diff = ...
-== Scale variation diagnostic ==
-  saved: /scratch/biggs.s/specdec_af/cache/scale_variation.json
-DONE
-collect-smoke: DONE
-```
-
-### Step 2 — full production cache
+## Train the VAE
 
 ```bash
-sbatch scripts/slurm/submit_collect.sh
+# Streamed (default). Step budget + β ramp in steps are required; resume is exact.
+RUN_NAME=rev8_vae N_STEPS=200000 BETA_ANNEAL_STEPS=80000 sbatch scripts/slurm/submit_train.sh
+# Chain a continuation in case the first job hits the wall budget (RESUME=auto is the default):
+RUN_NAME=rev8_vae N_STEPS=200000 BETA_ANNEAL_STEPS=80000 \
+  sbatch --dependency=afterany:<jobid> scripts/slurm/submit_train.sh
+# rev-7 reproduction from the cache:
+DATA_SOURCE=cache RUN_NAME=... N_STEPS=200000 BETA_ANNEAL_STEPS=80000 sbatch scripts/slurm/submit_train.sh
 ```
 
-Phase 3 deliverable: 10000-window WikiText-103 cache. ~1–1.5 h wall on v100-pcie.
+Outputs under `${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/`: `training_log.csv`,
+`training_summary.json`, `checkpoints/{step_NNNNNN,final}.pt` (resumable). W&B logging is on by
+default (`WANDB_PROJECT=none` disables). See the header of `submit_train.sh` for every env var.
 
-Artifacts under `${SCRATCH}/specdec_af/cache/`:
-
-| File                              | Size  | Used by      |
-|-----------------------------------|-------|--------------|
-| `chunk_norm_stats.pt`             | ~1 MB | Phase 5/6    |
-| `windows/shard_0000.pt` … `shard_0009.pt` | ~230 MB each | Phase 6 training |
-| `scale_variation.json`            | ~2 KB | Phase 5 decision |
-
-Total cache footprint: ~2.3 GB.
-
-### Step 3 — re-running a single stage
+## Evaluate and export
 
 ```bash
-# CLI directly (inside an interactive Slurm session or via sbatch wrapper):
-python -m specdec_af.data.collect --config configs/default.yaml --stage calibration
-python -m specdec_af.data.collect --config configs/default.yaml --stage main
-python -m specdec_af.data.collect --config configs/default.yaml --stage roundtrip
-python -m specdec_af.data.collect --config configs/default.yaml --stage scale-variation
+RUN_NAME=rev7B_optd sbatch scripts/slurm/submit_evaluate.sh        # fidelity suite on 5k val positions
+RUN_NAME=rev7B_optd sbatch scripts/slurm/submit_export_latents.sh  # μ/logvar for every cache position
+RUN_NAME=rev7B_optd sbatch scripts/slurm/submit_substitution.sh    # in-model block substitution
 ```
 
-Each stage is idempotent. Calibration and main use independent corpus
-iterators so they can be re-run in any order.
-
----
-
-## Phase 5: overfit-a-batch sweep (resolves option 4 vs option D)
-
-Prereq: Phase 3 outputs (`chunk_norm_stats.pt` + at least `shard_0000.pt`).
+## Other tools
 
 ```bash
-sbatch scripts/slurm/submit_overfit_sweep.sh
+sbatch scripts/slurm/submit_overfit_sweep.sh                      # one-batch capacity / plumbing check
+RUN_NAMES="rev7A_opt4 rev7A_optd" sbatch scripts/slurm/submit_wandb_backfill.sh   # CSV logs → W&B
 ```
-
-Trains a freshly-initialized `CondVAE` + `PrefixEncoder` + `ConditionAssembler`
-under each mode on **one fixed batch of 256 chunks for 1000 steps**, with
-`β=0` (pure overfit). Per the plan's decision register, the winner is
-whichever mode reaches the lowest **unnormalized terminal-slot ((j=11, slot 7)) MSE**.
-Tie-break favors `option_d`.
-
-~30 min wall on v100-pcie.
-
-### Artifacts produced
-
-Under `${SCRATCH}/specdec_af/outputs/overfit_sweep/`:
-
-| File                              | Content                                                                   |
-|-----------------------------------|---------------------------------------------------------------------------|
-| `results.json`                    | Per-mode list of step-by-step `{train_recon, kl, eval_correct, eval_wrong}` |
-| `summary.txt`                     | Final-step table (corr/wrong terminal MSE, top-1, CE) + winner + notes      |
-| `checkpoints/option_4.pt`         | Full VAE+PE+CA+CN state, loadable via `load_vae_checkpoint`                 |
-| `checkpoints/option_d.pt`         | Same, option_d trained model                                                |
-
-### How to read the result
-
-The summary now reports both **correct-prefix** and **wrong-prefix** versions of three metrics:
-
-| Column     | What it measures                                                            |
-|------------|----------------------------------------------------------------------------|
-| `tmse_corr` / `tmse_wrong`     | Unnormalized terminal-slot MSE (in raw activation² units). Cross-mode comparable. |
-| `top1_corr` / `top1_wrong`     | Fraction of terminal items where `argmax(lm_head(student_recon))` matches the teacher's argmax. |
-| `ce_corr`  / `ce_wrong`        | `CE(teacher_argmax, student_logits)` over terminal items — soft agreement metric. |
-
-Two questions to answer from this table:
-
-**A. Option 4 vs option D (the original sweep question).**
-Lowest `tmse_corr` wins. Tie-break favors `option_d` if within ~10%. **Caveat:** option_4's training loss surface *is* `tmse_unnorm` in raw space, so option_4 will mechanically win on this metric — the comparison isn't probing the architectural-anchoring concern that motivated option_d (which is OOD-only and not testable in overfit). See `project_normalization_decision` memory.
-
-**B. Is the prefix conditioning actually being used? (the ablation question).**
-Compare `top1_corr` vs `top1_wrong` (or `ce_corr` vs `ce_wrong`) within each mode:
-
-  - **`top1_corr ≈ top1_wrong`** → decoder isn't using prefix conditioning meaningfully. Recon is happening via `z`+`block_id`+`i` only. Probably means the PrefixEncoder is undersized or the prefix path is weak. Consider deepening PrefixEncoder or richer prefix features.
-  - **`top1_corr >> top1_wrong`** → conditioning is informative. Good. Proceed.
-  - **`ce_wrong >> ce_corr`** → same signal, softer. CE picks up smaller margins than top-1 (which is hard).
-
-The point of running this BEFORE Phase 6 is to catch a broken prefix path on cheap compute (~30 min) rather than after a full training run.
-
-### Local smoke (no HPC, ~30s)
-
-```bash
-python -m specdec_af.training.overfit_sweep --smoke --n-chunks 64 --n-steps 100 --cpu
-```
-
-Synthetic data, ad-hoc per-block ChunkNorm fitted to the batch itself. Validates
-the sweep harness end-to-end. Don't read decision signal from the synthetic
-result — only from the HPC run against the real cache.
-
----
-
-## Phase 6: full training run
-
-Prereq: Phase 3 outputs (`chunk_norm_stats.pt` + at least 2 shards).
-
-### Default training (option_4, per Phase-5 leading result)
-
-```bash
-sbatch scripts/slurm/submit_train.sh
-```
-
-Trains the chunked CVAE on the full cache. With 10k windows × J=12 = 120k items
-at batch 256, ~470 steps/epoch. The default config runs 100 epochs (~47k steps),
-with β linearly annealed 0 → 1.0 over 30 epochs. Wall: 6–12 h on v100-pcie
-(GPU compute is light; bottleneck is data loading + val passes).
-
-### Mode override (run option_d for direct comparison)
-
-```bash
-MODE=option_d sbatch scripts/slurm/submit_train.sh
-# or, explicit run name:
-MODE=option_d RUN_NAME=k1_optiond_v2 sbatch scripts/slurm/submit_train.sh
-```
-
-Running both modes back-to-back gives the only **fair** comparison of option_4
-vs option_d — at training scale, on held-out data. The Phase-5 overfit sweep
-favored option_4 mechanically (the loss surface is aligned with the metric), but
-that test couldn't probe the architectural-commitment concern. Phase 6 + 7
-together can.
-
-### Artifacts produced
-
-Under `${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/`:
-
-| File                              | Content                                              |
-|-----------------------------------|------------------------------------------------------|
-| `training_log.csv`                | Per-log-step row w/ recon, KL, β, per-block diagnostics |
-| `training_summary.json`           | Final-state summary + `val_history`                  |
-| `checkpoints/final.pt`            | Loadable via `load_vae_checkpoint`                   |
-| `checkpoints/step_NNNNN.pt`       | Periodic snapshots (every 5k steps by default)       |
-
-### Reading the training log
-
-The CSV has these per-block columns (12 each): `recon_b0..b11`, `kl_b0..b11`,
-`mu_norm_b0..b11`, `logvar_mean_b0..b11`. Signals to watch:
-
-- **Per-block recon non-degenerate** — no block stays at the step-0 loss; no block reconstructs near-zero (i.e. memorizing the marginal mean). Failure here means Phase 7 check 3 will fail.
-- **`mu_norm` per block** — large block-to-block gaps mean the encoder is using `block_embed` to specialize latents per block, which breaks CFM-stackability (Phase 2 concern). Should be roughly uniform across blocks.
-- **`logvar_mean` close to 0 across all blocks** indicates healthy KL — posterior is not collapsing to the prior (degenerate AE mode) and not blowing up (unused latent).
-
-### Local smoke (no HPC, ~2 min on CPU)
-
-```bash
-python -m specdec_af.training.train \
-  --config configs/default.yaml \
-  --mode option_4 --run-name smoke \
-  --n-steps 100 --batch-size 32 --num-workers 0 --cpu
-```
-
-Needs a Phase-3 cache (real or smoke-generated). Validates the full training
-loop, CSV logging, and checkpointing. Not a meaningful decision signal — just
-a "does it run" check.
-
----
 
 ## Hugging Face token
 
-**Not required.** WikiText-103 raw is public. The first job that touches it
-will trigger a ~250 MB download into `${SCRATCH}/huggingface_cache/datasets/`;
-subsequent jobs reuse the cache.
-
-If you want to use a gated corpus later, `huggingface-cli login` once (the
-token lands in `~/.cache/huggingface/token` on `/home`, which is fine — it's
-~50 bytes).
+**Not required.** WikiText-103 raw is public. The first job that touches it downloads
+~250 MB into `${SCRATCH}/huggingface_cache/datasets/`; later jobs reuse it.
 
 ## Disk hygiene
 
 ```bash
-# Total Phase-3 artifact footprint
-du -sh /scratch/biggs.s/specdec_af/cache/
-
-# Verify repo stays clean (must return nothing > 10 MB)
-find /home/biggs.s/sdaf-gpt2/SDAF -size +10M
-
-# HF cache footprint
+du -sh /scratch/biggs.s/specdec_af/*          # cache_v2 is ~112 GiB; /scratch is purge-prone
+find /home/biggs.s/sdaf-gpt2/SDAF -size +10M  # repo must stay small
 du -sh /scratch/biggs.s/huggingface_cache/
 ```
 
@@ -257,22 +97,9 @@ du -sh /scratch/biggs.s/huggingface_cache/
 |-------------------------------------------|---------------------------------------------------------------------------|
 | `ModuleNotFoundError: specdec_af`         | env not activated, or `pip install -e .` wasn't re-run after a `git pull` |
 | `OSError: ... has no permissions ...`     | `HF_HOME` pointing at `/home` (quota). Re-export to `/scratch` and retry. |
-| `RuntimeError: cache round-trip failed`   | shard write corrupted, or `chunk_index.SLOT_OFFSETS` drifted from Phase 1 hook widths |
-| job killed at `~01:30:00`                 | hit `--time` cap; bump in sbatch header                                   |
-| job killed early on login node            | you ran the python CLI directly on a login node — use sbatch or `srun --pty` |
-
-## rev-8 — streaming producer-consumer (`specdec_af/data/stream.py`)
-
-Training traces are generated on the fly by a frozen GPT-2 on the training GPU
-instead of read from cache v2; val + ChunkNorm stats still come from the cache.
-
-```bash
-sbatch scripts/slurm/submit_pretokenize.sh            # once: WikiText-103 → stream.tokens_path (CPU, ≈ 470 MB)
-sbatch scripts/slurm/submit_stream_check.sh           # verify vs cache shards + throughput bench
-# VAE on the stream (step budget required; resume is exact):
-RUN_NAME=rev8_vae_stream N_STEPS=200000 BETA_ANNEAL_STEPS=80000 sbatch scripts/slurm/submit_train.sh
-# rev-7 reproduction from the cache:
-DATA_SOURCE=cache RUN_NAME=... sbatch scripts/slurm/submit_train.sh
-# A100 instead of V100:
-sbatch --gres=gpu:a100:1 scripts/slurm/submit_train.sh
-```
+| `stream.tokens_path is not set` / missing | run `submit_pretokenize.sh` first                                         |
+| `data_source='stream' has no epochs`      | set `N_STEPS` and `BETA_ANNEAL_STEPS`                                     |
+| `resume data_source mismatch`             | resuming a stream run with `DATA_SOURCE=cache` (or vice versa)            |
+| round-trip gate fails                     | shard write corrupted, or `chunk_index.SLOT_OFFSETS` drifted from the hook widths |
+| job killed at the `--time` cap            | expected for long runs: chain with `--dependency=afterany` (`RESUME=auto`) |
+| job killed early on a login node          | ran the python CLI on a login node — use sbatch or `srun --pty`           |
