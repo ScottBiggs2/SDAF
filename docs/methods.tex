@@ -1,0 +1,578 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[round,authoryear]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\setlist{itemsep=2pt,topsep=4pt}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\LN}{\mathrm{LN}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\MASK}{\texttt{[MASK]}}
+\newcommand{\planned}{\textsuperscript{\textcolor{gray}{\,[planned]}}}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+
+\title{Generative Models of Transformer Activation Traces:\\Methods for a Trace VAE and a Prompt-Conditioned Latent Diffusion Model}
+\author{SpecDec-AF (GPT-2), rev-7 / rev-8}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We treat the activation trace of a frozen language model at one token position as a structured object to be modelled
+generatively, in the same way that weight-space generative models treat network parameters. The trace collects every
+weight--data product the model computes at that position, arranged as one fixed-schema chunk per transformer block. The
+method has two stages, following latent diffusion. First, a single variational autoencoder, shared across blocks and
+conditioned only on the block index, compresses each chunk to a 128-dimensional latent. Second, a diffusion transformer
+over the twelve block latents of a position generates the trace conditioned on the prompt. The conditional
+$p(\text{trace}\mid\text{full prefix})$ is a point mass, so we condition on a \emph{masked, left-truncated} prefix, using
+the masking scheme of masked diffusion language models. This gives a family of non-degenerate conditionals, whose fully
+masked member is the unconditional activation prior. It also makes ablation by marginalization available without
+resampling the input. Training data is generated on the fly by the frozen teacher, with exactly reproducible resume.
+We specify both stages, the data pipeline and the evaluation protocol. We report results for the VAE (\texttt{rev7B\_optd})
+and the data pipeline. The latent diffusion model is specified here, but not yet trained; components marked
+\planned{} have not been run.
+\end{abstract}
+
+\section{Overview and framing}
+\label{sec:overview}
+
+Our object of study is the \emph{trace} $\tau(p)$ of GPT-2 small \citep{radford2019gpt2} at token position $p$: the outputs of
+every linear map and normalization in every block at that position, packed into twelve chunks of a fixed schema
+(Section~\ref{sec:traces}). This follows the weight-space generative modelling line of work
+\citep{soro2025d2nwg,dwf2026}. There, a network's parameters are cut into chunks with a shared schema, each chunk is
+compressed by one autoencoder shared across chunks and conditioned on a chunk index, and a generative model is fitted
+in the latent space. We apply the same template to activations. A trace is a weight--data product: the weights are fixed
+and the data varies. The generator therefore models the distribution that the frozen network's computation induces on
+its own intermediate state. Next-token prediction is a consequence of reconstructing the trace faithfully, since the last
+chunk contains the input to the unembedding. It is not the training target.
+
+The method factorizes as in latent diffusion \citep{rombach2022ldm}:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Trace VAE} (Section~\ref{sec:vae}): an unconditional per-block compressor
+    $E: C_l \mapsto z_l \in \R^{128}$ and decoder $D:(z_l, l)\mapsto \hat C_l$, shared across the twelve blocks.
+  \item \textbf{Latent generator} (Section~\ref{sec:ldm}): a diffusion transformer over $Z = (z_0,\dots,z_{11}) \in \R^{12\times128}$,
+    conditioned on the prompt.
+\end{enumerate}
+All conditioning on context belongs to the generator. The VAE never sees the prompt, so whatever context structure the
+latent carries must come from the chunk itself. A data pipeline that generates traces on the fly
+(Section~\ref{sec:stream}) feeds both stages.
+
+\section{Traces}
+\label{sec:traces}
+
+\paragraph{Teacher.} GPT-2 small (12 blocks, $d_{\text{model}} = 768$), frozen, in evaluation mode, fp32. For a token
+sequence $x_{1:L}$, the residual stream at position $p$ is $r_0(p) = W_E x_p + W_P p$ and
+\begin{equation}
+  a_l = \mathrm{Attn}_l\big(\LN_{1,l}(r_l)\big),\qquad
+  m_l = \mathrm{MLP}_l\big(\LN_{2,l}(r_l + a_l)\big),\qquad
+  r_{l+1} = r_l + a_l + m_l,
+\end{equation}
+for $l = 0,\dots,11$. The logits are $W_U\,\LN_f(r_{12})$. Attention is causal, so $\tau(p)$ is a deterministic function of
+$x_{1:p}$.
+
+\paragraph{Chunk schema.} The chunk of block $l$ at position $p$ is $C_l(p) \in \R^{9984}$, the concatenation of eight
+slots (Table~\ref{tab:schema}). The two boundary slots carry the embedding at $l = 0$ and the final-norm output at
+$l = 11$, and are zero for other blocks. Every block therefore has the same schema, and the block index is the only thing
+that distinguishes one chunk from another. The unembedding input is slot~7 of $C_{11}$, so the decoded trace yields
+next-token logits directly.
+
+\begin{table}[h]
+  \centering\small
+  \begin{tabular}{@{}rlrl@{}}
+    \toprule
+    Slot & Module output & Width & Content \\
+    \midrule
+    0 & \texttt{transformer.drop} & 768 & $r_0$ at $l=0$; zeros otherwise \\
+    1 & \texttt{h[l].ln\_1} & 768 & $\LN_{1,l}(r_l)$ \\
+    2 & \texttt{h[l].attn.c\_attn} & 2304 & $Q, K, V$ \\
+    3 & \texttt{h[l].attn.c\_proj} & 768 & $a_l$ \\
+    4 & \texttt{h[l].ln\_2} & 768 & $\LN_{2,l}(r_l + a_l)$ \\
+    5 & \texttt{h[l].mlp.c\_fc} & 3072 & MLP pre-activation \\
+    6 & \texttt{h[l].mlp.c\_proj} & 768 & $m_l$ \\
+    7 & \texttt{transformer.ln\_f} & 768 & $\LN_f(r_{12})$ at $l=11$; zeros otherwise \\
+    \midrule
+    & & 9984 & \\
+    \bottomrule
+  \end{tabular}
+  \caption{Chunk schema (one chunk per block, twelve per position).}
+  \label{tab:schema}
+\end{table}
+
+\paragraph{Internal consistency.} A trace is heavily redundant under the frozen weights. With HF \texttt{Conv1D}
+convention $y = xW + b$, slots 2, 5 and 6 are affine (or GELU-then-affine) functions of slots 1, 4 and 5 of the same block:
+\begin{equation}
+  \text{c\_attn}_l = \text{ln\_1}_l W^{\text{attn}}_l + b^{\text{attn}}_l,\quad
+  \text{c\_fc}_l = \text{ln\_2}_l W^{\text{fc}}_l + b^{\text{fc}}_l,\quad
+  m_l = \mathrm{gelu}(\text{c\_fc}_l) W^{\text{proj}}_l + b^{\text{proj}}_l .
+  \label{eq:intra}
+\end{equation}
+Rebuilding the residual stream from slots 0, 3 and 6 gives cross-block identities:
+$\text{ln\_1}_l = \LN_{1,l}(r_l)$, $\text{ln\_2}_l = \LN_{2,l}(r_l + a_l)$ and $\text{ln\_f} = \LN_f(r_{12})$.
+The attention output $a_l$ is the one slot that cannot be checked from one position, because it mixes in other positions'
+keys and values. We use the relative violation $\lVert \text{lhs} - \text{rhs}\rVert / \lVert\text{rhs}\rVert$ as a
+reference-free measure of how close a generated trace is to a trace the teacher could have computed. On real traces the
+violation sits at the fp16 storage floor ($\approx 2.6\times10^{-4}$ cross-block).
+
+\paragraph{Positions and corpus.} Sequences are non-overlapping packed 256-token windows of WikiText-103 train
+\citep{merity2016wikitext}, tokenized without special tokens, with document boundaries ignored. From each sequence we draw
+16 positions uniformly without replacement from $[32, 255]$, so every target has at least 32 tokens of context. Draws are
+a pure function of (seed, global sequence index, stream), so any position can be regenerated. Val is a fixed set of 360
+sequences (global indices 5890--6249); every val metric below uses the same first 5{,}000 val positions.
+
+\section{Trace VAE}
+\label{sec:vae}
+
+\subsection{Model}
+
+\paragraph{Normalization.} Chunk elements vary in scale by orders of magnitude, across slots and across depth. We fit a
+fixed per-block, per-element affine normalization $N_l(C) = (C - \bar C_l)/\sigma_l$ once, with a streaming
+Welford pass over 16k calibration positions. These are drawn from the training position distribution with a separate
+random stream. $\sigma_l$ is clamped at $10^{-6}$, and a mask $M_l$ removes the zero-padded boundary slots from every loss
+term. The statistics are frozen and stored in every checkpoint.
+
+\paragraph{Encoder and decoder.} One encoder and one decoder are shared across the twelve blocks. The encoder is
+block-agnostic and unconditioned. It maps $N_l(C)$ through three Linear--LayerNorm--GELU layers ($9984 \to 2048 \to 1024
+\to 512$) to a diagonal Gaussian posterior $q(z\mid C) = \N(\mu_E, \mathrm{diag}\,e^{\lambda_E})$, $z\in\R^{128}$. The
+decoder is conditioned only on the block index: it maps $[z;\, e_l]$, with a learned 64-dimensional block embedding $e_l$,
+through the mirrored tower ($192 \to 512 \to 1024 \to 2048$) and a linear head to $\R^{9984}$. The model has no context,
+position or prompt input. A trace's latent is the stack of its twelve block latents, $Z \in \R^{12\times128}$ (1{,}536
+numbers per position).
+
+\paragraph{Output space.} The decoder emits \emph{raw} activations. The loss is a $\sigma$-weighted squared error in raw
+space, which equals the MSE in normalized space up to the mask:
+\begin{equation}
+  \mathcal{L}_{\text{rec}} = \frac{\sum_j M_{l,j}\,\sigma_{l,j}^{-2}\,\big(\hat C_{l,j} - C_{l,j}\big)^2}{\sum_j M_{l,j}} .
+\end{equation}
+Decoded traces can then be fed to the teacher or the unembedding with no inverse transform. We compared this against
+decoding in normalized space with a raw-space MSE, under a pre-registered rule (teacher top-1 after 60k steps). The raw
+output won, 0.483 vs 0.411. The final linear layer is initialized with each output row scaled by the
+block-averaged $\sigma$, so that outputs start at the target scale.
+
+\paragraph{Objective.} We use the standard ELBO with a linearly annealed KL weight \citep{kingma2014vae,bowman2016generating}
+and free bits \citep{kingma2016iaf}:
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_{\text{rec}}\big(D(z, l), C\big) + \beta_s \cdot \frac{1}{128}\sum_{k=1}^{128}
+  \max\!\Big(\phi,\ \E_{\text{batch}}\,\KL\big(q(z_k\mid C)\,\Vert\,\N(0,1)\big)\Big),
+  \qquad z \sim q(z\mid C),
+\end{equation}
+with $\beta_s = \beta_{\max}\min(1, s/S_\beta)$, $\beta_{\max} = 0.01$ and $\phi = 0.1$ nats. Each training item is one
+(position, block) pair, and a batch mixes blocks.
+
+\begin{table}[h]
+  \centering\small
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Parameter & Value (\texttt{rev7B\_optd}) \\
+    \midrule
+    Data & 500{,}768 positions (31.3k sequences $\times$ 16), i.e.\ 6.0M (position, block) items \\
+    Optimizer & Adam, lr $5\times10^{-4}$, 500-step linear warmup, grad-norm clip 1.0 \\
+    Batch / steps & 256 items, 200k steps (about 8.5 epochs) \\
+    KL & $\beta_{\max} = 0.01$, linear ramp over $S_\beta = 80$k steps, free bits 0.1 nats/dim \\
+    Latent & $d_{\text{latent}} = 128$ per block ($12\times128$ per position) \\
+    \bottomrule
+  \end{tabular}
+  \caption{VAE training configuration.}
+  \label{tab:vae-config}
+\end{table}
+
+\subsection{Evaluation}
+\label{sec:vae-eval}
+
+All metrics use the 5{,}000 fixed val positions. Latent conditions:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{qz\_mean} and \texttt{qz\_sample}: decode $\mu_E$ or a posterior sample;
+  \item \texttt{prior}: decode $z\sim\N(0,I)$;
+  \item \texttt{wrong\_z}: decode a different position's latent.
+\end{itemize}
+The last two are chance-level controls.
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Downstream fidelity.} Let $\hat P = \mathrm{softmax}(W_U \hat C_{11}^{(7)})$ be the decoded terminal slot read
+    out by the unembedding, and $P$ the teacher distribution from the real trace. We report top-1 agreement, top-5 overlap and
+    $\KL(P\,\Vert\,\hat P)$.
+  \item \textbf{Reconstruction.} Per-(block, slot) cosine and normalized MSE.
+  \item \textbf{Consistency.} Median intra- and cross-block violations of Eq.~\eqref{eq:intra} and the cross-block identities,
+    against the fp16 floor of real traces.
+  \item \textbf{Latent usage.} Active units (posterior-mean variance $> 10^{-2}$), KL per block, and the participation ratio of the
+    aggregate posterior.
+  \item \textbf{In-model substitution.} A block's reconstruction is put back into the teacher's forward pass at a single
+    position, and the divergence is measured at every downstream block and at the logits. This is specified separately in
+    \texttt{docs/block\_substitution\_method.tex}.
+\end{itemize}
+
+\subsection{Results}
+
+\begin{table}[h]
+  \centering\small
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    Metric (val, 5{,}000 positions) & \texttt{rev7B\_optd} \\
+    \midrule
+    Teacher top-1, \texttt{qz\_mean} (train) & 0.518 (0.525) \\
+    Teacher top-1, \texttt{qz\_sample} & 0.517 \\
+    Top-5 overlap & 0.566 \\
+    $\KL(P\,\Vert\,\hat P)$ (nats) & 0.89 \\
+    Top-1, \texttt{prior} / \texttt{wrong\_z} & 0.032 / 0.044 \\
+    Recon cosine, mean / worst block & 0.938 / 0.880 \\
+    Cross-block consistency, median (fp16 floor $2.6\times10^{-4}$) & 0.350 \\
+    Intra-block consistency, median (fp16 floor $2.8\times10^{-4}$) & 0.165 \\
+    Active units & 1{,}536 / 1{,}536 \\
+    KL, summed over blocks (nats) & 2{,}810 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Trace VAE results. The train/val top-1 gap is 0.6\,pp.}
+  \label{tab:vae-results}
+\end{table}
+
+These results bear directly on the second stage:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{No low-dimensional shortcut.} All 128 dimensions are active in all twelve blocks. The participation ratio of
+    the aggregate posterior is 72--100 per block, and 99--106 dimensions are needed for 90\% of the variance.
+  \item \textbf{The aggregate posterior is far from the prior.} Decoding $\N(0,I)$ gives chance-level top-1, so the
+    distribution has to be learned by a generator; this is the regime latent diffusion is designed for.
+  \item \textbf{Weak linear coupling across depth.} The mean absolute correlation of $\mu$ between blocks is 0.052, so the
+    joint structure of the twelve latents is largely non-Gaussian. This motivates a joint model over depth rather than
+    independent per-block models.
+  \item \textbf{The VAE sets the ceiling.} \texttt{qz\_mean} defines the \emph{VAE floor} that the generator's decoded
+    samples can at best reach. Generator metrics are reported as a gap to this floor.
+\end{itemize}
+
+\section{Streaming data pipeline}
+\label{sec:stream}
+
+A static activation cache costs about 240\,MB per thousand positions (112\,GiB for 500k), so the 10--100M positions we
+expect the generator to need are out of reach on shared scratch storage. Instead, the frozen teacher runs on the training
+GPU, and training batches are produced on the fly. The only stored artefacts are a pre-tokenized corpus (118M tokens, 470\,MB),
+the normalization statistics, and the fixed val shards.
+
+\paragraph{Plan.} Sequence $i$ of the corpus is the slice $[256i, 256(i+1))$ of the pre-tokenized array. This is exactly
+the packing used to build the cache, so sequence ids agree across the two paths, and any sequence can be read directly.
+Let $\mathcal{I}$ be the train ids, which is every sequence outside the val range (460{,}265 of 460{,}625).
+\begin{itemize}[leftmargin=1.5em]
+  \item Pass $k$ is the permutation $\pi_k = \mathrm{perm}(\text{seed}, k)$ of $\mathcal{I}$, cut into chunks of $K = 256$
+    sequences. Global chunk $c$ is chunk $c \bmod \lfloor|\mathcal{I}|/K\rfloor$ of pass $k = \lfloor c / \lfloor|\mathcal{I}|/K\rfloor\rfloor$.
+  \item Positions are re-drawn in every pass with random stream $2 + k$, so a pass yields about 7.4M new (sequence, position)
+    pairs.
+  \item The teacher runs on chunk $c$ in micro-batches, and its traces are rounded to fp16. This matches the distribution of
+    the cache the VAE was trained on.
+  \item The resulting $4{,}096$ positions are permuted with $\mathrm{perm}(\text{seed}, c)$ and served in fixed-size batches.
+    For the VAE, items are $(\text{position}, \text{block})$ pairs, so one chunk gives 192 batches of 256.
+  \item The latent-generator consumer encodes four chunks with the frozen VAE and shuffles the 16{,}384 resulting
+    positions. Each item is $(\mu_E, \lambda_E)$ for all twelve blocks, plus the source sequence, the position and the
+    sequence id.
+\end{itemize}
+
+\begin{proposition}[Exact resume]
+Batch $j$ of buffer $c$ is a deterministic function of (corpus, seed, $c$, $j$) and the frozen teacher (and frozen VAE).
+Checkpointing the cursor $(c, j)$, alongside the optimizer and RNG state, is therefore enough to resume training exactly, with no buffer state and no data-loader
+state.
+\end{proposition}
+\noindent The only caveat is GPU kernel nondeterminism in the teacher forward, which changes about 0.8\% of trace elements
+by one fp16 rounding step. On CPU, resume is bit-exact, and this is tested: 10 steps, resume, then 10 more steps gives
+the same weights as 20 uninterrupted steps, across buffer boundaries.
+
+\paragraph{Validation.} On one V100, against cache shards 0000 (Stage A), 0100 (val) and 0504 (Stage B):
+\begin{itemize}[leftmargin=1.5em]
+  \item Tokens are identical.
+  \item Live traces are 99.2\% bit-identical to the cache, and otherwise within one fp16 step (relative error $2\times10^{-5}$).
+  \item Encoder means agree to $3\times10^{-4}$.
+\end{itemize}
+A 5k-step VAE run reached val reconstruction loss 0.5816 on the stream and 0.5841 on the cache, with the two curves
+agreeing at every 1k-step checkpoint. The stream run took 113\,s against 482\,s for the disk-bound cache run. The
+teacher produces about 1{,}760 positions/s, and the latent consumer about 2{,}100 positions/s.
+
+\section{Prompt-conditioned latent diffusion}
+\label{sec:ldm}
+
+\subsection{Target distribution}
+
+\paragraph{Degeneracy.} Since $\tau(T)$ is a deterministic function of $x_{1:T}$, the natural conditional
+$p(Z_T\mid x_{1:T})$ is a point mass. Fitted with a diffusion model, it reduces to regression with extra steps: the
+diversity, the prior and the score geometry that make diffusion models useful objects of study all vanish.
+
+\paragraph{Masked, left-truncated conditioning.} We instead condition on a partially observed window. Fix a window
+length $W = 128$ ending at $T$. A visibility mask $S \subseteq \{T-W+1, \dots, T\}$ selects which window tokens are shown;
+all other window slots, and all tokens before the window, are hidden. The target is
+\begin{equation}
+  p(Z_T \mid x_S, T) = \int \delta\big(Z_T - E(\tau(x_{1:T}))\big)\; p\big(x_{\bar S}\mid x_S, T\big)\, dx_{\bar S},
+  \label{eq:target}
+\end{equation}
+where $\bar S$ is every unobserved position $\le T$ and $E$ applies the encoder blockwise. This is the push-forward of
+the corpus's conditional distribution over the unseen context, through the teacher and the encoder. It is non-degenerate
+whenever $\bar S$ is nonempty. Masks are drawn independently of the data. A conditional model trained on pairs
+$(Z_T, x_S)$, where $x_S$ is the true sequence with the mask applied, therefore targets Eq.~\eqref{eq:target} exactly.
+Hidden slots are filled with the \MASK{} token of a masked diffusion language model \citep{sahoo2024mdlm}, which is
+pretrained to read partially observed text. Masking is the mechanism; the encoder supplies the vocabulary for it.
+
+\paragraph{Mask distribution.} For each training example:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{null} ($p = 0.10$): every slot is masked, including $x_T$. This gives the unconditional activation prior
+    $p(Z)$ and the null branch for classifier-free guidance \citep{ho2022cfg}.
+  \item \textbf{suffix} ($p = 0.75$): the last $m+1$ tokens $x_{T-m:T}$ are visible. The context length $m$ is drawn from
+    $\{0\}$ w.p.\ 0.15, $\mathcal{U}\{1..8\}$ w.p.\ 0.45, $\mathcal{U}\{9..64\}$ w.p.\ 0.25 and $W-1$ w.p.\ 0.15.
+  \item \textbf{holes} ($p = 0.15$): every window slot except $x_T$ is masked independently at rate $r\sim\mathcal{U}(0, 0.5)$.
+\end{itemize}
+A single model thus spans a family of conditionals: the unconditional prior ($S = \varnothing$), the current token alone
+($m = 0$), and conditionals that approach full-context regression ($m = W-1$). No token after $T$ ever enters the window.
+
+\paragraph{Attribution by marginalization.} Eq.~\eqref{eq:target} gives token-level attribution a direct
+interventional reading. For $i \in S$, comparing $p(Z_T\mid x_S)$ with $p(Z_T\mid x_{S\setminus\{i\}})$ is a
+\emph{resample ablation}: $x_i$ is replaced by draws from its corpus conditional given the remaining visible tokens, and
+the induced trace distribution is compared with the original. Both distributions are sampled from the same generator by
+changing only the mask. There is no substitute text to sample, and no off-distribution zero or mean ablation.
+
+\subsection{Architecture}
+
+The denoiser follows the cross-attention diffusion transformer used in text-to-image models
+\citep{peebles2023dit,chen2024pixart}. These are the systems on which most mechanistic studies of diffusion models have
+been done (sparse autoencoders, cross-attention attribution, parameter localization). We keep our design close to them so
+that those tools transfer.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Tokens.} One token per block: $z_{t,l} \in \R^{128}$ is projected to width $d$, and a learned depth embedding
+    is added. Self-attention runs over the 12 depth tokens of one position.
+  \item \textbf{Prompt encoder.} The token embedding and \emph{first} DDiT block of the pretrained MDLM-OWT model
+    \citep{sahoo2024mdlm}, frozen. This model uses the GPT-2 tokenizer plus a \MASK{} token, and is trained on OpenWebText.
+    The encoder is deliberately shallow:
+    \begin{itemize}[leftmargin=1.2em]
+      \item It contextualizes the visible tokens and understands \MASK{}.
+      \item It is far too shallow to reproduce the teacher's computation, so it cannot hand the generator the trace.
+      \item MDLM uses rotary position embeddings only, so the absolute position $T$ is supplied separately.
+      \item Its blocks are modulated by a time embedding; with time conditioning off this is the constant
+        $\mathrm{silu}(\text{sigma\_map}(0))$.
+    \end{itemize}
+  \item \textbf{Block.} Each layer applies, in order:
+    \begin{enumerate}[leftmargin=1.2em]
+      \item adaLN-Zero self-attention;
+      \item unmodulated cross-attention, with queries from the depth tokens and keys/values from a linear projection of the
+        encoder states;
+      \item an adaLN-Zero SwiGLU MLP \citep{shazeer2020glu}.
+    \end{enumerate}
+    The modulation vector is per token,
+    \[ c_{\text{tok}} = \text{emb}(t_{\text{tok}}) + \text{emb}(T) + \text{proj}(\text{mean-pooled encoder states}). \]
+    The final layer is zero-initialized, so the model outputs $v \equiv 0$ at initialization.
+  \item \textbf{No joint attention.} Joint text--latent attention, as in MM-DiT \citep{esser2024sd3}, ranks higher in image
+    generation. We exclude it on purpose. It would let the representation of the prompt be rewritten by the activations we
+    want to interpret, so that any attribution from prompt to trace would partly measure the generator's own mixing.
+    Keeping the encoder frozen and the conditioning one-way (cross-attention) keeps the prompt side fixed.
+  \item \textbf{Size.} DiT-S to start: depth 12, $d = 384$, 6 heads.
+\end{itemize}
+
+\subsection{Objective and sampling}
+
+We train with rectified flow \citep{liu2023rectified,lipman2023flow}:
+\begin{equation}
+  z_t = (1-t)\,z_0 + t\,\varepsilon,\quad \varepsilon\sim\N(0, I),\qquad
+  \mathcal{L} = \E\,\big\lVert v_\theta(z_t, t, x_S, T) - (\varepsilon - z_0)\big\rVert^2,
+\end{equation}
+with $t = \mathrm{sigmoid}(u)$, $u\sim\N(0,1)$ (logit-normal; \citealp{esser2024sd3}). The clean-latent estimate
+$\hat z_0 = z_t - t\,v_\theta$ is the single accessor all analysis code uses. With probability 0.1 per batch, each of the
+12 depth tokens gets an independent $t$, following Diffusion Forcing \citep{chen2024diffusionforcing}. This keeps
+depth-wise partial-noise queries in distribution at almost no cost. Sampling is an Euler ODE from $t=1$ to 0 (50 steps by
+default), with classifier-free guidance $v = v_{\text{null}} + w(v_{\text{cond}} - v_{\text{null}})$. We keep an EMA
+(0.9999) and evaluate on it.
+
+\paragraph{Latent coordinates.} The generator works directly in the encoder's coordinates. There is no per-dimension
+standardization and no global scale factor. No transform is coordinate-free, and the VAE's KL term already fixes the
+scale of its own coordinates near the prior. Any whitening would instead encode the statistics of one particular
+training sample. Jacobian-based analyses therefore include the encoder's affine terms; we accept that.
+
+\paragraph{Training targets.} The target $z_0$ can be the encoder mean $\mu_E$ or a posterior sample. The posterior is
+narrow ($\sigma \approx 0.16$ against a per-dimension aggregate standard deviation of about 0.9), so the two differ mainly
+in augmentation. Streaming removes most of the need for augmentation. The choice is settled by a pre-registered
+head-to-head on the stream: two 50k-step runs, scored on decoded teacher KL averaged over $m$. A run that diverges or fails
+the memorization screen is disqualified, and ties within 3\% go to $\mu_E$.\planned
+
+\subsection{Evaluation protocol\planned}
+
+All conditions are evaluated on the 5{,}000 VAE val positions with fixed seeds: null; suffix with
+$m\in\{0, 2, 8, 32, W-1\}$; holes with $r = 0.1$; and shuffled (another position's full window).
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Per-sample fidelity.} We decode each sample and score it against the real trace with the VAE metrics of
+    Section~\ref{sec:vae-eval}. The headline number is the \emph{gap to the VAE floor} $D(\mu_E(\tau))$, reported by $m$. It
+    should shrink as $m$ grows, and stay large under \texttt{shuffled}.
+  \item \textbf{Consistency} of decoded samples, against both the VAE floor and the fp16 floor.
+  \item \textbf{Distributional fit.} We compute Fréchet distance \citep{heusel2017fid} and kernel inception distance
+    \citep{binkowski2018kid} between samples and real latents, pooled over conditions, in three spaces:
+    \begin{itemize}[leftmargin=1.2em]
+      \item per-block latents (128-d);
+      \item the joint latent (1{,}536-d);
+      \item the decoded residual (768-d).
+    \end{itemize}
+    Every condition has the same marginal target, the val distribution, so the pooled statistic is a calibration test even
+    though each condition has only one sample per position. KID is primary: FD is biased at $N = 5$k in 1{,}536 dimensions.
+    Both are bracketed by a data floor (val against train) and a prior ceiling ($\N(0,I)$ against val).
+  \item \textbf{Diversity against $m$.} Pairwise distance and decoded top-1 agreement among $K = 4$ samples per condition.
+    These should fall monotonically as $m$ increases.
+  \item \textbf{Guidance sweep.} CFG with $w \in\{1, 1.5, 2, 3\}$.
+  \item \textbf{Memorization screen.} For each null sample, the distance to its nearest neighbour in a 100k training
+    subsample, compared with the same statistic for val latents.
+  \item \textbf{Generalization by disjoint halves} \citep{kadkhodaie2024generalization}. Two models are trained identically on
+    the even and odd sequence ids. Both are sampled from shared noise under identical conditions, and we report the paired
+    distance relative to the distance between independent samples:
+    \begin{itemize}[leftmargin=1.2em]
+      \item if the paired samples nearly coincide, the models have learned the density;
+      \item if they diverge, each model has memorized its half.
+    \end{itemize}
+    This test is what licenses later geometric analyses of the learned score.
+\end{itemize}
+
+\paragraph{Baselines.\planned}
+\begin{itemize}[leftmargin=1.5em]
+  \item An unconditional deep SwiGLU MLP over the flattened 1{,}536-d latent, in the style of generative activation priors
+    \citep{luo2026glp}, evaluated under null only.
+  \item The main architecture with diagonal self-attention. The twelve blocks are then independent given the condition,
+    which isolates what joint modelling across depth buys, particularly for cross-block consistency.
+\end{itemize}
+
+\section{Status and limitations}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Built and evaluated:}
+    \begin{itemize}[leftmargin=1.2em]
+      \item the chunk schema and the cache;
+      \item the trace VAE (Section~\ref{sec:vae});
+      \item block substitution;
+      \item the streaming pipeline with both consumers (Section~\ref{sec:stream}).
+    \end{itemize}
+  \item \textbf{Specified, not yet run:} the whole of Section~\ref{sec:ldm}, including the MDLM block-0 encoder, which needs
+    a functional check against the full MDLM before anything is built on it.
+  \item \textbf{The VAE floor bounds every generator result.} About half of val positions decode to a different argmax than
+    the teacher's (top-1 0.518). Decoded traces violate the teacher's cross-block identities about 1{,}350$\times$ above the
+    fp16 floor. A larger latent ($d = 256$) is the next lever. It will be chosen with a rule that accounts for how
+    diffusable the latent is, not only for reconstruction \citep{yao2025vavae,skorokhodov2025diffusability}.
+  \item \textbf{Single-position traces.} A trace omits the keys and values of other positions, which is why $a_l$ cannot be
+    checked for consistency. Multi-position generation (grids over tokens $\times$ depth) is future work.
+  \item \textbf{One corpus, one teacher.} WikiText-103 and GPT-2 small. The stream makes changing the corpus cheap; scaling
+    the teacher is not.
+\end{itemize}
+
+\begin{thebibliography}{99}\small
+\setlength{\itemsep}{1pt}
+
+\bibitem[Bi{\'n}kowski et~al.(2018)]{binkowski2018kid}
+M.~Bi{\'n}kowski, D.~J. Sutherland, M.~Arbel, A.~Gretton.
+\newblock Demystifying {MMD} {GAN}s.
+\newblock \emph{ICLR}, 2018. arXiv:1801.01401.
+
+\bibitem[Bowman et~al.(2016)]{bowman2016generating}
+S.~R. Bowman, L.~Vilnis, O.~Vinyals, A.~M. Dai, R.~Jozefowicz, S.~Bengio.
+\newblock Generating sentences from a continuous space.
+\newblock \emph{CoNLL}, 2016. arXiv:1511.06349.
+
+\bibitem[Chen et~al.(2024a)]{chen2024diffusionforcing}
+B.~Chen, D.~Mart{\'i} Mons{\'o}, Y.~Du, M.~Simchowitz, R.~Tedrake, V.~Sitzmann.
+\newblock Diffusion forcing: Next-token prediction meets full-sequence diffusion.
+\newblock \emph{NeurIPS}, 2024. arXiv:2407.01392.
+
+\bibitem[Chen et~al.(2024b)]{chen2024pixart}
+J.~Chen et~al.
+\newblock {PixArt}-$\alpha$: Fast training of diffusion transformer for photorealistic text-to-image synthesis.
+\newblock \emph{ICLR}, 2024. arXiv:2310.00426.
+
+\bibitem[DWF(2026)]{dwf2026}
+S.~Biggs et~al.
+\newblock {DWF}: chunked-{VAE} latent flow matching over network weights.
+\newblock arXiv:2601.05052, 2026. \textcolor{red}{[title/authors to confirm]}
+
+\bibitem[Esser et~al.(2024)]{esser2024sd3}
+P.~Esser et~al.
+\newblock Scaling rectified flow transformers for high-resolution image synthesis.
+\newblock \emph{ICML}, 2024. arXiv:2403.03206.
+
+\bibitem[Heusel et~al.(2017)]{heusel2017fid}
+M.~Heusel, H.~Ramsauer, T.~Unterthiner, B.~Nessler, S.~Hochreiter.
+\newblock {GAN}s trained by a two time-scale update rule converge to a local {N}ash equilibrium.
+\newblock \emph{NeurIPS}, 2017. arXiv:1706.08500.
+
+\bibitem[Ho \& Salimans(2022)]{ho2022cfg}
+J.~Ho, T.~Salimans.
+\newblock Classifier-free diffusion guidance.
+\newblock arXiv:2207.12598, 2022.
+
+\bibitem[Kadkhodaie et~al.(2024)]{kadkhodaie2024generalization}
+Z.~Kadkhodaie, F.~Guth, E.~P. Simoncelli, S.~Mallat.
+\newblock Generalization in diffusion models arises from geometry-adaptive harmonic representations.
+\newblock \emph{ICLR}, 2024. arXiv:2310.02557.
+
+\bibitem[Kingma \& Welling(2014)]{kingma2014vae}
+D.~P. Kingma, M.~Welling.
+\newblock Auto-encoding variational {B}ayes.
+\newblock \emph{ICLR}, 2014. arXiv:1312.6114.
+
+\bibitem[Kingma et~al.(2016)]{kingma2016iaf}
+D.~P. Kingma, T.~Salimans, R.~Jozefowicz, X.~Chen, I.~Sutskever, M.~Welling.
+\newblock Improved variational inference with inverse autoregressive flow.
+\newblock \emph{NeurIPS}, 2016. arXiv:1606.04934.
+
+\bibitem[Lipman et~al.(2023)]{lipman2023flow}
+Y.~Lipman, R.~T.~Q. Chen, H.~Ben-Hamu, M.~Nickel, M.~Le.
+\newblock Flow matching for generative modeling.
+\newblock \emph{ICLR}, 2023. arXiv:2210.02747.
+
+\bibitem[Liu et~al.(2023)]{liu2023rectified}
+X.~Liu, C.~Gong, Q.~Liu.
+\newblock Flow straight and fast: Learning to generate and transfer data with rectified flow.
+\newblock \emph{ICLR}, 2023. arXiv:2209.03003.
+
+\bibitem[Luo et~al.(2026)]{luo2026glp}
+G.~Luo, J.~Feng, T.~Darrell, A.~Radford, J.~Steinhardt.
+\newblock Learning a generative meta-model of {LLM} activations.
+\newblock \emph{ICML}, 2026. arXiv:2602.06964.
+
+\bibitem[Merity et~al.(2017)]{merity2016wikitext}
+S.~Merity, C.~Xiong, J.~Bradbury, R.~Socher.
+\newblock Pointer sentinel mixture models.
+\newblock \emph{ICLR}, 2017. arXiv:1609.07843.
+
+\bibitem[Peebles \& Xie(2023)]{peebles2023dit}
+W.~Peebles, S.~Xie.
+\newblock Scalable diffusion models with transformers.
+\newblock \emph{ICCV}, 2023. arXiv:2212.09748.
+
+\bibitem[Radford et~al.(2019)]{radford2019gpt2}
+A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei, I.~Sutskever.
+\newblock Language models are unsupervised multitask learners.
+\newblock OpenAI technical report, 2019.
+
+\bibitem[Rombach et~al.(2022)]{rombach2022ldm}
+R.~Rombach, A.~Blattmann, D.~Lorenz, P.~Esser, B.~Ommer.
+\newblock High-resolution image synthesis with latent diffusion models.
+\newblock \emph{CVPR}, 2022. arXiv:2112.10752.
+
+\bibitem[Sahoo et~al.(2024)]{sahoo2024mdlm}
+S.~S. Sahoo et~al.
+\newblock Simple and effective masked diffusion language models.
+\newblock \emph{NeurIPS}, 2024. arXiv:2406.07524.
+
+\bibitem[Shazeer(2020)]{shazeer2020glu}
+N.~Shazeer.
+\newblock {GLU} variants improve transformer.
+\newblock arXiv:2002.05202, 2020.
+
+\bibitem[Skorokhodov et~al.(2025)]{skorokhodov2025diffusability}
+I.~Skorokhodov et~al.
+\newblock Improving the diffusability of autoencoders.
+\newblock \emph{ICML}, 2025. arXiv:2502.14831.
+
+\bibitem[Soro et~al.(2025)]{soro2025d2nwg}
+B.~Soro, B.~Andreis, H.~Lee, W.~Jeong, S.~Chong, F.~Hutter, S.~J. Hwang.
+\newblock Diffusion-based neural network weights generation.
+\newblock \emph{ICLR}, 2025. arXiv:2402.18153.
+
+\bibitem[Yao et~al.(2025)]{yao2025vavae}
+J.~Yao, B.~Yang, X.~Wang.
+\newblock Reconstruction vs.\ generation: Taming optimization dilemma with latent diffusion models.
+\newblock \emph{CVPR}, 2025. arXiv:2501.01423.
+
+\end{thebibliography}
+
+\end{document}
