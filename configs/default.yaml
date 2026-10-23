@@ -33,6 +33,53 @@ stream:                   # rev-8: producer-consumer (specdec_af/data/stream.py)
   seed: 1236              # plan / shuffle / position seed (cache v2 used 1234 Stage A, 1235 Stage B)
   latent_chunks_per_buffer: 4  # LDM consumer: 16,384 positions shuffled together
 
+ldm:                      # rev-8: prompt-conditioned latent diffusion (specdec_af/ldm; agent_plan_rev8.md)
+  latents_dir: "${SCRATCH:-./outputs}/specdec_af/outputs/latents/rev7B_optd"   # static export: fallback train + eval
+  vae_checkpoint: "${SCRATCH:-./outputs}/specdec_af/outputs/train/rev7B_optd/checkpoints/final.pt"
+  data_source: stream     # "stream" (live GPT-2 → frozen VAE, data/stream.py) | "static" (the export). Eval is always static val.
+  z_source: mu            # D14: "mu" | "sample" (μ + σ·ε, fresh per draw). Raw VAE coordinates, no transform (D13).
+  train_half: all         # D15: "all" | "A" (even global sequence id) | "B" (odd)
+  max_train_rows: null    # static only: first N train rows (overfit smoke)
+  val_positions: 5000     # = the VAE report's fixed val set (first 5k positions of the val shards)
+  condition:              # D1 / D11 / D12
+    W: 128                # window ending at T; slots before the sequence start are [MASK]
+    mask_id: 50257        # MDLM [MASK] (one past GPT-2's vocab)
+    p_null: 0.10          # all-[MASK] incl. x_T, and T dropped → unconditional E
+    p_suffix: 0.75        # visible = x_{T-m..T}
+    p_holes: 0.15         # full window, each slot except x_T masked i.i.d. at r ~ U(holes_rate)
+    m_mixture: [[0, 0, 0.15], [1, 8, 0.45], [9, 64, 0.25], [-1, -1, 0.15]]  # [lo, hi, weight]; -1 = W-1
+    holes_rate: [0.0, 0.5]
+  encoder:                # D4: MDLM-OWT vocab_embed + DDiT block 0, frozen
+    repo: kuleshov-group/mdlm-no_flashattn-fp32-owt
+    revision: 60054720485e8aa080d5d2f3eaebafe1b829afb9
+    init: pretrained      # "pretrained" | "random" (tests only)
+    trainable: false
+  dit:                    # D2 / D3 / D10: DiT-S, cross-attention to the prefix + adaLN-Zero
+    depth: 12
+    d_model: 384
+    n_heads: 6
+    mlp_hidden: null      # null = (8/3)·d_model rounded up to a multiple of 64 (SwiGLU)
+    self_attn_mask: full  # "full" | "diag" (blocks independent given the condition; Stage-7 baseline)
+  flow:                   # rectified flow, v-prediction
+    t_logit_mean: 0.0
+    t_logit_std: 1.0
+    p_token_t: 0.10       # fraction of batches with i.i.d. per-token t (Diffusion Forcing hedge)
+  training:
+    batch_size: 256
+    lr: 1.0e-4
+    weight_decay: 0.0
+    lr_warmup_steps: 1000
+    grad_clip_norm: 1.0
+    ema_decay: 0.9999
+    n_steps: 50000
+    val_every_steps: 2000
+    val_max_positions: 2048
+    checkpoint_every_steps: 5000
+    seed: 0
+  sampler:
+    steps: 50
+    cfg_w: 1.0
+
 corpus:
   name: "wikitext"
   config: "wikitext-103-raw-v1"
