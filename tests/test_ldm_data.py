@@ -15,7 +15,6 @@ import pytest
 import torch
 
 from specdec_af.data.dataset import PositionSet, list_shards, read_split
-from specdec_af.export_latents import export_latents
 from specdec_af.ldm.data import (
     HOLES,
     NULL,
@@ -37,10 +36,8 @@ W_FULL = 32   # = fixture seq_len, so W > T always (front-padded with [MASK])
 
 
 @pytest.fixture(scope="module")
-def table(trained_run, tmp_path_factory):
-    out = tmp_path_factory.mktemp("ldm_latents")
-    export_latents(trained_run["checkpoint"], trained_run["cache_dir"], out, device=torch.device("cpu"))
-    return LatentTable(out, trained_run["cache_dir"])
+def table(trained_run, ldm_latents):
+    return LatentTable(ldm_latents, trained_run["cache_dir"])
 
 
 def _sampler(W: int, **kw) -> ConditionSampler:

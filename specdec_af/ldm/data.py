@@ -266,9 +266,10 @@ def z_from(raw: dict, z_source: str, generator: torch.Generator) -> Tensor:
 
 
 def condition_batch(raw: dict, sampler: ConditionSampler, *, z_source: str, seed: int,
-                    epoch: int, batch_in_epoch: int, **fixed) -> dict:
-    """Raw batch → ``{z0, ids, visible, T, regime, m, ...provenance}``; a pure function of the cursor."""
-    g = batch_generator(seed, _TAG_CONDITION, epoch, batch_in_epoch)
+                    epoch: int, batch_in_epoch: int, tag: int = _TAG_CONDITION, **fixed) -> dict:
+    """Raw batch → ``{z0, ids, visible, T, regime, m, ...provenance}``; a pure function of the cursor
+    (``tag`` separates independent streams, e.g. the fixed val conditions)."""
+    g = batch_generator(seed, tag, epoch, batch_in_epoch)
     cond = sampler.sample(raw["seq_tokens"], raw["pos"], generator=g, **fixed)
     out = {"z0": z_from(raw, z_source, g), **cond, "seq_id": raw["seq_id"]}
     if "row" in raw:

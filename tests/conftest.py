@@ -83,3 +83,13 @@ def trained_run(v2_cache, tmp_path_factory):
     summary = train(v2_cache, odir, cfg, device=torch.device("cpu"))
     return {"cache_dir": v2_cache, "checkpoint": Path(summary["checkpoint_dir"]) / "final.pt",
             "output_dir": odir}
+
+
+@pytest.fixture(scope="session")
+def ldm_latents(trained_run, tmp_path_factory):
+    """rev-8: latent export of the mini cache with the 25-step VAE (LDM data / train tests)."""
+    from specdec_af.export_latents import export_latents
+
+    out = tmp_path_factory.mktemp("ldm_latents")
+    export_latents(trained_run["checkpoint"], trained_run["cache_dir"], out, device=torch.device("cpu"))
+    return out
