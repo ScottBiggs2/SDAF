@@ -154,14 +154,23 @@ def val_seq_ranges(cache_dir: Path | str, val_shards: int | None = None) -> list
 # ----------------------------------------------------------------------
 
 class SequencePlan:
-    """Deterministic chunking of the train sequence ids, pass after pass."""
+    """Deterministic chunking of the train sequence ids, pass after pass.
+
+    rev-8 ``include``: optional bool mask ``[n_seq]`` applied on top of
+    ``exclude`` (the LDM's disjoint-halves split, D15: even / odd ids).
+    """
 
     def __init__(self, n_seq: int, *, seqs_per_chunk: int, seed: int,
-                 exclude: Iterable[tuple[int, int]] = ()) -> None:
+                 exclude: Iterable[tuple[int, int]] = (), include: np.ndarray | None = None) -> None:
         keep = np.ones(int(n_seq), dtype=bool)
         self.exclude = [(int(lo), int(hi)) for lo, hi in exclude]
         for lo, hi in self.exclude:
             keep[lo:hi] = False
+        if include is not None:
+            include = np.asarray(include, dtype=bool)
+            if include.shape != keep.shape:
+                raise ValueError(f"include mask shape {include.shape} != ({int(n_seq)},)")
+            keep &= include
         self.train_ids = np.nonzero(keep)[0]
         self.seqs_per_chunk = int(seqs_per_chunk)
         self.seed = int(seed)
@@ -383,14 +392,15 @@ def load_frozen_gpt2(name: str, device):
 
 
 def build_producer(scfg: dict, cache_dir: Path | str, *, device, val_shards: int | None = None,
-                   gpt2=None) -> TraceProducer:
-    """Producer over ``scfg['tokens_path']`` excluding the cache's pinned val sequences."""
+                   gpt2=None, include: np.ndarray | None = None) -> TraceProducer:
+    """Producer over ``scfg['tokens_path']`` excluding the cache's pinned val sequences
+    (and, rev-8, restricted to ``include`` if given)."""
     scfg = {**STREAM_DEFAULTS, **scfg}
     if not scfg["tokens_path"]:
         raise ValueError("stream.tokens_path is not set (run `python -m specdec_af.data.stream pretokenize`)")
     seqs = TokenSequences(scfg["tokens_path"], scfg["seq_len"])
     plan = SequencePlan(len(seqs), seqs_per_chunk=scfg["seqs_per_chunk"], seed=scfg["seed"],
-                        exclude=val_seq_ranges(cache_dir, val_shards))
+                        exclude=val_seq_ranges(cache_dir, val_shards), include=include)
     model = gpt2 if gpt2 is not None else load_frozen_gpt2(scfg["model_name"], device)
     return TraceProducer(model, seqs, plan, n_pos=scfg["n_pos"], p_min=scfg["p_min"], seed=scfg["seed"],
                          micro_bs=scfg["micro_bs"], round_fp16=scfg["round_fp16"], device=device)

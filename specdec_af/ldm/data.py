@@ -277,6 +277,33 @@ def condition_batch(raw: dict, sampler: ConditionSampler, *, z_source: str, seed
     return out
 
 
+# ----------------------------------------------------------------------
+# Stream source
+# ----------------------------------------------------------------------
+
+def build_stream_batches(cfg, cache_dir: Path | str, *, device, gpt2=None):
+    """``(StreamingLatentBatches, producer)`` for an :class:`~specdec_af.ldm.train_ldm.LDMTrainConfig`:
+    live GPT-2 → frozen VAE (``cfg.vae_checkpoint``) on ``device``, val sequences excluded,
+    restricted to ``cfg.train_half``. ``cfg.stream`` = :func:`~specdec_af.data.stream.stream_cfg_from`."""
+    from specdec_af.data.stream import STREAM_DEFAULTS, StreamingLatentBatches, TokenSequences, build_producer
+    from specdec_af.training.checkpoint import load_vae_checkpoint
+
+    scfg = {**STREAM_DEFAULTS, **(cfg.stream or {})}
+    if not scfg["tokens_path"]:
+        raise ValueError("stream.tokens_path is not set")
+    if not cfg.vae_checkpoint:
+        raise ValueError("data_source='stream' needs vae_checkpoint (the frozen encoder)")
+    n_seq = len(TokenSequences(scfg["tokens_path"], scfg["seq_len"]))
+    include = None if cfg.train_half == "all" else half_mask(np.arange(n_seq), cfg.train_half)
+    producer = build_producer(scfg, cache_dir, device=device, gpt2=gpt2, include=include)
+    loaded = load_vae_checkpoint(cfg.vae_checkpoint, device=device)
+    src = StreamingLatentBatches(producer, loaded["vae"], loaded["chunk_norm"], batch_size=cfg.batch_size,
+                                 seed=int(scfg["seed"]), chunks_per_buffer=int(scfg["latent_chunks_per_buffer"]))
+    print(f"stream: {len(producer.plan.train_ids)} train sequences (half={cfg.train_half}, "
+          f"val excluded {producer.plan.exclude}), {producer.plan.chunks_per_pass} chunks/pass", flush=True)
+    return src, producer
+
+
 def describe_condition(ids: Tensor, visible: Tensor, tokenizer, *, mask: str = "[M]") -> str:
     """One window as text with [MASK] slots shown (for logs / Gate-1 examples)."""
     return "".join(tokenizer.decode([int(t)]) if v else mask for t, v in zip(ids.tolist(), visible.tolist()))

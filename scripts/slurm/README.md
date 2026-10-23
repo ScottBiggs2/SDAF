@@ -71,6 +71,28 @@ RUN_NAME=rev7B_optd sbatch scripts/slurm/submit_export_latents.sh  # μ/logvar f
 RUN_NAME=rev7B_optd sbatch scripts/slurm/submit_substitution.sh    # in-model block substitution
 ```
 
+## Latent diffusion (rev-8, `specdec_af/ldm/`)
+
+Plan: `agent_plan_rev8.md`; job log: `outputs/rev8_joblog.md`. After `git pull`, re-run
+`pip install -e .` once (new deps: `safetensors`, `huggingface_hub`). The MDLM-OWT checkpoint
+(~680 MB, pinned revision in `ldm.encoder.revision`) downloads into `HF_HOME` on first use.
+
+```bash
+# Gate 2: validate the pure-torch MDLM block (A100). One-time flash-attn env for the reference fixture:
+srun --partition=gpu --gres=gpu:a100:1 --time=01:00:00 --mem=32G --pty bash scripts/ldm/setup_flash_env.sh
+sbatch scripts/slurm/submit_mdlm_check.sh         # fixture dump + MLM check vs broken controls + pytest
+
+# Gate 4: overfit smoke (1,024 static rows, suffix m = W-1 only) + true-vs-shuffled eval
+RUN_NAME=rev8_overfit DATA_SOURCE=static MAX_TRAIN_ROWS=1024 CONDITION_PRESET=full \
+  N_STEPS=5000 EMA_DECAY=0.999 OVERFIT_EVAL=1 sbatch scripts/slurm/submit_train_ldm.sh
+
+# Stage 6+ (stream; chain continuations, RESUME=auto is the default)
+RUN_NAME=rev8_mu Z_SOURCE=mu N_STEPS=50000 sbatch scripts/slurm/submit_train_ldm.sh
+```
+
+Outputs under `${SCRATCH}/specdec_af/outputs/ldm/${RUN_NAME}/`: `training_log.csv`,
+`val_history.json`, `checkpoints/{step_NNNNNN,final}.pt` (`ldm_v1`, resumable), `overfit_eval.json`.
+
 ## Other tools
 
 ```bash
