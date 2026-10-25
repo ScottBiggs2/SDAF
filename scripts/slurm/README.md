@@ -91,7 +91,13 @@ RUN_NAME=rev8_mu Z_SOURCE=mu N_STEPS=50000 sbatch scripts/slurm/submit_train_ldm
 ```
 
 Outputs under `${SCRATCH}/specdec_af/outputs/ldm/${RUN_NAME}/`: `training_log.csv`,
-`val_history.json`, `checkpoints/{step_NNNNNN,final}.pt` (`ldm_v1`, resumable), `overfit_eval.json`.
+`val_history.json`, `checkpoints/{step_NNNNNN,final}.pt` (`ldm_v1`, resumable), `overfit_eval.json`,
+`eval_step<N>/` (Stage-5 suite: `metrics.json`, `summary.txt`, plots):
+
+```bash
+RUN_NAME=rev8_mu sbatch scripts/slurm/submit_eval_ldm.sh
+python -m specdec_af.ldm.evaluate_ldm compare $SCRATCH/specdec_af/outputs/ldm/{rev8_mu,rev8_sample}/eval_step50000
+```
 
 ## Other tools
 
