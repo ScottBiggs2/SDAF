@@ -9,6 +9,6 @@ Code: `specdec_af/ldm/`. Plan: `agent_plan_rev8.md`. One row per cluster job (id
 | 10-26 | 11389195 | Gate 2 prep: flash-attn env, retry (explicit env python, prebuilt wheel) | CANCELLED (A100 queue; moved to CPU) |
 | 10-26 | 11389196 | Gate 2: fixture dump (if flash env works) + functional MLM check + pytest (afterany 11389195) | CANCELLED (split below) |
 | 10-26 | 11389197 | Repair ~/.local py3.12 user site damaged by 11369750 (torch 2.10.0, triton 3.6.0, hub 0.35.3) | COMPLETED 4:43 — versions match the pre-11369750 uninstall log |
-| 10-26 | 11394079 | Gate 2 prep: flash-attn env build on CPU (short partition) | pending |
-| 10-26 | 11394080 | Gate 2: functional MLM check + pytest only, no fixture (V100) | pending |
+| 10-26 | 11394079 | Gate 2 prep: flash-attn env build on CPU (short partition) | COMPLETED 29:59 — torch 2.4.1+cu121, flash_attn 2.6.3 |
+| 10-26 | 11394080 | Gate 2: functional MLM check + pytest only, no fixture (V100) | COMPLETED 1:36 — ours top-1/NLL 0.576/2.33 (15%), 0.367/3.89 (50%); interleaved rotary 0.043/7.40, swapped adaLN 0.001/8.98; ratio 11.3×; pytest 6 passed 1 skipped (fixture) |
 | 10-26 | 11394087 | Gate 2: fixture dump + check + fixture diff (A100; afterok 11394079) | pending |
