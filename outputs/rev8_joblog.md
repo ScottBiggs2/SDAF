@@ -5,4 +5,7 @@ Code: `specdec_af/ldm/`. Plan: `agent_plan_rev8.md`. One row per cluster job (id
 | date | job | purpose | result |
 |---|---|---|---|
 | 10-25 | 11369750 | Gate 2 prep: build throwaway flash-attn env (`setup_flash_env.sh`, A100) | pending |
-| 10-25 | 11369752 | Gate 2: MDLM fixture dump + functional MLM check vs broken controls + pytest (A100; afterok 11369750) | pending |
+| 10-25 | 11369752 | Gate 2: MDLM fixture dump + functional MLM check vs broken controls + pytest (A100; afterok 11369750) | CANCELLED (dependency) |
+| 10-26 | 11389195 | Gate 2 prep: flash-attn env, retry (explicit env python, prebuilt wheel) | pending |
+| 10-26 | 11389196 | Gate 2: fixture dump (if flash env works) + functional MLM check + pytest (afterany 11389195) | pending |
+| 10-26 | 11389197 | Repair ~/.local py3.12 user site damaged by 11369750 (torch 2.10.0, triton 3.6.0, hub 0.35.3) | pending |
