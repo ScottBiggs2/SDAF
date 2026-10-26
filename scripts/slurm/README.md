@@ -79,7 +79,8 @@ Plan: `agent_plan_rev8.md`; job log: `outputs/rev8_joblog.md`. After `git pull`,
 
 ```bash
 # Gate 2: validate the pure-torch MDLM block (A100). One-time flash-attn env for the reference fixture:
-srun --partition=gpu --gres=gpu:a100:1 --time=01:00:00 --mem=32G --pty bash scripts/ldm/setup_flash_env.sh
+sbatch --job-name=mdlm-flash-env --partition=gpu --gres=gpu:a100:1 --mem=32G --time=01:30:00 \
+  --output=logs/flash-env-%j.out --error=logs/flash-env-%j.err --wrap "bash scripts/ldm/setup_flash_env.sh"
 sbatch scripts/slurm/submit_mdlm_check.sh         # fixture dump + MLM check vs broken controls + pytest
 
 # Gate 4: overfit smoke (1,024 static rows, suffix m = W-1 only) + true-vs-shuffled eval

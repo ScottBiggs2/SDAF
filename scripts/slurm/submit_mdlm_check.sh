@@ -42,6 +42,7 @@ export HF_HOME="${SCRATCH}/huggingface_cache"
 export HF_DATASETS_CACHE="${SCRATCH}/huggingface_cache/datasets"
 export TRANSFORMERS_CACHE="${SCRATCH}/huggingface_cache/transformers"
 export SCRATCH
+export PYTHONNOUSERSITE=1   # never pick up ~/.local packages
 
 if command -v module &>/dev/null; then
   module load anaconda3 || module load miniconda3 || true
@@ -55,18 +56,15 @@ echo "FLASH_ENV_PREFIX=$FLASH_ENV_PREFIX  N_SEQ=$N_SEQ  OUT_DIR=$OUT_DIR"
 echo "====================="
 
 FIXTURE_ARGS=()
-if [[ -d "$FLASH_ENV_PREFIX" ]]; then
-  # shellcheck disable=SC1091
-  source activate "$FLASH_ENV_PREFIX"
-  python scripts/ldm/dump_mdlm_fixture.py --out "$FIXTURE"
+if "$FLASH_ENV_PREFIX/bin/python" -c "import flash_attn" 2>/dev/null; then
+  "$FLASH_ENV_PREFIX/bin/python" scripts/ldm/dump_mdlm_fixture.py --out "$FIXTURE"
   FIXTURE_ARGS=(--fixture "$FIXTURE")
 else
-  echo "flash env not found at $FLASH_ENV_PREFIX — skipping the reference fixture"
+  echo "no working flash env at $FLASH_ENV_PREFIX — skipping the reference fixture"
 fi
 
-# shellcheck disable=SC1091
-source activate "$ENV_PREFIX"
-python scripts/ldm/mdlm_functional_check.py --n-seq "$N_SEQ" --out "$OUT_DIR/mdlm_check.json" ${FIXTURE_ARGS[@]+"${FIXTURE_ARGS[@]}"}
-python -m pytest -q tests/test_ldm_prefix.py -rs
+PY="$ENV_PREFIX/bin/python"
+"$PY" scripts/ldm/mdlm_functional_check.py --n-seq "$N_SEQ" --out "$OUT_DIR/mdlm_check.json" ${FIXTURE_ARGS[@]+"${FIXTURE_ARGS[@]}"}
+"$PY" -m pytest -q tests/test_ldm_prefix.py -rs
 
 echo "mdlm-check: DONE"
