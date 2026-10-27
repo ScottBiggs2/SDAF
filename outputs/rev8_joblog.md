@@ -12,3 +12,4 @@ Code: `specdec_af/ldm/`. Plan: `agent_plan_rev8.md`. One row per cluster job (id
 | 10-26 | 11394079 | Gate 2 prep: flash-attn env build on CPU (short partition) | COMPLETED 29:59 — torch 2.4.1+cu121, flash_attn 2.6.3 |
 | 10-26 | 11394080 | Gate 2: functional MLM check + pytest only, no fixture (V100) | COMPLETED 1:36 — ours top-1/NLL 0.576/2.33 (15%), 0.367/3.89 (50%); interleaved rotary 0.043/7.40, swapped adaLN 0.001/8.98; ratio 11.3×; pytest 6 passed 1 skipped (fixture) |
 | 10-26 | 11394087 | Gate 2: fixture dump + check + fixture diff (A100; afterok 11394079) | pending |
+| 10-26 | 11395669 | Gate 4: overfit smoke rev8_overfit (static 1,024 rows, preset full, 5k steps, EMA 0.999, OVERFIT_EVAL=1; V100) | pending |
