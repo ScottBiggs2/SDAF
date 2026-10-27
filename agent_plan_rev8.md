@@ -102,6 +102,18 @@ The original questions, for the record:
   end-to-end** than the disk cache (113 s vs 482 s). Synchronous refill is 55% of *compute-only* step time, so it fails the overhead gate as written,
   but it is not a bottleneck in practice. The LDM latent buffer builds 16k positions in 7.8 s. Levers if it ever binds are in `outputs/stream_joblog.md`.
 
+
+### 0.6 Build-time choices (D16, confirmed 10-26) and Gate 2 result
+- **Null drops T.** `null` masks the whole window *and* replaces the T embedding with a learned null row, so the null branch is the
+  unconditional E and CFG's null really is unconditional.
+- **Shuffled control criterion.** Rows in a small overfit set have similar μ, so absolute cosine against the own row is uninformative.
+  The overfit eval reports `frac_closer_to_source`: the share of samples drawn under row j's condition that land closer to μ_j than to
+  their own row's μ (pass ≥ 90%), plus `cos_baseline` for reference.
+- **Overfit-smoke EMA 0.999.** 0.9999 averages over ~10k steps, longer than the 5k-step smoke. Main runs keep 0.9999 (Q2).
+- **Gate 2 (10-26, job 11394080, V100, 256 WikiText val seqs × 256):** ours top-1 / NLL = 0.576 / 2.33 at 15% masking, 0.367 / 3.89 at
+  50%. Interleaved rotary: 0.043 / 7.40; swapped adaLN chunks: 0.001 / 8.98. Ours ≥ 11.3× the best broken control. Flash-attn fixture
+  diff (job 11394087, A100) pending; not blocking. Signed off by Scott 10-26.
+
 ---
 
 ## 1. Ground rules
@@ -378,7 +390,7 @@ For each flag, recommend (don't run) the next lever.
 
 - [ ] Branch `rev8-ldm` with per-stage commits, pushed.
 - [ ] `specdec_af/ldm/`: `data.py`, `prefix_block.py`, `dit.py`, `flow.py`, `train_ldm.py`, `evaluate_ldm.py` (+ tests).
-- [ ] MDLM block-0 encoder validated (Gate 2 numbers recorded).
+- [x] MDLM block-0 encoder validated (Gate 2 numbers recorded, §0.6; fixture diff pending).
 - [ ] Overfit smoke + shuffled-condition control passed.
 - [ ] D14 decided by the pre-registered rule; `ldm.z_source` pinned.
 - [ ] `rev8_main` + baselines trained and evaluated; `outputs/rev8_joblog.md`, `outputs/rev8_report.md`.

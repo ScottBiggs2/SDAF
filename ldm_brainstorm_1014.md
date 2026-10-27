@@ -25,6 +25,7 @@ decided until it is marked **DECIDED**. Inputs: `outputs/rev7_report.md`, `brain
 | D13 | 10-21 | **Latent untransformed.** The LDM trains directly in the VAE's raw z coordinates: no standardization, no scale factor. Supersedes D5. | §4.3 | The VAE's KL prior sets the coordinates. Resolution-order results are stated in VAE coordinates. |
 | D14 | 10-21 | **μ vs posterior samples: decide by a quick head-to-head check** (two short matched runs), then commit. | §4.2 | The rule is pre-registered in the plan. |
 | D15 | 10-20 | **Disjoint-halves generalization test included from the start** (Kadkhodaie et al.): two LDMs on parity-split sequence halves, sampled from shared noise. | §7 | Plan Stage 7b; split built in Stage 1. |
+| D16 | 10-26 | **Build-time implementation choices confirmed:** (a) the null condition also drops T (a learned null row in `T_embed`), so null = fully unconditional E; (b) the shuffled-condition control is scored as "fraction of samples closer to the condition-source row's μ than to their own row's μ", not by absolute cosine; (c) the Gate-4 overfit smoke uses EMA 0.999 (0.9999 lags too far over 5k steps). | §2.1, §7 | Scott, 10-26. Plan §0.6. |
 
 **Plan:** `agent_plan_rev8.md` (DRAFT, 10-21) turns D1–D14 into stages and gates.
 
@@ -462,6 +463,8 @@ Tracked so they don't get lost. None are part of the first LDM plan.
   - Note: an unrequested μ-stats run on Explorer was started and then stopped by Scott; no results.
 - **2026-10-21:** D13 (untransformed z, supersedes D5), D14 (μ-vs-sample quick check), D7′ (d = 128). Design questions closed. Plan drafted in `agent_plan_rev8.md`.
 - **2026-10-20 (session end):** Scott approved the plan answers (merge to main, standard DiT/EMA, budgets, A100s) and **adopted producer-consumer now** for both the VAE and the LDM (D8 amended). Built `specdec_af/data/stream.py` + `train.py --data-source stream`; merged to `main`. Then D15: disjoint halves included from the start (plan Stage 7b).
+
+- **2026-10-26:** Gate 2 passed its functional check (plan §0.6). Scott confirmed the build-time choices as D16 and gave the go for the Gate-4 overfit smoke.
 
 ## Sources
 
