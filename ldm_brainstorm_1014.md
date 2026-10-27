@@ -466,7 +466,7 @@ Tracked so they don't get lost. None are part of the first LDM plan.
 - **2026-10-20 (session end):** Scott approved the plan answers (merge to main, standard DiT/EMA, budgets, A100s) and **adopted producer-consumer now** for both the VAE and the LDM (D8 amended). Built `specdec_af/data/stream.py` + `train.py --data-source stream`; merged to `main`. Then D15: disjoint halves included from the start (plan Stage 7b).
 
 - **2026-10-26:** Gate 2 passed its functional check (plan §0.6). Scott confirmed the build-time choices as D16 and gave the go for the Gate-4 overfit smoke.
-- **2026-10-27:** Stage 6 ran (μ vs sample tie under the rule), but the suite exposed a position-blind cross-attention (quality falls with m past 2, diversity rises). Scott agreed the fix (D17); z_source left unpinned until the head-to-head is re-checked on the fixed architecture.
+- **2026-10-27:** Stage 6 ran (μ vs sample tie under the rule), but the suite exposed a position-blind cross-attention (quality falls with m past 2, diversity rises). Scott agreed the fix (D17); z_source left unpinned until the head-to-head is re-checked on the fixed architecture. Fix smoke at 10k passed the same day: quality now rises and diversity falls with m (full-context top-1 0.241 vs 0.083 pre-fix).
 
 ## Sources
 

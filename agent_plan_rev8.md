@@ -126,6 +126,11 @@ The original questions, for the record:
 - **Fix (017a32a):** learned `[W, d_cond]` slot embedding added to the encoder outputs before cross-attention keys/values
   (`DiTConfig.ctx_len = W`); pooled condition = mean over visible slots. Pre-fix checkpoints no longer load (a worktree at e75b7bb
   evaluates them). **Next:** smoke at 10k steps vs `rev8_mu` at 10k; if the m-curve turns monotone, re-run the Stage-6 head-to-head.
+- **Smoke passed (10-27).** `rev8_mu_pos` vs `rev8_mu`, both 10k steps, raw weights, 1k positions, same seed/data:
+  top-1 m0/2/8/32/full 0.182/0.211/0.238/0.251/0.241 (was 0.154/0.168/0.146/0.112/0.083; floor 0.527); lat_cos
+  0.48/0.61/0.67/0.70/0.70 (was 0.45/0.48/0.40/0.29/0.20); diversity 32.1/28.1/26.3/25.4/25.3 (was 33.1/32.4/34.2/37.3/39.2).
+  Shuffled − full top-1 −0.20 (was −0.05). Val raw loss mfull 0.512 (was 0.580). Null top-1 0.037 vs 0.046 (small cost).
+  m32 vs full is flat within noise at 1k positions. **Next:** re-run the Stage-6 head-to-head on the fixed architecture.
 
 ---
 
