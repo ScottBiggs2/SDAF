@@ -12,4 +12,6 @@ Code: `specdec_af/ldm/`. Plan: `agent_plan_rev8.md`. One row per cluster job (id
 | 10-26 | 11394079 | Gate 2 prep: flash-attn env build on CPU (short partition) | COMPLETED 29:59 — torch 2.4.1+cu121, flash_attn 2.6.3 |
 | 10-26 | 11394080 | Gate 2: functional MLM check + pytest only, no fixture (V100) | COMPLETED 1:36 — ours top-1/NLL 0.576/2.33 (15%), 0.367/3.89 (50%); interleaved rotary 0.043/7.40, swapped adaLN 0.001/8.98; ratio 11.3×; pytest 6 passed 1 skipped (fixture) |
 | 10-26 | 11394087 | Gate 2: fixture dump + check + fixture diff (A100; afterok 11394079) | pending |
-| 10-26 | 11395669 | Gate 4: overfit smoke rev8_overfit (static 1,024 rows, preset full, 5k steps, EMA 0.999, OVERFIT_EVAL=1; V100) | pending |
+| 10-26 | 11395669 | Gate 4: overfit smoke rev8_overfit (static 1,024 rows, preset full, 5k steps, EMA 0.999, OVERFIT_EVAL=1; V100) | COMPLETED 22:00 — loss drop 20.8× ✓; raw cos_min 0.954 ✗ (>0.98); top-1 0.480 vs floor 0.504 ✗ (2.4pp); shuffled: own cos 0.09, to-source 0.95, closer 0.98 ✓. Train loss still falling (0.088→0.076 over last 500). Artifacts kept as step_005000_frozen.pt / overfit_eval_step5000.json |
+| 10-26 | 11396762 | Gate 4 diag: overfit eval of the 5k ckpt at 200 Euler steps (sampler vs fit error) | pending |
+| 10-26 | 11396763 | Gate 4 diag: continue rev8_overfit to 20k steps (resume auto) + overfit eval | pending |
