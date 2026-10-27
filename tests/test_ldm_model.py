@@ -6,6 +6,8 @@
   4. Euler sampler with an exact oracle velocity recovers a Gaussian's mean / cov;
      the EM stub with churn = 0 == Euler, runs with churn > 0.
   5. Interp hooks: attention maps are distributions; residual deltas add up.
+  6. Window order matters (slot embedding); without it the DiT is permutation-blind;
+     pooling ignores [MASK] slots.
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ B, W, D_LAT = 3, 10, 16
 
 
 def _cfg(**kw) -> DiTConfig:
-    return DiTConfig(d_latent=D_LAT, depth=2, d_model=32, n_heads=4, d_cond=ENC["hidden_dim"], **kw)
+    return DiTConfig(d_latent=D_LAT, depth=2, d_model=32, n_heads=4, d_cond=ENC["hidden_dim"], ctx_len=W, **kw)
 
 
 def _perturb(m: torch.nn.Module, seed: int = 0) -> torch.nn.Module:
@@ -175,3 +177,26 @@ def test_interp_hooks():
 def test_dit_s_param_count():
     n = count_params(LatentDiT(DiTConfig()))
     assert 30e6 < n < 60e6, n
+
+
+def test_ctx_slot_embedding_breaks_permutation_symmetry():
+    dit = _perturb(LatentDiT(_cfg()))
+    z, ctx, T, null = _inputs()
+    t = torch.rand(B)
+    perm = torch.randperm(W, generator=torch.Generator().manual_seed(0))
+    assert not torch.allclose(dit(z, t, ctx, T, null), dit(z, t, ctx[:, perm], T, null), atol=1e-5)
+    with torch.no_grad():
+        dit.ctx_pos.zero_()  # the pre-fix model: cross-attention + mean pool see an unordered set
+    torch.testing.assert_close(dit(z, t, ctx, T, null), dit(z, t, ctx[:, perm], T, null))
+    with pytest.raises(ValueError, match="ctx_len"):
+        dit(z, t, ctx[:, :-1], T, null)
+
+
+def test_pool_ignores_masked_slots():
+    from specdec_af.ldm.dit import _pool
+    ctx = torch.randn(2, W, 4)
+    vis = torch.zeros(2, W, dtype=torch.bool)
+    vis[0, -3:] = True
+    p = _pool(ctx, vis)
+    torch.testing.assert_close(p[0], ctx[0, -3:].mean(0))
+    torch.testing.assert_close(p[1], ctx[1].mean(0))  # null row: no visible slots → all

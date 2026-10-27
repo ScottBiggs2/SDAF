@@ -52,6 +52,7 @@ class DiTConfig:
     mlp_hidden: int | None = None
     d_cond: int = 768        # encoder hidden size
     n_positions: int = 256   # T ∈ [0, n_positions); row n_positions = null
+    ctx_len: int = 128       # condition window W (slot W-1 = x_T)
     self_attn_mask: str = "full"
 
     @classmethod
@@ -144,6 +145,15 @@ class DiTBlock(nn.Module):
         return x, p_self, p_cross
 
 
+def _pool(ctx: Tensor, visible: Tensor | None) -> Tensor:
+    """Mean of ``ctx`` over visible slots ([MASK] padding excluded); all slots for null rows."""
+    if visible is None:
+        return ctx.mean(1)
+    w = visible.to(ctx.dtype)
+    w = torch.where(w.sum(1, keepdim=True) > 0, w, torch.ones_like(w))
+    return (ctx * w[..., None]).sum(1) / w.sum(1, keepdim=True)
+
+
 class LatentDiT(nn.Module):
     def __init__(self, cfg: DiTConfig) -> None:
         super().__init__()
@@ -156,6 +166,10 @@ class LatentDiT(nn.Module):
         self.t_embed = TimestepEmbedder(d)
         self.T_embed = nn.Embedding(cfg.n_positions + 1, d)
         self.pool_proj = nn.Linear(cfg.d_cond, d)
+        # Learned slot embedding on the cross-attention keys/values. The encoder's RoPE only
+        # acts inside its own attention, so without this the window is an unordered set to
+        # the DiT and x_T is lost among the visible tokens as m grows (Stage-6 finding).
+        self.ctx_pos = nn.Parameter(torch.zeros(cfg.ctx_len, cfg.d_cond))
         self.blocks = nn.ModuleList(DiTBlock(cfg) for _ in range(cfg.depth))
         self.final_norm = nn.LayerNorm(d, elementwise_affine=False, eps=1e-6)
         self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d, 2 * d))
@@ -172,6 +186,7 @@ class LatentDiT(nn.Module):
         self.apply(_basic)
         nn.init.normal_(self.depth_embed, std=0.02)
         nn.init.normal_(self.T_embed.weight, std=0.02)
+        nn.init.normal_(self.ctx_pos, std=0.02)
         for lin in (self.t_embed.mlp[0], self.t_embed.mlp[2]):
             nn.init.normal_(lin.weight, std=0.02)
         for blk in self.blocks:
@@ -184,15 +199,19 @@ class LatentDiT(nn.Module):
             nn.init.zeros_(lin.bias)
 
     def forward(self, z_t: Tensor, t: Tensor, ctx: Tensor, T: Tensor, null: Tensor, *,
-                return_attn: bool = False, return_resid: bool = False):
+                visible: Tensor | None = None, return_attn: bool = False, return_resid: bool = False):
         """``z_t [B, 12, d_latent]``, ``t [B, 12]`` (or ``[B]``), ``ctx [B, W, d_cond]``,
-        ``T [B]`` long, ``null [B]`` bool → v ``[B, 12, d_latent]`` (+ aux dict if hooks requested)."""
+        ``T [B]`` long, ``null [B]`` bool, ``visible [B, W]`` bool (pooling mask; all slots if
+        None or none visible) → v ``[B, 12, d_latent]`` (+ aux dict if hooks requested)."""
         B, n, _ = z_t.shape
+        if ctx.shape[1] != self.cfg.ctx_len:
+            raise ValueError(f"ctx window {ctx.shape[1]} != DiTConfig.ctx_len {self.cfg.ctx_len}")
         if t.dim() == 1:
             t = t[:, None].expand(B, n)
         T_idx = torch.where(null, torch.full_like(T, self.cfg.n_positions), T)
         c = (self.t_embed(1000.0 * t.reshape(-1)).view(B, n, -1)
-             + self.T_embed(T_idx)[:, None] + self.pool_proj(ctx.mean(1))[:, None])
+             + self.T_embed(T_idx)[:, None] + self.pool_proj(_pool(ctx, visible))[:, None])
+        ctx = ctx + self.ctx_pos
         x = self.in_proj(z_t) + self.depth_embed
         aux = {"self_attn": [], "cross_attn": [], "resid": [x], "delta": []} if (return_attn or return_resid) else None
         for blk in self.blocks:
@@ -226,7 +245,7 @@ class LatentLDM(nn.Module):
                 dit: LatentDiT | None = None, **kw):
         ctx = self.encode(cond["ids"]) if ctx is None else ctx
         null = ~cond["visible"].any(-1)
-        return (dit or self.dit)(z_t, t, ctx, cond["T"], null, **kw)
+        return (dit or self.dit)(z_t, t, ctx, cond["T"], null, visible=cond["visible"], **kw)
 
     def null_cond(self, cond: dict) -> dict:
         ids = torch.full_like(cond["ids"], self.mask_id)

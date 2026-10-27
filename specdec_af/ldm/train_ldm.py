@@ -143,8 +143,10 @@ def build_encoder(enc_cfg: dict) -> MDLMBlock0Encoder:
 
 def build_ldm(cfg: LDMTrainConfig, *, d_latent: int, n_positions: int) -> LatentLDM:
     enc = build_encoder(cfg.encoder)
-    dit = LatentDiT(DiTConfig.from_dict(cfg.dit, d_latent=d_latent, d_cond=enc.hidden_dim, n_positions=n_positions))
-    return LatentLDM(enc, dit, mask_id=ConditionConfig.from_dict(cfg.condition).mask_id)
+    ccfg = ConditionConfig.from_dict(cfg.condition)
+    dit = LatentDiT(DiTConfig.from_dict(cfg.dit, d_latent=d_latent, d_cond=enc.hidden_dim, n_positions=n_positions,
+                                        ctx_len=ccfg.W))
+    return LatentLDM(enc, dit, mask_id=ccfg.mask_id)
 
 
 def file_sha256(path: str | Path | None) -> str | None:
