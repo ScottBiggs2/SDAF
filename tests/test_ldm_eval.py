@@ -103,7 +103,7 @@ def test_eval_conditions_and_shuffle(ldm_latents, trained_run):
 
 def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     cfg = LDMTrainConfig(latents_dir=str(ldm_latents), vae_checkpoint=str(trained_run["checkpoint"]),
-                         data_source="static", z_source="sample", batch_size=8, lr=1e-3, lr_warmup_steps=2,
+                         data_source="static", z_source="sample", max_train_rows=12, batch_size=8, lr=1e-3, lr_warmup_steps=2,
                          ema_decay=0.9, n_steps=6, val_every_steps=0, val_positions=16, val_max_positions=16,
                          checkpoint_every_steps=0, log_every=1, seed=0, condition={"W": 16},
                          encoder=dict(init="random", vocab_size=50258, hidden_dim=32, n_heads=4, cond_dim=8),
@@ -122,6 +122,7 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     assert "shuffled" not in res["diversity"] and set(res["diversity"]["null"]) == {"latent_dist", "top1_agreement"}
     assert set(res["conditioning"]["cfg_sweep"]) == {"m2", "m15"}
     mem = res["memorization"]
+    assert mem["n_train_ref"] == 12  # the rows this run trained on, not the whole train split
     assert mem["nn_ratio"] > 0 and {"train", "val"} == set(mem["loss"]) and "loss" in mem["loss_gap_val_minus_train"]
     write_suite_report(res, tmp_path / "eval")
     for f in ("metrics.json", "summary.txt", "ldm_gap_by_block.png", "dist_by_condition.png",

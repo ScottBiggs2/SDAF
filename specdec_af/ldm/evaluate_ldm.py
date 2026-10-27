@@ -371,7 +371,10 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
                                 for k in ("top1", "kl")},
         "cfg_sweep": _cfg_sweep(ldm, dit, table, sampler, dec, rows[:sc.cfg_positions], sc, device),
     }
-    res["memorization"] = _memorization(ck, table, sampler, accs["null"].cat("z"), mu_val, train_all, rows, sc, device)
+    # Memorization is judged against the rows this run could have trained on (respects
+    # max_train_rows / train_half); the data floor above uses the whole train split.
+    seen = table.train_rows(half=cfg.train_half, max_rows=cfg.max_train_rows)
+    res["memorization"] = _memorization(ck, table, sampler, accs["null"].cat("z"), mu_val, seen, rows, sc, device)
     return res
 
 
@@ -415,10 +418,10 @@ def _cfg_sweep(ldm, dit, table, sampler, dec, rows, sc, device) -> dict:
 
 
 @torch.no_grad()
-def _memorization(ck, table, sampler, z_null, mu_val, train_all, eval_rows, sc, device) -> dict:
+def _memorization(ck, table, sampler, z_null, mu_val, train_seen, eval_rows, sc, device) -> dict:
     from specdec_af.ldm.train_ldm import Validator
     rng = np.random.default_rng(sc.seed + 1)
-    sub = np.sort(rng.choice(train_all, size=min(sc.mem_train_rows, len(train_all)), replace=False))
+    sub = np.sort(rng.choice(train_seen, size=min(sc.mem_train_rows, len(train_seen)), replace=False))
     ref = torch.from_numpy(np.asarray(table.mu[sub], dtype=np.float32)).to(device)
     nn_null = nn_distance(z_null.to(device), ref)
     nn_val = nn_distance(mu_val.to(device), ref)
@@ -427,7 +430,7 @@ def _memorization(ck, table, sampler, z_null, mu_val, train_all, eval_rows, sc, 
     cfg = ck["config"]
     vcfg = type(cfg)(**{**asdict(cfg), "batch_size": min(cfg.batch_size, 256)})
     n = sc.loss_gap_positions
-    tr_rows = np.sort(rng.choice(train_all, size=min(n, len(train_all)), replace=False))
+    tr_rows = np.sort(rng.choice(train_seen, size=min(n, len(train_seen)), replace=False))
     gap = {}
     for split, r in (("train", tr_rows), ("val", eval_rows[:n])):
         gap[split] = Validator(table, r, sampler, vcfg, device)(ck["ldm"], ck["ema"] if sc.weights == "ema" else ck["ldm"].dit)
