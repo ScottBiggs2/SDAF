@@ -26,6 +26,7 @@ decided until it is marked **DECIDED**. Inputs: `outputs/rev7_report.md`, `brain
 | D14 | 10-21 | **μ vs posterior samples: decide by a quick head-to-head check** (two short matched runs), then commit. | §4.2 | The rule is pre-registered in the plan. |
 | D15 | 10-20 | **Disjoint-halves generalization test included from the start** (Kadkhodaie et al.): two LDMs on parity-split sequence halves, sampled from shared noise. | §7 | Plan Stage 7b; split built in Stage 1. |
 | D16 | 10-26 | **Build-time implementation choices confirmed:** (a) the null condition also drops T (a learned null row in `T_embed`), so null = fully unconditional E; (b) the shuffled-condition control is scored as "fraction of samples closer to the condition-source row's μ than to their own row's μ", not by absolute cosine; (c) the Gate-4 overfit smoke uses EMA 0.999 (0.9999 lags too far over 5k steps). | §2.1, §7 | Scott, 10-26. Plan §0.6. |
+| D17 | 10-27 | **Slot position embedding on the cross-attention keys/values** (learned `[W, d_cond]`, added to the MDLM block-0 outputs) and **pooled condition averaged over visible slots only**. | §3.2, §3.3 | Scott, 10-27. Stage-6 finding: MDLM's RoPE acts only inside its own attention, so the DiT saw the window as an unordered set; sample quality peaked at m = 2 and fell toward the shuffled control at full context. Plan §0.7. |
 
 **Plan:** `agent_plan_rev8.md` (DRAFT, 10-21) turns D1–D14 into stages and gates.
 
@@ -465,6 +466,7 @@ Tracked so they don't get lost. None are part of the first LDM plan.
 - **2026-10-20 (session end):** Scott approved the plan answers (merge to main, standard DiT/EMA, budgets, A100s) and **adopted producer-consumer now** for both the VAE and the LDM (D8 amended). Built `specdec_af/data/stream.py` + `train.py --data-source stream`; merged to `main`. Then D15: disjoint halves included from the start (plan Stage 7b).
 
 - **2026-10-26:** Gate 2 passed its functional check (plan §0.6). Scott confirmed the build-time choices as D16 and gave the go for the Gate-4 overfit smoke.
+- **2026-10-27:** Stage 6 ran (μ vs sample tie under the rule), but the suite exposed a position-blind cross-attention (quality falls with m past 2, diversity rises). Scott agreed the fix (D17); z_source left unpinned until the head-to-head is re-checked on the fixed architecture.
 
 ## Sources
 

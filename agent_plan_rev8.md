@@ -114,6 +114,19 @@ The original questions, for the record:
   50%. Interleaved rotary: 0.043 / 7.40; swapped adaLN chunks: 0.001 / 8.98. Ours ≥ 11.3× the best broken control. Flash-attn fixture
   diff (job 11394087, A100) pending; not blocking. Signed off by Scott 10-26.
 
+
+### 0.7 Stage-6 result and the cross-attention position fix (D17, 10-27)
+- **Stage 6 ran** (`rev8_mu`, `rev8_sample`, 50k stream steps each; neither diverged nor memorized). The rule's primary metric, mean
+  decoded KL over suffix m ∈ {0, 2, 8, 32, W−1}, was 3.99 (μ) vs 3.93 (sample): a 1.6% tie → μ. **Not pinned**, because of the next point.
+- **Anomaly.** At a fixed target (same position, nested information), quality must not fall with m and sample diversity must not rise
+  (law of total variance). Both did: top-1 0.20 / cos 0.58 at m = 2 vs 0.11 / 0.30 at full context (shuffled control: cos 0.12);
+  diversity 30 → 38. Model-internal (the VAE is identical across columns).
+- **Cause.** MDLM's RoPE only shapes attention inside block 0; its output vectors carry no slot identity, and the DiT's cross-attention
+  added none, so the window was an unordered set and x_T got lost among the visible tokens. `ctx.mean(1)` also averaged [MASK] slots.
+- **Fix (017a32a):** learned `[W, d_cond]` slot embedding added to the encoder outputs before cross-attention keys/values
+  (`DiTConfig.ctx_len = W`); pooled condition = mean over visible slots. Pre-fix checkpoints no longer load (a worktree at e75b7bb
+  evaluates them). **Next:** smoke at 10k steps vs `rev8_mu` at 10k; if the m-curve turns monotone, re-run the Stage-6 head-to-head.
+
 ---
 
 ## 1. Ground rules
