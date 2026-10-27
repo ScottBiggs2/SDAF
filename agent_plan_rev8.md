@@ -388,8 +388,8 @@ For each flag, recommend (don't run) the next lever.
 
 ## 9. Deliverables checklist
 
-- [ ] Branch `rev8-ldm` with per-stage commits, pushed.
-- [ ] `specdec_af/ldm/`: `data.py`, `prefix_block.py`, `dit.py`, `flow.py`, `train_ldm.py`, `evaluate_ldm.py` (+ tests).
+- [x] Branch `rev8-ldm` with per-stage commits, pushed.
+- [x] `specdec_af/ldm/`: `data.py`, `prefix_block.py`, `dit.py`, `flow.py`, `train_ldm.py`, `evaluate_ldm.py` (+ tests).
 - [x] MDLM block-0 encoder validated (Gate 2 numbers recorded, §0.6; fixture diff pending).
 - [x] Overfit smoke + shuffled-condition control passed (10-26, 20k steps; 5k was undertrained — see job log).
 - [ ] D14 decided by the pre-registered rule; `ldm.z_source` pinned.
