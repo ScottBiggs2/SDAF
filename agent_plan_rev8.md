@@ -391,7 +391,7 @@ For each flag, recommend (don't run) the next lever.
 - [ ] Branch `rev8-ldm` with per-stage commits, pushed.
 - [ ] `specdec_af/ldm/`: `data.py`, `prefix_block.py`, `dit.py`, `flow.py`, `train_ldm.py`, `evaluate_ldm.py` (+ tests).
 - [x] MDLM block-0 encoder validated (Gate 2 numbers recorded, §0.6; fixture diff pending).
-- [ ] Overfit smoke + shuffled-condition control passed.
+- [x] Overfit smoke + shuffled-condition control passed (10-26, 20k steps; 5k was undertrained — see job log).
 - [ ] D14 decided by the pre-registered rule; `ldm.z_source` pinned.
 - [ ] `rev8_main` + baselines trained and evaluated; `outputs/rev8_joblog.md`, `outputs/rev8_report.md`.
 - [ ] Interp hooks present and tested (attention maps, residual capture, x̂₀/ε̂ accessors, SDE sampler stub). The studies themselves are not run.
