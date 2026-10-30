@@ -50,6 +50,7 @@ import torch
 from specdec_af.ldm.data import (
     HOLES,
     NULL,
+    SPANS,
     SUFFIX,
     ConditionConfig,
     ConditionSampler,
@@ -57,6 +58,7 @@ from specdec_af.ldm.data import (
     StaticLatentBatches,
     batch_generator,
     condition_batch,
+    resolve_window,
 )
 from specdec_af.ldm.dit import DiTConfig, LatentDiT, LatentLDM, count_params
 from specdec_af.ldm.flow import interpolate, logit_normal_t, rf_loss
@@ -166,6 +168,8 @@ def _bucket_m(m: torch.Tensor, regime: torch.Tensor, W: int) -> list[str]:
             out.append("null")
         elif r == HOLES:
             out.append("holes")
+        elif r == SPANS:
+            out.append("spans")
         elif mm == W - 1:
             out.append("mfull")
         elif mm == 0:
@@ -254,7 +258,7 @@ def load_ldm_checkpoint(path: Path | str, *, device="cpu") -> dict:
     enc = build_encoder(cfg.encoder)
     if state.get("encoder") is not None:
         enc.load_state_dict(state["encoder"])
-    dcfg = DiTConfig(**state["dit_config"])
+    dcfg = DiTConfig(**{"mask_prestart": False, **state["dit_config"]})  # pre-D18 checkpoints
     dit, ema = LatentDiT(dcfg), LatentDiT(dcfg)
     dit.load_state_dict(state["dit"])
     ema.load_state_dict(state["ema"])
@@ -290,6 +294,10 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
     resume_path = Path(resume_from) if resume_from else None
 
     table = LatentTable(cfg.latents_dir, cache_dir)
+    cfg.condition = resolve_window(cfg.condition, table.seq_len)  # D18: W = GPT-2 context (saved resolved)
+    stream_len = (cfg.stream or {}).get("seq_len")
+    if cfg.data_source == "stream" and stream_len is not None and int(stream_len) != table.seq_len:
+        raise ValueError(f"stream seq_len={stream_len} != latent table seq_len={table.seq_len}")
     sampler = ConditionSampler(ConditionConfig.from_dict(cfg.condition))
     train_src, producer = build_train_source(cfg, table, cache_dir, device=device, gpt2=gpt2)
     val_rows = table.eval_rows(cfg.val_positions)[:cfg.val_max_positions]
@@ -359,7 +367,7 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
               + "  ".join(f"{k[4:]}={x:.3f}" for k, x in v.items() if k.startswith("ema_loss_")), flush=True)
         return v
 
-    fields = ["step", "epoch", "lr", "loss", "loss_null", "loss_suffix", "loss_holes", "grad_norm", "per_token_t"]
+    fields = ["step", "epoch", "lr", "loss", "loss_null", "loss_suffix", "loss_holes", "loss_spans", "grad_norm", "per_token_t"]
     csv_logger = CSVLogger(output_dir / "training_log.csv", fields,
                            resume_step=step if resume_path is not None else None)
     wb = WandbLogger(cfg.wandb_project, entity=cfg.wandb_entity, run_dir=output_dir, run_name=output_dir.name,
@@ -397,9 +405,10 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
                 with torch.no_grad():
                     reg = b["regime"]
                     rl = {name: float(per[reg == code].mean()) if (reg == code).any() else float("nan")
-                          for name, code in (("null", NULL), ("suffix", SUFFIX), ("holes", HOLES))}
+                          for name, code in (("null", NULL), ("suffix", SUFFIX), ("holes", HOLES), ("spans", SPANS))}
                 row = {"step": idx, "epoch": epoch, "lr": opt.param_groups[0]["lr"], "loss": loss.item(),
                        "loss_null": rl["null"], "loss_suffix": rl["suffix"], "loss_holes": rl["holes"],
+                       "loss_spans": rl["spans"],
                        "grad_norm": float(gn) if gn is not None else float("nan"),
                        "per_token_t": int(bool((t != t[:, :1]).any()))}
                 csv_logger.log(row)

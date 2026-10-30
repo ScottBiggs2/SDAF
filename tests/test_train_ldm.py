@@ -26,7 +26,7 @@ def _cfg(ldm_latents, trained_run, **kw) -> LDMTrainConfig:
                 data_source="static", batch_size=8, lr=1e-3, lr_warmup_steps=3, ema_decay=0.9,
                 n_steps=12, val_every_steps=5, val_positions=16, val_max_positions=16,
                 checkpoint_every_steps=0, log_every=1, seed=0,
-                condition={"W": 16}, encoder=TINY_ENC, dit=TINY_DIT, flow={"p_token_t": 0.3})
+                condition={}, encoder=TINY_ENC, dit=TINY_DIT, flow={"p_token_t": 0.3})
     base.update(kw)
     return LDMTrainConfig(**base)
 
@@ -69,7 +69,7 @@ def test_resume_is_exact(ldm_latents, trained_run, tmp_path):
 
 def test_overfit_eval_runs(ldm_latents, trained_run, tmp_path, gpt2):
     cfg = _cfg(ldm_latents, trained_run, n_steps=15, max_train_rows=16, val_every_steps=0,
-               condition={"W": 16, "p_null": 0.0, "p_suffix": 1.0, "p_holes": 0.0, "m_mixture": [[-1, -1, 1.0]]})
+               condition={"p_null": 0.0, "p_suffix": 1.0, "p_holes": 0.0, "m_mixture": [[-1, -1, 1.0]]})
     train_ldm(cfg, trained_run["cache_dir"], tmp_path / "of", device=torch.device("cpu"))
     res = overfit_eval(tmp_path / "of" / "checkpoints" / "final.pt", device=torch.device("cpu"), steps=4,
                        batch=8, gpt2=gpt2)

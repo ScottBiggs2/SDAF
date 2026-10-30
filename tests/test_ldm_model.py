@@ -8,6 +8,7 @@
   5. Interp hooks: attention maps are distributions; residual deltas add up.
   6. Window order matters (slot embedding); without it the DiT is permutation-blind;
      pooling ignores [MASK] slots.
+  7. D18: pre-start slots are invisible to the DiT and the encoder (null rows keep them).
 """
 from __future__ import annotations
 
@@ -180,7 +181,7 @@ def test_dit_s_param_count():
 
 
 def test_ctx_slot_embedding_breaks_permutation_symmetry():
-    dit = _perturb(LatentDiT(_cfg()))
+    dit = _perturb(LatentDiT(_cfg(mask_prestart=False)))  # pre-D18 keys: every slot attended
     z, ctx, T, null = _inputs()
     t = torch.rand(B)
     perm = torch.randperm(W, generator=torch.Generator().manual_seed(0))
@@ -200,3 +201,32 @@ def test_pool_ignores_masked_slots():
     p = _pool(ctx, vis)
     torch.testing.assert_close(p[0], ctx[0, -3:].mean(0))
     torch.testing.assert_close(p[1], ctx[1].mean(0))  # null row: no visible slots → all
+
+
+def test_prestart_slots_are_absent():
+    """D18: ctx at slots before the sequence start never reaches v (non-null rows); null rows and
+    mask_prestart=False still attend them."""
+    from specdec_af.ldm.dit import slot_exists
+    z, ctx, _, null = _inputs()
+    T = torch.tensor([2, 5, W - 1])  # 7, 4 and 0 pre-start slots
+    t = torch.rand(B)
+    exists = slot_exists(T, null, W)
+    assert exists.sum(1).tolist() == [3, 6, W]
+    noisy = torch.where(exists[..., None], ctx, torch.randn_like(ctx))
+    dit = _perturb(LatentDiT(_cfg()))
+    torch.testing.assert_close(dit(z, t, ctx, T, null), dit(z, t, noisy, T, null))
+    nulls = torch.ones(B, dtype=torch.bool)
+    assert slot_exists(T, nulls, W).all()
+    assert not torch.allclose(dit(z, t, ctx, T, nulls), dit(z, t, noisy, T, nulls), atol=1e-5)
+    off = _perturb(LatentDiT(_cfg(mask_prestart=False)))
+    assert not torch.allclose(off(z, t, ctx, T, null), off(z, t, noisy, T, null), atol=1e-5)
+
+
+def test_encoder_key_mask_drops_prestart_ids():
+    enc = MDLMBlock0Encoder.random(seed=0, **ENC)
+    ids = torch.randint(0, 50257, (2, W), generator=torch.Generator().manual_seed(0))
+    km = torch.arange(W)[None].expand(2, W) >= torch.tensor([[4], [0]])
+    other = torch.where(km, ids, torch.full_like(ids, 50257))
+    a, b = enc(ids, key_mask=km), enc(other, key_mask=km)
+    torch.testing.assert_close(a[km], b[km])
+    assert not torch.allclose(enc(ids)[0, 4:], enc(other)[0, 4:], atol=1e-5)

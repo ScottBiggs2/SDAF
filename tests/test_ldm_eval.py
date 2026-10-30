@@ -105,14 +105,14 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     cfg = LDMTrainConfig(latents_dir=str(ldm_latents), vae_checkpoint=str(trained_run["checkpoint"]),
                          data_source="static", z_source="sample", max_train_rows=12, batch_size=8, lr=1e-3, lr_warmup_steps=2,
                          ema_decay=0.9, n_steps=6, val_every_steps=0, val_positions=16, val_max_positions=16,
-                         checkpoint_every_steps=0, log_every=1, seed=0, condition={"W": 16},
+                         checkpoint_every_steps=0, log_every=1, seed=0, condition={},
                          encoder=dict(init="random", vocab_size=50258, hidden_dim=32, n_heads=4, cond_dim=8),
                          dit=dict(depth=2, d_model=32, n_heads=4))
     train_ldm(cfg, trained_run["cache_dir"], tmp_path / "run", device=torch.device("cpu"))
     sc = SuiteConfig(n_positions=16, batch=8, steps=3, diversity_positions=6, diversity_k=3, cfg_positions=6,
                      cfg_ws=(1.0, 2.0), mem_train_rows=20, loss_gap_positions=8, kid_subset=8, kid_subsets=3)
     res = evaluate_suite(tmp_path / "run" / "checkpoints" / "final.pt", device=torch.device("cpu"), sc=sc, gpt2=gpt2)
-    assert res["n_positions"] == 16 and set(res["conditions"]) == {n for n, _ in eval_conditions(16)}
+    assert res["n_positions"] == 16 and set(res["conditions"]) == {n for n, _ in eval_conditions(res["W"])}
     c = res["conditions"]["mfull"]
     assert len(c["latent_cos_block"]) == len(c["gap_recon_cos_block"]) == 12
     assert c["gap_top1"] == pytest.approx(c["top1"] - res["floor"]["top1"])
@@ -120,7 +120,7 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     assert "fd_joint" not in c["dist_resid"] and "dist_z_vs_posterior_samples" in c  # z_source=sample
     assert set(res["dist_floors"]) == {"z_data", "z_prior", "resid_vae"}
     assert "shuffled" not in res["diversity"] and set(res["diversity"]["null"]) == {"latent_dist", "top1_agreement"}
-    assert set(res["conditioning"]["cfg_sweep"]) == {"m2", "m15"}
+    assert set(res["conditioning"]["cfg_sweep"]) == {"m2", f"m{res['W'] - 1}"}
     mem = res["memorization"]
     assert mem["n_train_ref"] == 12  # the rows this run trained on, not the whole train split
     assert mem["nn_ratio"] > 0 and {"train", "val"} == set(mem["loss"]) and "loss" in mem["loss_gap_val_minus_train"]

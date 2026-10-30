@@ -18,13 +18,22 @@ function of the training loop's cursor and resume is exact with no RNG state.
 
 :class:`ConditionSampler` (D1, D11, D12) builds the ``W``-token window ending
 at T (``seq[T-W+1 .. T]``; slots before the sequence start are [MASK]; nothing
-after T ever enters) and one of three masks:
+after T ever enters) and one of the masks below. D18: ``W`` is locked to GPT-2's
+context (``W = seq_len``, :func:`resolve_window`), so the window holds every
+token Z_T depends on; pre-start slots are "absent" (the DiT masks them out of
+attention), never "hidden".
 
   - ``null``   — every slot [MASK], incl. x_T → unconditional E (the DiT also
                  drops T for these, see :mod:`.dit`);
   - ``suffix`` — visible = ``x_{T-m} .. x_T``, m from the configured mixture
                  (m = 0: only x_T);
-  - ``holes``  — full window, each slot except x_T masked i.i.d. at r ~ U(lo, hi).
+  - ``holes``  — full window, each slot except x_T masked i.i.d. at r ~ U(lo, hi);
+  - ``spans``  — the window cut into ``n_spans`` equal contiguous spans (slot
+                 coordinates, i.e. relative to T), each visible i.i.d. with
+                 prob. ``span_p``, x_T always visible. Trains the whole 2^n_spans
+                 sub-lattice for the concept-algebra work; **off by default**
+                 (``p_spans = 0`` draws no extra randomness, so default batches
+                 are unchanged).
 
 [MASK] means "unknown to the generator", not "absent from GPT-2's input":
 Z_T is always the trace of the full real context (marginalization, §2.1).
@@ -48,8 +57,8 @@ from torch import Tensor
 from specdec_af.data.dataset import PositionSet, list_shards, read_split
 
 MASK_ID = 50257
-REGIMES = ("null", "suffix", "holes")
-NULL, SUFFIX, HOLES = 0, 1, 2
+REGIMES = ("null", "suffix", "holes", "spans")
+NULL, SUFFIX, HOLES, SPANS = 0, 1, 2, 3
 _TAG_STATIC_SHUFFLE, _TAG_CONDITION = 10, 11
 
 
@@ -169,17 +178,30 @@ class StaticLatentBatches:
 
 @dataclass
 class ConditionConfig:
-    W: int = 128
+    W: int | None = None     # D18: None until resolve_window ties it to seq_len
     mask_id: int = MASK_ID
     p_null: float = 0.10
     p_suffix: float = 0.75
     p_holes: float = 0.15
-    m_mixture: list = field(default_factory=lambda: [[0, 0, 0.15], [1, 8, 0.45], [9, 64, 0.25], [-1, -1, 0.15]])
+    p_spans: float = 0.0     # off by default (lattice experiments only)
+    m_mixture: list = field(default_factory=lambda: [[0, 0, 0.15], [1, 8, 0.45], [9, -2, 0.25], [-1, -1, 0.15]])
     holes_rate: list = field(default_factory=lambda: [0.0, 0.5])
+    n_spans: int = 8
+    span_p: float = 0.5
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "ConditionConfig":
         return cls(**(d or {}))
+
+
+def resolve_window(condition: dict | None, seq_len: int) -> dict:
+    """D18: lock the condition window to GPT-2's context, ``W = seq_len``. An explicit ``W`` must agree."""
+    condition = dict(condition or {})
+    W = condition.get("W")
+    if W is not None and int(W) != int(seq_len):
+        raise ValueError(f"condition.W={W} != seq_len={seq_len}; the window is locked to GPT-2's context (D18)")
+    condition["W"] = int(seq_len)
+    return condition
 
 
 class ConditionSampler:
@@ -187,13 +209,20 @@ class ConditionSampler:
 
     def __init__(self, cfg: ConditionConfig) -> None:
         self.cfg = cfg
-        p = np.array([cfg.p_null, cfg.p_suffix, cfg.p_holes], dtype=np.float64)
+        if cfg.W is None:
+            raise ValueError("condition.W is unresolved; train_ldm locks it to seq_len (resolve_window, D18)")
+        p = np.array([cfg.p_null, cfg.p_suffix, cfg.p_holes, cfg.p_spans], dtype=np.float64)
         if (p < 0).any() or abs(p.sum() - 1) > 1e-6:
             raise ValueError(f"regime probabilities must sum to 1; got {p.tolist()}")
-        self._p_cum = torch.tensor(np.cumsum(p)[:2], dtype=torch.float64)
+        self._p_cum = torch.tensor(np.cumsum(p)[:3], dtype=torch.float64)
         W = cfg.W
-        # -1 = W-1; bin tops past W-1 are clipped (small W in tests), bottoms past it are an error.
-        bins = [(W - 1 if lo == -1 else int(lo), W - 1 if hi == -1 else min(int(hi), W - 1), float(w))
+        if not 1 <= cfg.n_spans <= W:
+            raise ValueError(f"n_spans={cfg.n_spans} outside [1, W={W}]")
+        # span id per slot: equal contiguous spans (the last absorbs the remainder when n_spans ∤ W)
+        self._span_of = (torch.arange(W) // (W // cfg.n_spans)).clamp(max=cfg.n_spans - 1)
+        # Negative bounds count from W (-1 = W-1 = full window, -2 = W-2, ...), so the bins follow the
+        # locked W (D18). Bin tops past W-1 are clipped (small W in tests), bottoms past it are an error.
+        bins = [(W + int(lo) if lo < 0 else int(lo), W + int(hi) if hi < 0 else min(int(hi), W - 1), float(w))
                 for lo, hi, w in cfg.m_mixture]
         if any(not 0 <= lo <= hi for lo, hi, _ in bins):
             raise ValueError(f"m_mixture bins must lie in [0, W-1={W - 1}]; got {bins}")
@@ -216,19 +245,21 @@ class ConditionSampler:
         return self._m_lo[k] + (torch.rand(B, generator=g, dtype=torch.float64) * span).long().clamp(max=span - 1)
 
     def sample(self, seq_tokens: Tensor, pos: Tensor, *, generator: torch.Generator,
-               regime: str | None = None, m: int | None = None, holes_rate: float | None = None) -> dict:
-        """Condition for a batch. ``regime`` / ``m`` / ``holes_rate`` fix the draw (eval mode).
+               regime: str | None = None, m: int | None = None, holes_rate: float | None = None,
+               span_set=None) -> dict:
+        """Condition for a batch. ``regime`` / ``m`` / ``holes_rate`` / ``span_set`` (visible span
+        indices, for ``spans``) fix the draw (eval mode).
 
         Returns ``ids [B, W]`` (masked slots = [MASK]), ``visible [B, W]`` bool,
-        ``regime [B]`` (0 null / 1 suffix / 2 holes), ``m [B]`` (−1 for null /
-        holes), ``T [B]``. All on ``seq_tokens.device``.
+        ``regime [B]`` (0 null / 1 suffix / 2 holes / 3 spans), ``m [B]`` (−1 for
+        null / holes / spans), ``T [B]``. All on ``seq_tokens.device``.
         """
         dev, W, B = seq_tokens.device, self.cfg.W, seq_tokens.shape[0]
         g = generator
         ids, in_seq = self.window(seq_tokens, pos)
         if regime is None:
             u = torch.rand(B, generator=g, dtype=torch.float64)
-            reg = (u >= self._p_cum[0]).long() + (u >= self._p_cum[1]).long()
+            reg = (u[:, None] >= self._p_cum[None, :]).long().sum(1)
         else:
             reg = torch.full((B,), REGIMES.index(regime), dtype=torch.long)
         if m is None:
@@ -248,6 +279,17 @@ class ConditionSampler:
         vis_holes = keep | last
         visible = torch.where((reg == SUFFIX)[:, None], vis_suffix,
                               torch.where((reg == HOLES)[:, None], vis_holes, torch.zeros_like(vis_suffix)))
+        # Spans draw randomness only when the regime is in use, so p_spans = 0 leaves the stream unchanged.
+        if span_set is not None or (reg == SPANS).any():
+            n = self.cfg.n_spans
+            if span_set is not None:
+                on = torch.zeros(n, dtype=torch.bool)
+                on[list(span_set)] = True
+                on = on[None].expand(B, n)
+            else:
+                on = torch.rand(B, n, generator=g, dtype=torch.float64) < self.cfg.span_p
+            vis_spans = on[:, self._span_of] | last
+            visible = torch.where((reg == SPANS)[:, None], vis_spans, visible)
         visible = visible.to(dev) & in_seq
         reg, m_out = reg.to(dev), torch.where(reg == SUFFIX, m_draw, torch.full_like(m_draw, -1)).to(dev)
         return {"ids": torch.where(visible, ids, torch.full_like(ids, self.cfg.mask_id)),

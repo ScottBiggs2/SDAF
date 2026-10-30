@@ -7,6 +7,9 @@
   4. ``z_source=sample`` moments; condition draws are a pure function of the cursor.
   5. Eval rows == the VAE's PositionSet val set; static batches cover each row once.
   6. Halves: A ∩ B = ∅, A ∪ B = all train rows, val untouched.
+  7. D18: W resolves to seq_len (mismatch raises); negative m-bin bounds count from W;
+     ``spans`` is off by default and,
+     when off, draws nothing (span settings cannot change a batch).
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from specdec_af.data.dataset import PositionSet, list_shards, read_split
 from specdec_af.ldm.data import (
     HOLES,
     NULL,
+    SPANS,
     SUFFIX,
     ConditionConfig,
     ConditionSampler,
@@ -27,6 +31,7 @@ from specdec_af.ldm.data import (
     condition_batch,
     describe_condition,
     half_mask,
+    resolve_window,
     z_from,
 )
 from specdec_af.models.chunk_index import SLOT_OFFSETS, TERMINAL_BLOCK
@@ -113,16 +118,18 @@ def test_m_semantics_per_regime():
 
 
 def test_regime_and_m_frequencies():
-    W, B = 128, 100_000
+    W, B = 256, 100_000  # D18: W = seq_len
     seq = torch.zeros(B, 256, dtype=torch.long)
     pos = torch.full((B,), 255)
     c = _sampler(W).sample(seq, pos, generator=batch_generator(3, 0, 0))
-    freq = torch.bincount(c["regime"], minlength=3).double() / B
-    assert torch.allclose(freq, torch.tensor([0.10, 0.75, 0.15], dtype=torch.float64), atol=0.006)
+    freq = torch.bincount(c["regime"], minlength=4).double() / B
+    assert torch.allclose(freq, torch.tensor([0.10, 0.75, 0.15, 0.0], dtype=torch.float64), atol=0.006)
     m = c["m"][c["regime"] == SUFFIX]
-    bins = torch.stack([(m == 0), (m >= 1) & (m <= 8), (m >= 9) & (m <= 64), (m == W - 1)]).double().mean(-1)
+    bins = torch.stack([(m == 0), (m >= 1) & (m <= 8), (m >= 9) & (m <= W - 2), (m == W - 1)]).double().mean(-1)
     assert torch.allclose(bins, torch.tensor([0.15, 0.45, 0.25, 0.15], dtype=torch.float64), atol=0.008)
-    assert set(m.unique().tolist()) <= {0, *range(1, 9), *range(9, 65), W - 1}
+    assert set(m.unique().tolist()) <= {0, *range(1, W)}
+    mid = m[(m >= 9) & (m <= W - 2)]  # the bin tracks W: uniform over 9..W-2, no gap below full context
+    assert mid.max() == W - 2 and abs(float((mid > 64).double().mean()) - (W - 2 - 64) / (W - 2 - 8)) < 0.02
     small = m[(m >= 1) & (m <= 8)]
     assert torch.bincount(small, minlength=9)[1:].min() > 0.9 * len(small) / 8  # uniform within the bin
     holes = c["visible"][c["regime"] == HOLES, :-1].double().mean()
@@ -196,3 +203,40 @@ def test_describe_condition(gpt2_tokenizer, table):
                                  regime="suffix", m=2)
     txt = describe_condition(c["ids"][0], c["visible"][0], gpt2_tokenizer)
     assert txt.startswith("[M]" * (W_SMALL - 3)) and "[M]" not in txt[3 * (W_SMALL - 3):]
+
+
+def test_window_locked_to_seq_len():
+    assert resolve_window({}, 256)["W"] == 256
+    assert resolve_window({"W": 256, "p_null": 0.2}, 256) == {"W": 256, "p_null": 0.2}
+    with pytest.raises(ValueError, match="locked"):
+        resolve_window({"W": 128}, 256)
+    with pytest.raises(ValueError, match="unresolved"):
+        ConditionSampler(ConditionConfig())
+    assert ConditionConfig().p_spans == 0.0
+
+
+def test_spans_off_by_default_draws_nothing():
+    seq = torch.randint(0, 50257, (64, W_FULL), generator=torch.Generator().manual_seed(0))
+    pos = torch.randint(4, W_FULL, (64,), generator=torch.Generator().manual_seed(1))
+    a = _sampler(W_FULL).sample(seq, pos, generator=batch_generator(0, 0, 0))
+    b = _sampler(W_FULL, n_spans=4, span_p=0.9).sample(seq, pos, generator=batch_generator(0, 0, 0))
+    assert (a["regime"] != SPANS).all()
+    for k in ("ids", "visible", "regime", "m"):
+        assert torch.equal(a[k], b[k])
+
+
+def test_spans_regime():
+    W, n = W_FULL, 4
+    seq = torch.randint(0, 50257, (512, W), generator=torch.Generator().manual_seed(0))
+    pos = torch.full((512,), W - 1)
+    s = _sampler(W, p_null=0.0, p_suffix=0.0, p_holes=0.0, p_spans=1.0, n_spans=n)
+    c = s.sample(seq, pos, generator=batch_generator(0, 0, 0))
+    assert (c["regime"] == SPANS).all() and (c["m"] == -1).all() and c["visible"][:, -1].all()
+    vis = c["visible"].view(512, n, W // n)
+    assert (vis[:, :-1] == vis[:, :-1, :1]).all()            # constant within each full span
+    assert (vis[:, -1, :-1] == vis[:, -1, :1]).all()            # last span, bar the forced x_T slot
+    assert abs(vis[:, :, 0].float().mean().item() - 0.5) < 0.05
+    fixed = s.sample(seq[:2], pos[:2], generator=batch_generator(0, 0, 1), regime="spans", span_set=[1, 3])
+    want = torch.zeros(W, dtype=torch.bool)
+    want[W // n:2 * W // n] = want[3 * W // n:] = True
+    assert torch.equal(fixed["visible"], want.expand(2, W))

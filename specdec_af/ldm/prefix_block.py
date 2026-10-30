@@ -121,8 +121,9 @@ class DDiTBlock(nn.Module):
         self.rotary_interleaved = rotary_interleaved  # Gate-2 broken control only
         self.mod_order = tuple(mod_order)             # Gate-2 broken control only
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, c: Tensor) -> Tensor:
-        """``x`` ``[B, S, dim]``, ``c`` ``[B, cond_dim]`` or ``[cond_dim]``."""
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, c: Tensor, key_mask: Tensor | None = None) -> Tensor:
+        """``x`` ``[B, S, dim]``, ``c`` ``[B, cond_dim]`` or ``[cond_dim]``, ``key_mask [B, S]`` bool
+        (True = attend; None = MDLM's own unmasked attention)."""
         B, S, _ = x.shape
         mod = self.adaLN_modulation(c.reshape(-1, c.shape[-1]))[:, None].chunk(6, dim=2)
         shift1, scale1, gate1, shift2, scale2, gate2 = (mod[i] for i in self.mod_order)
@@ -132,7 +133,8 @@ class DDiTBlock(nn.Module):
         q = apply_rotary(qkv[:, :, 0], cos, sin, interleaved=self.rotary_interleaved)
         k = apply_rotary(qkv[:, :, 1], cos, sin, interleaved=self.rotary_interleaved)
         v = qkv[:, :, 2]
-        a = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        am = None if key_mask is None else key_mask[:, None, None, :]
+        a = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=am)
         x = x + gate1 * self.attn_out(a.transpose(1, 2).reshape(B, S, self.dim))
         return x + gate2 * self.mlp(self.norm2(x) * (1 + scale2) + shift2)
 
@@ -255,9 +257,10 @@ class MDLMBlock0Encoder(nn.Module):
         enc._freeze()
         return enc
 
-    def forward(self, ids: Tensor) -> Tensor:
+    def forward(self, ids: Tensor, key_mask: Tensor | None = None) -> Tensor:
+        """``key_mask [B, W]`` bool drops absent (pre-start) slots from the attention keys (D18)."""
         cos, sin = rotary_cos_sin(ids.shape[1], self.hidden_dim // self.n_heads, device=ids.device)
-        return self.block(self.vocab_embed(ids), cos, sin, self.c)
+        return self.block(self.vocab_embed(ids), cos, sin, self.c, key_mask)
 
 
 class MDLMFull(nn.Module):

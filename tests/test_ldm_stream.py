@@ -51,7 +51,7 @@ def _cfg(tokens_path, ldm_latents, trained_run, **kw) -> LDMTrainConfig:
     base = dict(latents_dir=str(ldm_latents), vae_checkpoint=str(trained_run["checkpoint"]), data_source="stream",
                 batch_size=8, lr=1e-3, lr_warmup_steps=2, ema_decay=0.9, n_steps=6, val_every_steps=0,
                 val_positions=16, val_max_positions=8, checkpoint_every_steps=0, log_every=1, seed=0,
-                condition={"W": 16},
+                condition={},
                 encoder=dict(init="random", vocab_size=50258, hidden_dim=32, n_heads=4, cond_dim=8),
                 dit=dict(depth=2, d_model=32, n_heads=4),
                 stream=dict(tokens_path=str(tokens_path), seqs_per_chunk=K, micro_bs=2, round_fp16=True, seed=3,

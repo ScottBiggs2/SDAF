@@ -19,6 +19,13 @@ Each block (PixArt-α ordering):
   3. adaLN-Zero(c_tok) → SwiGLU MLP → gated residual.
 Final: adaLN(shift, scale) → zero-init ``Linear(d, d_latent)`` → v. At init v ≡ 0.
 
+**Pre-start slots** (D18, ``mask_prestart``): slot j holds position T−W+1+j;
+slots with a negative position do not exist, so they are masked out of the
+cross-attention keys (and, via :class:`LatentLDM`, out of the encoder's
+attention). "Absent" stays distinct from "hidden" ([MASK] inside the
+sequence, which is attended). Null rows keep every slot: masking by T would
+leak T into the unconditional branch.
+
 ``self_attn_mask="diag"`` makes blocks independent given the condition (the
 Stage-7 per-block baseline). Interp hooks: ``return_attn`` (manual attention
 path; self ``[B, H, 12, 12]`` and cross ``[B, H, 12, W]`` per layer) and
@@ -52,8 +59,9 @@ class DiTConfig:
     mlp_hidden: int | None = None
     d_cond: int = 768        # encoder hidden size
     n_positions: int = 256   # T ∈ [0, n_positions); row n_positions = null
-    ctx_len: int = 128       # condition window W (slot W-1 = x_T)
+    ctx_len: int = 256       # condition window W (slot W-1 = x_T); D18: = seq_len
     self_attn_mask: str = "full"
+    mask_prestart: bool = True  # D18; checkpoints saved before it load with False
 
     @classmethod
     def from_dict(cls, d: dict | None, **over) -> "DiTConfig":
@@ -69,7 +77,7 @@ def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 def _attend(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None, return_attn: bool):
-    """``q`` ``[B, H, Sq, Dh]``; ``mask`` bool ``[Sq, Sk]`` (True = attend)."""
+    """``q`` ``[B, H, Sq, Dh]``; ``mask`` bool, broadcastable to ``[B, H, Sq, Sk]`` (True = attend)."""
     if not return_attn:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask), None
     s = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
@@ -102,13 +110,14 @@ class CrossAttention(nn.Module):
         self.v = nn.Linear(d_kv, d)
         self.out = nn.Linear(d, d)
 
-    def forward(self, x: Tensor, ctx: Tensor, return_attn: bool):
+    def forward(self, x: Tensor, ctx: Tensor, key_mask: Tensor | None, return_attn: bool):
+        """``key_mask [B, W]`` bool (True = attend) or None."""
         B, S, d = x.shape
         W = ctx.shape[1]
         q = self.q(x).view(B, S, self.h, -1).transpose(1, 2)
         k = self.k(ctx).view(B, W, self.h, -1).transpose(1, 2)
         v = self.v(ctx).view(B, W, self.h, -1).transpose(1, 2)
-        o, p = _attend(q, k, v, None, return_attn)
+        o, p = _attend(q, k, v, None if key_mask is None else key_mask[:, None, None, :], return_attn)
         return self.out(o.transpose(1, 2).reshape(B, S, d)), p
 
 
@@ -135,14 +144,22 @@ class DiTBlock(nn.Module):
         self.mlp = SwiGLU(d, cfg.hidden)
         self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(d, 6 * d))
 
-    def forward(self, x: Tensor, c: Tensor, ctx: Tensor, mask: Tensor | None, return_attn: bool):
+    def forward(self, x: Tensor, c: Tensor, ctx: Tensor, mask: Tensor | None, return_attn: bool,
+                key_mask: Tensor | None = None):
         sh1, sc1, g1, sh2, sc2, g2 = self.adaLN(c).chunk(6, dim=-1)
         a, p_self = self.attn(_modulate(self.norm1(x), sh1, sc1), mask, return_attn)
         x = x + g1 * a
-        ca, p_cross = self.cross(self.norm2(x), ctx, return_attn)
+        ca, p_cross = self.cross(self.norm2(x), ctx, key_mask, return_attn)
         x = x + ca
         x = x + g2 * self.mlp(_modulate(self.norm3(x), sh2, sc2))
         return x, p_self, p_cross
+
+
+def slot_exists(T: Tensor, null: Tensor, W: int) -> Tensor:
+    """``[B, W]`` bool: slot j holds position T−W+1+j ≥ 0 (the sampler's ``in_seq``); all True for
+    null rows, whose T is dropped."""
+    j = torch.arange(W, device=T.device)
+    return (T[:, None] - (W - 1) + j >= 0) | null[:, None]
 
 
 def _pool(ctx: Tensor, visible: Tensor | None) -> Tensor:
@@ -208,6 +225,9 @@ class LatentDiT(nn.Module):
             raise ValueError(f"ctx window {ctx.shape[1]} != DiTConfig.ctx_len {self.cfg.ctx_len}")
         if t.dim() == 1:
             t = t[:, None].expand(B, n)
+        key_mask = slot_exists(T, null, self.cfg.ctx_len) if self.cfg.mask_prestart else None
+        if visible is None:
+            visible = key_mask  # no pooling mask given: pool over the slots that exist
         T_idx = torch.where(null, torch.full_like(T, self.cfg.n_positions), T)
         c = (self.t_embed(1000.0 * t.reshape(-1)).view(B, n, -1)
              + self.T_embed(T_idx)[:, None] + self.pool_proj(_pool(ctx, visible))[:, None])
@@ -215,7 +235,7 @@ class LatentDiT(nn.Module):
         x = self.in_proj(z_t) + self.depth_embed
         aux = {"self_attn": [], "cross_attn": [], "resid": [x], "delta": []} if (return_attn or return_resid) else None
         for blk in self.blocks:
-            x_new, p_self, p_cross = blk(x, c, ctx, self.attn_mask, return_attn)
+            x_new, p_self, p_cross = blk(x, c, ctx, self.attn_mask, return_attn, key_mask)
             if aux is not None:
                 if return_attn:
                     aux["self_attn"].append(p_self)
@@ -237,13 +257,17 @@ class LatentLDM(nn.Module):
         super().__init__()
         self.encoder, self.dit, self.mask_id = encoder, dit, mask_id
 
-    def encode(self, ids: Tensor) -> Tensor:
+    def encode(self, cond: dict) -> Tensor:
+        """Encoder states for ``cond``; pre-start slots are masked out of its attention (D18)."""
+        key_mask = None
+        if self.dit.cfg.mask_prestart:
+            key_mask = slot_exists(cond["T"], ~cond["visible"].any(-1), cond["ids"].shape[1])
         with torch.set_grad_enabled(torch.is_grad_enabled() and getattr(self.encoder, "trainable", False)):
-            return self.encoder(ids)
+            return self.encoder(cond["ids"], key_mask=key_mask)
 
     def forward(self, z_t: Tensor, t: Tensor, cond: dict, *, ctx: Tensor | None = None,
                 dit: LatentDiT | None = None, **kw):
-        ctx = self.encode(cond["ids"]) if ctx is None else ctx
+        ctx = self.encode(cond) if ctx is None else ctx
         null = ~cond["visible"].any(-1)
         return (dit or self.dit)(z_t, t, ctx, cond["T"], null, visible=cond["visible"], **kw)
 
@@ -256,11 +280,11 @@ class LatentLDM(nn.Module):
                dit: LatentDiT | None = None) -> Tensor:
         """Euler ODE t = 1 → 0 from ``noise`` (fixed noise gives paired comparisons).
         ``cfg_w = 1`` is the plain conditional model; ``dit`` overrides (e.g. EMA weights)."""
-        ctx = self.encode(cond["ids"])
+        ctx = self.encode(cond)
         if cfg_w == 1.0:
             return euler_sample(lambda x, t: self(x, t, cond, ctx=ctx, dit=dit), noise, steps=steps)
         nc = self.null_cond(cond)
-        ctx_null = self.encode(nc["ids"])
+        ctx_null = self.encode(nc)
 
         def v(x, t):
             return cfg_combine(self(x, t, cond, ctx=ctx, dit=dit), self(x, t, nc, ctx=ctx_null, dit=dit), cfg_w)
