@@ -39,5 +39,8 @@ echo "job=${SLURM_JOB_ID:-?} node=${SLURMD_NODENAME:-?} gpu=${GPU} git=$(git rev
 EXTRA_ARGS=()
 if [[ -f "$VAE_CK" ]]; then EXTRA_ARGS+=(--vae-checkpoint "$VAE_CK"); fi
 if [[ -n "${TOKENS:-}" ]]; then EXTRA_ARGS+=(--tokens "$TOKENS"); fi
+# BENCH_ARGS: extra bench.py flags, e.g. V100: BENCH_ARGS="--only producer vae dit --precisions fp32 --dit-size S"
+# shellcheck disable=SC2206
+if [[ -n "${BENCH_ARGS:-}" ]]; then EXTRA_ARGS+=(${BENCH_ARGS}); fi
 PYTHONPATH=. "$PY" scripts/scale1/bench.py --config "${CONFIG:-configs/scale1.yaml}" --out "$OUT" "${EXTRA_ARGS[@]}"
 echo "s1-bench: DONE → $OUT"

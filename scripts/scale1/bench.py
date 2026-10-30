@@ -62,7 +62,7 @@ def _time(fn, device, *, warmup: int, iters: int) -> dict:
 
 def bench_producer(gpt2, seqs, scfg, device, args) -> list[dict]:
     rows = []
-    for prec in ("fp32", "bf16"):
+    for prec in args.precisions:
         for mbs in args.micro_bs:
             plan = SequencePlan(len(seqs), seqs_per_chunk=args.seqs_per_chunk, seed=0)
             prod = TraceProducer(gpt2, seqs, plan, n_pos=scfg["n_pos"], p_min=scfg["p_min"], seed=0,
@@ -123,7 +123,7 @@ def bench_vae(cn, device, args) -> list[dict]:
     rows = []
     for d in args.d_latent:
         for bs in args.vae_batch:
-            for prec in ("fp32", "bf16"):
+            for prec in args.precisions:
                 vae = build_vae("option_d", cn, device=device, d_latent=d).train()
                 opt = torch.optim.Adam(vae.parameters(), lr=1e-4)
                 x = torch.randn(bs, 9984, device=device) * cn.std.to(device).mean()
@@ -158,7 +158,7 @@ def bench_dit(raw_cfg, seqs, device, args) -> list[dict]:
     for size in args.dit_size:
         for d in args.d_latent:
             for bs in args.dit_batch:
-                for prec in ("fp32", "bf16"):
+                for prec in args.precisions:
                     cfg = LDMTrainConfig.from_raw(raw_cfg, batch_size=bs)
                     cfg.condition = cond
                     cfg.dit = {**cfg.dit, **DIT_SIZES[size]}
@@ -205,6 +205,8 @@ def main() -> int:
     p.add_argument("--vae-checkpoint", default=None, help="parity: also report VAE μ error (e.g. rev7B_optd)")
     p.add_argument("--random-encoder", action="store_true", help="DiT bench without the MDLM download")
     p.add_argument("--only", nargs="+", default=["producer", "parity", "vae", "dit"])
+    p.add_argument("--precisions", nargs="+", default=["fp32", "bf16"], choices=["fp32", "bf16"],
+                   help="V100 has no bf16: pass --precisions fp32 (and drop parity from --only)")
     p.add_argument("--micro-bs", type=int, nargs="+", default=[32, 64, 128])
     p.add_argument("--seqs-per-chunk", type=int, default=256)
     p.add_argument("--chunk-iters", type=int, default=3)
