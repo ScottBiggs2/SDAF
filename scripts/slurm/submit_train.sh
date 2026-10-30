@@ -36,6 +36,7 @@
 #                          BETA_ANNEAL_STEPS) or cache (cache-v2 shards, reproduces rev-7).
 #                          Default: training.data_source in the config (stream).
 #   D_LATENT          — scale-1: latent width per block (default: config vae.d_latent)
+#   BATCH_SIZE        — scale-1: (position, block) items per step (default: config training.batch_size)
 #   OOD_CACHE_DIR     — scale-1: OOD val cache for inflight/ood/* (e.g. the rev-7 WikiText cache_v2)
 #   CONFIG            — scale-1: yaml (default configs/default.yaml; scale-1 runs use configs/scale1.yaml)
 #   PRECISION         — scale-1: fp32 | bf16 train forward (default: config)
@@ -125,6 +126,7 @@ if [[ -n "${DATA_SOURCE:-}" ]]; then EXTRA_ARGS+=(--data-source "$DATA_SOURCE");
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
 if [[ -n "${D_LATENT:-}" ]]; then EXTRA_ARGS+=(--d-latent "$D_LATENT"); fi
+if [[ -n "${BATCH_SIZE:-}" ]]; then EXTRA_ARGS+=(--batch-size "$BATCH_SIZE"); fi
 if [[ -n "${PRECISION:-}" ]]; then EXTRA_ARGS+=(--precision "$PRECISION"); fi
 if [[ -n "${INFLIGHT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--inflight-every-steps "$INFLIGHT_EVERY_STEPS"); fi
 if [[ -n "${OOD_CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--ood-cache-dir "$OOD_CACHE_DIR"); fi

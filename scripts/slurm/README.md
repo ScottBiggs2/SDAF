@@ -100,6 +100,46 @@ RUN_NAME=rev8_mu sbatch scripts/slurm/submit_eval_ldm.sh
 python -m specdec_af.ldm.evaluate_ldm compare $SCRATCH/specdec_af/outputs/ldm/{rev8_mu,rev8_sample}/eval_step50000
 ```
 
+## Scale-1 series (`configs/scale1.yaml`)
+
+~2B tokens (FineWeb-Edu + OWT), d128 vs d256 VAE, a DiT per arm, μ-vs-sample on the winner.
+Every training job logs to W&B group `scale1` with in-flight evals (`inflight/*`); every post-hoc
+eval writes `post/*` into its training run. Set once per shell:
+
+```bash
+export WANDB_RUN_GROUP=scale1 CONFIG=configs/scale1.yaml PRECISION=bf16
+```
+
+```bash
+# 1. Corpus (CPU): one job per source, then concat → tokens/s1/{train,val}.npy
+A=$(SOURCE=fineweb_edu sbatch --parsable scripts/slurm/submit_s1_tokenize.sh)
+B=$(SOURCE=owt         sbatch --parsable scripts/slurm/submit_s1_tokenize.sh)
+C=$(CMD=concat sbatch --parsable --dependency=afterok:$A:$B scripts/slurm/submit_s1_tokenize.sh)
+# 2. cache_s1: ChunkNorm refit + 20k train / 10k val positions + round-trip gate
+K=$(sbatch --parsable --dependency=afterok:$C scripts/slurm/submit_s1_cache.sh)
+# 3. Benchmark + bf16 trace parity, once per GPU type → sets batch sizes and step budgets
+sbatch --dependency=afterok:$K scripts/slurm/submit_s1_bench.sh
+sbatch --dependency=afterok:$K --gres=gpu:a100:1 scripts/slurm/submit_s1_bench.sh
+# 4. VAEs (identical schedule; N_STEPS / BETA_ANNEAL_STEPS / BATCH_SIZE from the bench)
+RUN_NAME=S1-vae128 D_LATENT=128 WANDB_TAGS=d128 N_STEPS=... BETA_ANNEAL_STEPS=... sbatch --gres=gpu:h200:1 scripts/slurm/submit_train.sh
+RUN_NAME=S1-vae256 D_LATENT=256 WANDB_TAGS=d256 N_STEPS=... BETA_ANNEAL_STEPS=... sbatch --gres=gpu:h200:1 scripts/slurm/submit_train.sh
+# 5. Post-hoc VAE suite (cache_s1 val, then the WikiText OOD probe) and the latent export
+RUN_NAME=S1-vae128 sbatch scripts/slurm/submit_evaluate.sh
+RUN_NAME=S1-vae128 TAG=vae_ood CACHE_DIR=$SCRATCH/specdec_af/cache_v2 sbatch scripts/slurm/submit_evaluate.sh
+RUN_NAME=S1-vae128 sbatch scripts/slurm/submit_export_latents.sh
+# 6. DiT per arm (μ), then the suite; the winner gets Z_SOURCE=sample
+RUN_NAME=S1-ldm128-mu WANDB_TAGS=d128,mu N_STEPS=... \
+  LATENTS_DIR=$SCRATCH/specdec_af/outputs/latents/S1-vae128 \
+  VAE_CHECKPOINT=$SCRATCH/specdec_af/outputs/train/S1-vae128/checkpoints/final.pt \
+  sbatch --gres=gpu:h200:1 scripts/slurm/submit_train_ldm.sh
+RUN_NAME=S1-ldm128-mu sbatch scripts/slurm/submit_eval_ldm.sh
+# 7. Dossier (anywhere the outputs are visible), then republish the artifact
+python -m specdec_af.analysis.dossier --root $SCRATCH/specdec_af/outputs --tokens-dir $SCRATCH/specdec_af/tokens/s1 --out outputs/scale1
+```
+
+Chain continuations with `--dependency=afterany:<job>` (RESUME=auto). Per-user submit limit: 8 jobs.
+The LDM refuses a VAE checkpoint whose sha or width differs from the latent export.
+
 ## Other tools
 
 ```bash
