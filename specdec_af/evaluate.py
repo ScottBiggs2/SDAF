@@ -251,6 +251,7 @@ def latent_stats(mu: Tensor, logvar: Tensor) -> dict:
         "logvar_mean_block": logvar.mean(dim=(0, 2)).tolist(),
         "kl_block": kl_item.mean(0).tolist(),
         "kl_per_dim_block": (kl_item.mean(0) / d).tolist(),
+        "kl_dim_block": (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean(0).tolist(),  # [J, d]
         "active_units_block": (var_mu > AU_THRESHOLD).sum(-1).tolist(),
         "active_units_threshold": AU_THRESHOLD,
         "spectrum_block": spectra,
@@ -558,6 +559,9 @@ def main() -> int:
                    help="rev-5: cap VAE memory by chunking each forward into this many items")
     p.add_argument("--skip-lm-head", action="store_true", help="omit teacher-agreement metrics")
     p.add_argument("--skip-consistency", action="store_true", help="omit weight-consistency metrics")
+    p.add_argument("--wandb-project", default=None,
+                   help="scale-1: send post/vae/* to the training run (default: $WANDB_PROJECT; 'none' = off)")
+    p.add_argument("--tag", default="vae", help="scale-1: W&B key prefix post/<tag> (e.g. vae_ood)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -584,6 +588,14 @@ def main() -> int:
         plot_consistency(results, out_dir)
     plot_latents(results, out_dir)
     print(f"\noutputs: {out_dir}", flush=True)
+    from specdec_af.analysis.wandb_post import log_posthoc
+    scalars = {sp: {"conditions": r["conditions"],
+                    "latent": {k: r["latent_stats"][k] for k in ("kl_block", "active_units_block")}}
+               for sp, r in results["splits"].items()}
+    url = log_posthoc(Path(args.checkpoint).parent.parent, args.tag, {"step": results["step"], **scalars},
+                      out_dir=out_dir, project=args.wandb_project)
+    if url:
+        print(f"wandb: post/{args.tag}/* → {url}", flush=True)
     return 0
 
 

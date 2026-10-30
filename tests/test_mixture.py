@@ -113,7 +113,8 @@ def test_collect_from_token_array(mixture_root, gpt2, gpt2_tokenizer, tmp_path):
 def test_scale1_config_inherits_default():
     d, s = load_config("configs/default.yaml"), load_config("configs/scale1.yaml")
     assert "base" not in s
-    assert s["vae"] == d["vae"] and s["ldm"] == d["ldm"]
+    assert s["vae"] == d["vae"] and s["ldm"]["dit"] == d["ldm"]["dit"]
+    assert s["ldm"]["training"]["lr"] == d["ldm"]["training"]["lr"] and s["ldm"]["training"]["precision"] == "bf16"
     assert s["stream"]["tokens_path"].endswith("tokens/s1/train.npy")
     assert s["stream"]["micro_bs"] == d["stream"]["micro_bs"]  # merged, not replaced
     assert s["cache_v2"]["seq_len"] == d["cache_v2"]["seq_len"] and s["cache_v2"]["val_shards"] == 11

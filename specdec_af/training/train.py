@@ -194,6 +194,21 @@ class CSVLogger:
         self._fh.close()
 
 
+def git_info() -> dict:
+    """``{git_commit, git_dirty, git_diff_sha}`` of the repo this module lives in (empty if not a checkout)."""
+    import hashlib
+    import subprocess
+    root = Path(__file__).resolve().parents[2]
+    try:
+        run = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True,  # noqa: E731
+                                        timeout=10, check=True).stdout
+        diff = run("diff", "HEAD")
+        return {"git_commit": run("rev-parse", "HEAD").strip(), "git_dirty": bool(diff.strip()),
+                "git_diff_sha": hashlib.sha256(diff.encode()).hexdigest()[:12] if diff.strip() else None}
+    except Exception:
+        return {}
+
+
 class WandbLogger:
     """Thin optional wrapper around ``wandb``; every call is a no-op when disabled.
 
@@ -204,24 +219,69 @@ class WandbLogger:
     """
 
     def __init__(self, project: str | None, *, run_dir: Path, run_name: str,
-                 config: dict, entity: str | None = None) -> None:
+                 config: dict, entity: str | None = None, group: str | None = None,
+                 job_type: str | None = None, tags: list[str] | None = None) -> None:
+        """Scale-1: ``group`` / ``job_type`` / ``tags`` default to ``WANDB_RUN_GROUP`` /
+        ``WANDB_JOB_TYPE`` / ``WANDB_TAGS`` (comma-separated), which the sbatch scripts set;
+        the git commit and dirty state are added to the config."""
         self.run = None
+        self._wandb = None
         if not project:
             return
         try:
             import wandb  # lazy: optional dependency
+            self._wandb = wandb
             id_path = run_dir / "wandb_run_id.txt"
             # Own id generation: wandb.util.generate_id was removed in wandb 0.30.
             run_id = id_path.read_text().strip() if id_path.exists() else uuid.uuid4().hex[:12]
+            env_tags = [t for t in os.environ.get("WANDB_TAGS", "").split(",") if t]
             self.run = wandb.init(
                 project=project, entity=entity or None, name=run_name, id=run_id,
-                resume="allow", config=config, dir=os.environ.get("WANDB_DIR") or str(run_dir),
+                resume="allow", config={**config, **git_info()}, dir=os.environ.get("WANDB_DIR") or str(run_dir),
+                group=group or os.environ.get("WANDB_RUN_GROUP") or None,
+                job_type=job_type or os.environ.get("WANDB_JOB_TYPE") or None,
+                tags=tags if tags is not None else (env_tags or None),
             )
             id_path.write_text(run_id)
+            if getattr(self.run, "url", None):
+                (run_dir / "wandb_url.txt").write_text(self.run.url)  # scale-1: the dossier links runs
             print(f"wandb: logging to {getattr(self.run, 'url', None) or project} (id={run_id})", flush=True)
         except Exception as e:  # never let logging kill a multi-hour job
             print(f"  WARN: wandb disabled ({type(e).__name__}: {e})", flush=True)
             self.run = None
+
+    @classmethod
+    def attach(cls, project: str | None, run_dir: Path, *, entity: str | None = None) -> "WandbLogger":
+        """Scale-1 post-hoc evals: reopen the training run recorded in ``run_dir/wandb_run_id.txt``
+        (no-op logger if there is none), so ``post/*`` lands next to the training curves."""
+        run_dir = Path(run_dir)
+        if not (run_dir / "wandb_run_id.txt").exists():
+            print(f"  WARN: no wandb_run_id.txt in {run_dir}; post-hoc metrics not sent to W&B", flush=True)
+            project = None
+        return cls(project, run_dir=run_dir, run_name=run_dir.name, config={}, entity=entity)
+
+    @property
+    def url(self) -> str | None:
+        return getattr(self.run, "url", None) if self.run is not None else None
+
+    def log_media(self, *, step: int | None = None, images: dict[str, Path] | None = None,
+                  tables: dict[str, tuple[list[str], list[list]]] | None = None,
+                  lines: dict[str, tuple[list, list, str, str]] | None = None) -> None:
+        """Images ``{key: png}``, tables ``{key: (columns, rows)}``, line plots
+        ``{key: (xs, ys, x_label, y_label)}``; one ``log`` call."""
+        if self.run is None:
+            return
+        try:
+            wb = self._wandb
+            data = {k: wb.Image(str(p)) for k, p in (images or {}).items() if Path(p).exists()}
+            data.update({k: wb.Table(columns=list(c), data=[list(r) for r in rows]) for k, (c, rows) in (tables or {}).items()})
+            for k, (xs, ys, xl, yl) in (lines or {}).items():
+                t = wb.Table(columns=[xl, yl], data=[[x, y] for x, y in zip(xs, ys)])
+                data[k] = wb.plot.line(t, xl, yl, title=k)
+            if data:
+                self.run.log(data, step=step) if step is not None else self.run.log(data)
+        except Exception as e:
+            print(f"  WARN: wandb media log failed ({type(e).__name__}: {e})", flush=True)
 
     def log(self, data: dict, step: int) -> None:
         if self.run is None:
@@ -328,6 +388,9 @@ class TrainConfig:
     data_source: str = "cache"             # "cache" (cache-v2 shards) | "stream" (live GPT-2, data/stream.py)
     stream: dict | None = None             # stream config (see stream.STREAM_DEFAULTS); data_source="stream"
     precision: str = "fp32"                # scale-1: "bf16" autocasts the train forward (val stays fp32)
+    inflight_every_steps: int = 0          # scale-1: VAEInflight cadence (0 = off) → inflight/* + inflight.jsonl
+    inflight_positions: int = 2000         # fixed val positions for the in-flight teacher metrics
+    ood_cache_dir: str | None = None       # optional OOD cache (e.g. rev-7 WikiText cache_v2) for inflight/ood/*
 
 
 def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device, d_latent: int = 128) -> TraceVAE:
@@ -500,6 +563,28 @@ def train(
                              "n_params": n_params, "train_items": train_ds.n_items,
                              "val_positions": val_ds.n_positions, "cache_dir": str(cache_dir)})
 
+    inflight = None
+    if cfg.inflight_every_steps > 0:
+        from specdec_af.inflight import VAEInflight
+        if streaming:
+            lm_head = producer.model.lm_head
+        else:
+            from specdec_af.training.overfit_sweep import load_lm_head_only
+            lm_head = load_lm_head_only(device=device)
+        inflight = VAEInflight(cache_dir, lm_head=lm_head, mode=cfg.mode, device=device, free_bits=cfg.free_bits,
+                               n_positions=cfg.inflight_positions, val_shards=val_shards,
+                               ood_cache_dir=cfg.ood_cache_dir)
+
+    def _inflight() -> None:
+        from specdec_af.inflight import append_jsonl
+        t_e = time.time()
+        m = inflight(vae, chunk_norm)
+        m["seconds"] = time.time() - t_e
+        append_jsonl(output_dir / "inflight.jsonl", {"step": step, **m})
+        wb.log({f"inflight/{k}": v for k, v in m.items()}, step=step - 1)
+        print(f"    [inflight @ step {step}] top1={m['val/top1_agreement']:.4f}  kl_total={m['latent/kl_total']:.1f}  "
+              f"floor_dims={m['latent/dims_at_free_bits_floor']}  ({m['seconds']:.0f}s)", flush=True)
+
     t0 = time.time()
     out_of_time = False
     resumed_complete = step >= total_steps
@@ -577,6 +662,8 @@ def train(
                     f"terminal_mse={vmetrics['val_terminal_mse_unnorm']:.4g}",
                     flush=True,
                 )
+            if inflight is not None and (step % cfg.inflight_every_steps == 0 or step == total_steps):
+                _inflight()
 
             if step >= total_steps:
                 break
@@ -708,6 +795,11 @@ def main() -> int:
                         "(default: training.data_source in config, else cache)")
     p.add_argument("--precision", choices=PRECISIONS, default=None,
                    help="scale-1: train-forward precision (default: training.precision in config, else fp32)")
+    p.add_argument("--inflight-every-steps", type=int, default=None,
+                   help="scale-1: in-flight teacher/latent eval cadence (default: training.inflight_every_steps, 0 = off)")
+    p.add_argument("--inflight-positions", type=int, default=None)
+    p.add_argument("--ood-cache-dir", type=str, default=None,
+                   help="scale-1: OOD val cache for inflight/ood/* (default: training.ood_cache_dir)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -750,6 +842,11 @@ def main() -> int:
         data_source=args.data_source or tr.get("data_source", "cache"),
         d_latent=args.d_latent or int(raw_cfg["vae"].get("d_latent", 128)),
         precision=args.precision or tr.get("precision", "fp32"),
+        inflight_every_steps=(args.inflight_every_steps if args.inflight_every_steps is not None
+                              else int(tr.get("inflight_every_steps", 0))),
+        inflight_positions=args.inflight_positions or int(tr.get("inflight_positions", 2000)),
+        ood_cache_dir=(expand_env(args.ood_cache_dir or tr["ood_cache_dir"])
+                       if (args.ood_cache_dir or tr.get("ood_cache_dir")) else None),
     )
     if tcfg.data_source == "stream":
         from specdec_af.data.stream import stream_cfg_from

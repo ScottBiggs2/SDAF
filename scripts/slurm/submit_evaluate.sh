@@ -39,7 +39,13 @@ SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 RUN_NAME="${RUN_NAME:-rev7A_optd}"
 CKPT="${CKPT:-${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/checkpoints/final.pt}"
 SPLITS="${SPLITS:-train val}"
-OUT_DIR="${SCRATCH}/specdec_af/outputs/eval/${RUN_NAME}"
+TAG="${TAG:-vae}"   # scale-1: W&B prefix post/<TAG>; e.g. TAG=vae_ood CACHE_DIR=<rev-7 cache_v2> for the WikiText probe
+OUT_DIR="${OUT_DIR:-${SCRATCH}/specdec_af/outputs/eval/${RUN_NAME}${TAG#vae}}"
+CONFIG="${CONFIG:-configs/default.yaml}"
+export WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"   # scale-1: post-hoc metrics → the training run ("none" = off)
+export WANDB_DIR="${SCRATCH}/specdec_af/wandb"
+export PYTHONNOUSERSITE=1
+PY="$ENV_PREFIX/bin/python"
 
 mkdir -p "${REPO_DIR}/logs"
 
@@ -69,14 +75,16 @@ echo "====================="
 
 EXTRA_ARGS=()
 if [[ -n "${N_POSITIONS:-}" ]]; then EXTRA_ARGS+=(--n-positions "$N_POSITIONS"); fi
+if [[ -n "${CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--cache-dir "$CACHE_DIR"); fi
+EXTRA_ARGS+=(--tag "$TAG")
 if [[ -n "${EVAL_MICRO_BATCH_SIZE:-}" ]]; then
   EXTRA_ARGS+=(--eval-micro-batch-size "$EVAL_MICRO_BATCH_SIZE")
 fi
 
 # shellcheck disable=SC2086
-python -m specdec_af.evaluate \
+"$PY" -m specdec_af.evaluate \
   --checkpoint "$CKPT" \
-  --config configs/default.yaml \
+  --config "$CONFIG" \
   --splits $SPLITS \
   --out "$OUT_DIR" \
   "${EXTRA_ARGS[@]}"

@@ -279,6 +279,37 @@ def _dist(x: torch.Tensor, ref: torch.Tensor, sc: SuiteConfig, device) -> dict:
 
 
 @torch.no_grad()
+def score_conditions(ldm, dit, table: LatentTable, sampler: ConditionSampler, dec: "_Decoded", rows: np.ndarray,
+                     conds: list[tuple[str, dict]], sc: SuiteConfig, device, *, verbose: bool = True):
+    """The suite's paired sampling loop: per condition, sample → latent and decoded scores, next to the
+    VAE floor ``decode(μ)``. Works on in-memory models (post-hoc suite and in-flight eval).
+    Returns ``(accs, floor, real_acc, ref)``; consistency is skipped when ``dec.weights`` is None."""
+    accs = {name: _Acc() for name, _ in conds}
+    floor, real_acc, ref = _Acc(), _Acc(), _Acc()
+    for bi, s in enumerate(range(0, len(rows), sc.batch)):
+        r = rows[s:s + sc.batch]
+        raw = table.raw_batch(r, device)
+        real = cached_chunks(table, r).to(device)
+        teacher = dec.logits(real)
+        mu = raw["mu"]
+        ref.add(mu=mu, z_post=mu + (0.5 * raw["logvar"]).exp()
+                * torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, 10**6 + bi)).to(device))
+        real_acc.add(resid=residual_stream(real).half())
+        if dec.weights is not None:
+            real_acc.cons.append(trace_consistency(real, dec.weights))
+        dec.score(floor, mu, real, teacher)
+        noise = torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, bi)).to(device)
+        for ci, (name, spec) in enumerate(conds):
+            cond = _make_cond(sampler, raw, spec, batch_generator(sc.seed, _TAG_EVAL_COND, bi, ci))
+            z = ldm.sample(cond, noise, steps=sc.steps, cfg_w=sc.cfg_w, dit=dit)
+            accs[name].add(z=z, lat_cos=F.cosine_similarity(z, mu, dim=-1), lat_mse=(z - mu).pow(2).mean(-1))
+            dec.score(accs[name], z, real, teacher)
+        if verbose:
+            print(f"  suite batch {bi + 1}/{-(-len(rows) // sc.batch)}", flush=True)
+    return accs, floor, real_acc, ref
+
+
+@torch.no_grad()
 def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = None, gpt2=None,
                    cache_dir: Path | str | None = None) -> dict:
     """Stage-5 suite on the fixed eval set (plan §6). Samples share noise across conditions (paired).
@@ -308,29 +339,7 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
     dec = _Decoded(loaded["vae"], loaded["chunk_norm"], loaded["mode"], gpt2.lm_head,
                    GPT2Weights.from_model(gpt2, device=device))
 
-    def sample(cond, noise, w=sc.cfg_w):
-        return ldm.sample(cond, noise, steps=sc.steps, cfg_w=w, dit=dit)
-
-    accs = {name: _Acc() for name, _ in conds}
-    floor, real_acc, ref = _Acc(), _Acc(), _Acc()
-    for bi, s in enumerate(range(0, len(rows), sc.batch)):
-        r = rows[s:s + sc.batch]
-        raw = table.raw_batch(r, device)
-        real = cached_chunks(table, r).to(device)
-        teacher = dec.logits(real)
-        mu = raw["mu"]
-        ref.add(mu=mu, z_post=mu + (0.5 * raw["logvar"]).exp()
-                * torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, 10**6 + bi)).to(device))
-        real_acc.add(resid=residual_stream(real).half())
-        real_acc.cons.append(trace_consistency(real, dec.weights))
-        dec.score(floor, mu, real, teacher)
-        noise = torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, bi)).to(device)
-        for ci, (name, spec) in enumerate(conds):
-            cond = _make_cond(sampler, raw, spec, batch_generator(sc.seed, _TAG_EVAL_COND, bi, ci))
-            z = sample(cond, noise)
-            accs[name].add(z=z, lat_cos=F.cosine_similarity(z, mu, dim=-1), lat_mse=(z - mu).pow(2).mean(-1))
-            dec.score(accs[name], z, real, teacher)
-        print(f"  suite batch {bi + 1}/{-(-len(rows) // sc.batch)}", flush=True)
+    accs, floor, real_acc, ref = score_conditions(ldm, dit, table, sampler, dec, rows, conds, sc, device)
 
     mu_val, z_post = ref.cat("mu"), ref.cat("z_post")
     floor_res = {"top1": float(floor.cat("top1").mean()), "top5": float(floor.cat("top5").mean()),
@@ -445,6 +454,37 @@ def _memorization(ck, table, sampler, z_null, mu_val, train_seen, eval_rows, sc,
 # Reporting
 # ----------------------------------------------------------------------
 
+MCURVE_ORDER = ("null", "m0", "m2", "m8", "m32", "mfull", "holes0.1", "shuffled")
+
+
+def suite_table(res: dict) -> tuple[list[str], list[list]]:
+    """Per-condition headline table (the m-curve plus controls) for W&B and the dossier."""
+    cols = ["condition", "top1", "gap_top1", "kl", "latent_cos", "kid_joint", "diversity", "sample_agreement"]
+    rows = []
+    for name in MCURVE_ORDER:
+        c = res["conditions"].get(name)
+        if c is None:
+            continue
+        div = res.get("diversity", {}).get(name, {})
+        kid = c["dist_z"].get("kid_joint", {}).get("mean", float("nan"))
+        rows.append([name, c["top1"], c["gap_top1"], c["kl"], float(np.mean(c["latent_cos_block"])), kid,
+                     div.get("latent_dist", float("nan")), div.get("top1_agreement", float("nan"))])
+    return cols, rows
+
+
+def log_suite_wandb(res: dict, run_dir: Path, out_dir: Path, *, project: str | None = None) -> str | None:
+    from specdec_af.analysis.wandb_post import log_posthoc
+    cols, rows = suite_table(res)
+    curve = [r for r in rows if r[0] in MCURVE_ORDER[:6]]
+    scalars = {"step": res["step"], "floor": res["floor"], "conditioning": res["conditioning"],
+               "memorization": {k: v for k, v in res["memorization"].items() if k != "loss"},
+               "conditions": {c: {k: v for k, v in m.items() if k in ("top1", "top5", "kl", "gap_top1", "gap_kl")}
+                              for c, m in res["conditions"].items()}}
+    return log_posthoc(run_dir, "ldm", scalars, out_dir=out_dir, project=project,
+                       tables={"conditions": (cols, rows)},
+                       lines={"mcurve": ([r[0] for r in curve], [r[1] for r in curve], "condition", "top1")})
+
+
 def write_suite_report(res: dict, out_dir: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -553,6 +593,8 @@ def main() -> int:
     su.add_argument("--batch", type=int, default=250)
     su.add_argument("--seed", type=int, default=0)
     su.add_argument("--out", default=None, help="default: <run_dir>/eval_step<step>")
+    su.add_argument("--wandb-project", default=None,
+                    help="scale-1: send post/ldm/* to the training run (default: $WANDB_PROJECT; 'none' = off)")
     su.add_argument("--cpu", action="store_true")
     cp = sub.add_parser("compare")
     cp.add_argument("paths", nargs="+")
@@ -570,6 +612,9 @@ def main() -> int:
         write_suite_report(res, out)
         print((out / "summary.txt").read_text())
         print(f"wrote {out}")
+        url = log_suite_wandb(res, Path(args.checkpoint).parent.parent, out, project=args.wandb_project)
+        if url:
+            print(f"wandb: post/ldm/* → {url}", flush=True)
         return 0
     res = overfit_eval(args.checkpoint, device=device, steps=args.steps, cfg_w=args.cfg_w, max_rows=args.max_rows)
     _print_overfit(res)

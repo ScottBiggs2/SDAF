@@ -1,0 +1,321 @@
+<title>Scale-1 Dossier</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: one run-sheet column; summary (verdict + runs) first, then methods, then VAE and LDM results. */
+:root {
+  --bg: #f3f5f6; --surface: #fdfdfc; --ink: #15191c; --ink-2: #4b555c; --muted: #77828a;
+  --rule: #dde2e5; --grid: #e8ecee; --accent: #1d6a73;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --good: #1f7a3d; --good-bg: #e3f2e7; --warn: #8a5a00; --warn-bg: #fbefd5; --bad: #b3261e; --bad-bg: #fbe4e2;
+  --idle: #5d6a72; --idle-bg: #e7ebed;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121518; --surface: #1a1d20; --ink: #eceff1; --ink-2: #b4bdc3; --muted: #87939a;
+    --rule: #2c3237; --grid: #262b2f; --accent: #6cc2cc;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --good: #7fd49a; --good-bg: #1d3426; --warn: #f0c066; --warn-bg: #3a2e14; --bad: #f2a29c; --bad-bg: #3d1f1d;
+    --idle: #a3afb6; --idle-bg: #262c30; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121518; --surface: #1a1d20; --ink: #eceff1; --ink-2: #b4bdc3; --muted: #87939a;
+  --rule: #2c3237; --grid: #262b2f; --accent: #6cc2cc;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --good: #7fd49a; --good-bg: #1d3426; --warn: #f0c066; --warn-bg: #3a2e14; --bad: #f2a29c; --bad-bg: #3d1f1d;
+  --idle: #a3afb6; --idle-bg: #262c30; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--f-body); }
+.page { max-width: 68rem; margin: 0 auto; padding-block: 40px 72px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2, h3 { font-family: var(--f-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: -0.005em; }
+h1 { font-size: 2.4rem; line-height: 1.1; }
+h2 { font-size: 1.5rem; line-height: 1.2; }
+h3 { font-size: 1.05rem; line-height: 1.3; font-weight: 500; }
+p { margin: 0; max-width: 66ch; }
+.eyebrow { font: 500 0.72rem/1 var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.mono, td.num, .num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+section { display: grid; gap: 20px; min-width: 0; }
+.sec-head { display: grid; gap: 6px; border-top: 1px solid var(--rule); padding-top: 18px; }
+header.top { display: grid; gap: 14px; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 18px; font: 0.8rem/1.4 var(--f-mono); color: var(--ink-2); }
+.lede { font-size: 1.05rem; color: var(--ink-2); }
+
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 7px; border-radius: 999px;
+  font: 500 0.74rem/1.6 var(--f-mono); white-space: nowrap; }
+.pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.good { color: var(--good); background: var(--good-bg); }
+.pill.warn { color: var(--warn); background: var(--warn-bg); }
+.pill.bad { color: var(--bad); background: var(--bad-bg); }
+.pill.idle { color: var(--idle); background: var(--idle-bg); }
+
+.verdict { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 20px 22px;
+  display: grid; gap: 14px; }
+.verdict .headline { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; }
+.verdict .call { font: 600 1.6rem/1.2 var(--f-display); }
+.checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 12px; }
+.check { display: grid; gap: 6px; min-width: 0; }
+.check ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 0.88rem; }
+.check li { display: flex; justify-content: space-between; gap: 12px; }
+
+.tbl-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { font: 500 0.7rem/1.3 var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+td.num, th.num { text-align: right; }
+tr:last-child td { border-bottom: 0; }
+.key { display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 6px; }
+.key.dash { border-top-style: dashed; }
+
+.methods { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 18px 28px; }
+.methods > div { display: grid; gap: 6px; align-content: start; min-width: 0; }
+.methods p, .methods li { font-size: 0.92rem; color: var(--ink-2); }
+.methods ul { margin: 0; padding-left: 1.1em; display: grid; gap: 3px; }
+
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: 16px; }
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 14px 14px 8px;
+  display: grid; gap: 8px; min-width: 0; position: relative; }
+.chart .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 0.78rem; color: var(--ink-2); }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart svg text { font: 11px var(--f-mono); fill: var(--muted); }
+.tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--surface); border-radius: 4px;
+  padding: 6px 8px; font: 0.74rem/1.45 var(--f-mono); white-space: nowrap; z-index: 2; }
+.tip .sw { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.empty { border: 1px dashed var(--rule); border-radius: 6px; padding: 18px 20px; color: var(--ink-2); font-size: 0.92rem;
+  display: grid; gap: 4px; }
+.empty strong { color: var(--ink); font-weight: 500; }
+.notes { margin: 0; padding-left: 1.1em; display: grid; gap: 6px; color: var(--ink-2); max-width: 70ch; }
+@media (prefers-reduced-motion: no-preference) { .chart path.line { transition: opacity .15s; } }
+</style>
+
+<div class="page" id="app">
+  <header class="top">
+    <span class="eyebrow">SpecDec-AF · GPT-2 activation traces · scale-1 series</span>
+    <h1>Scale-1 Dossier</h1>
+    <p class="lede">Does a 256-wide trace latent beat 128 once both are trained on a 2B-token corpus, judged end to end: VAE, then a prompt-conditioned DiT, then decoded back through GPT-2's head?</p>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <section id="verdict-sec">
+    <div class="sec-head"><span class="eyebrow">Decision</span><h2>Width verdict</h2></div>
+    <div id="verdict"></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="eyebrow">Status</span><h2>Runs</h2></div>
+    <div class="tbl-wrap"><table id="runs"></table></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="eyebrow">Methods</span><h2>Design</h2></div>
+    <div class="methods" id="methods"></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="eyebrow">Stage 1 · trace VAE</span><h2>VAE: d128 vs d256</h2>
+      <p class="muted">In-flight metrics on 2,000 fixed cache_s1 val positions (z = μ, fp32), every 5k steps; the table is the post-hoc suite.</p></div>
+    <div id="vae"></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="eyebrow">Stage 2 · prompt-conditioned DiT</span><h2>Latent diffusion</h2>
+      <p class="muted">Decoded teacher top-1 by condition: null, suffix context m ∈ {0, 2, 8, 32, full}, holes, shuffled. The VAE floor is decode(μ).</p></div>
+    <div id="ldm"></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="eyebrow">Open</span><h2>Open questions</h2></div>
+    <ol class="notes" id="notes"></ol>
+  </section>
+</div>
+
+<script>
+const D = /*__DOSSIER__*/null;
+const $ = (s) => document.querySelector(s);
+const el = (tag, attrs = {}, html = "") => { const e = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); e.innerHTML = html; return e; };
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (v, d = 3) => v == null || Number.isNaN(v) ? "—" : (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString("en-US") : Number(v).toFixed(d));
+const pct = (v) => v == null ? "—" : (100 * v).toFixed(1) + "%";
+const signed = (v, d = 3) => v == null ? "—" : (v > 0 ? "+" : "") + Number(v).toFixed(d);
+const SERIES = { d128: { label: "d128", color: "var(--s1)" }, d256: { label: "d256", color: "var(--s2)" } };
+const arms = ["d128", "d256"];
+
+function pill(status) {
+  const cls = { complete: "good", decided: "good", running: "warn", partial: "warn", pending: "idle", "not started": "idle" }[status] || "idle";
+  return `<span class="pill ${cls}">${esc(status)}</span>`;
+}
+function emptyBox(title, body) { return `<div class="empty"><strong>${esc(title)}</strong><span>${body}</span></div>`; }
+
+/* ---------- header ---------- */
+function renderMeta() {
+  const g = D.git || {};
+  $("#meta").innerHTML = [`generated ${esc(D.generated)}`, g.commit ? `${esc(g.branch)} @ ${esc(g.commit)}` : "", `rule pre-registered 2026-10-29`]
+    .filter(Boolean).map((s) => `<span>${s}</span>`).join("");
+}
+
+/* ---------- verdict ---------- */
+function renderVerdict() {
+  const v = D.verdict, r = v.rule;
+  const ruleTxt = `Primary: ${esc(r.primary)}. Guards: m-curve non-decreasing (tolerance ${r.monotone_tol}), shuffled − full top-1 &lt; ${r.shuffled_minus_full_max}, null-sample joint KID ≤ ${r.null_kid_max_ratio}× the other arm. Within ±${r.tie_band} on the primary, prefer ${esc(r.tie_prefers)} (easier to diffuse).`;
+  if (v.status !== "decided") {
+    $("#verdict").innerHTML = `<div class="verdict"><div class="headline"><span class="call">Pending</span>${pill("pending")}</div>
+      <p>${esc(v.reason)}. The verdict fills in when both μ-arm LDM suites have run.</p><p class="muted">${ruleTxt}</p></div>`;
+    return;
+  }
+  const c = v.checks;
+  const chip = (ok) => ok ? `<span class="pill good">pass</span>` : `<span class="pill bad">fail</span>`;
+  const col = (a) => `<div class="check"><h3><span class="key" style="border-color:${SERIES[a].color}"></span>${a}${v.winner === a ? " · selected" : ""}</h3><ul>
+      <li><span>gap top-1 @ mfull</span><span class="num">${signed(c[a].gap_top1_mfull)}</span></li>
+      <li><span>top-1 @ mfull</span><span class="num">${pct(c[a].top1_mfull)}</span></li>
+      <li><span>m-curve monotone</span>${chip(c[a].monotone)}</li>
+      <li><span>shuffled − full <span class="num">${signed(c[a].shuffled_minus_full)}</span></span>${chip(c[a].shuffle_ok)}</li>
+      <li><span>null KID <span class="num">${fmt(c[a].null_kid, 4)}</span></span>${chip(c[a].kid_ok)}</li>
+      <li><span>VAE val top-1 (secondary)</span><span class="num">${pct(c[a].vae_top1)}</span></li></ul></div>`;
+  $("#verdict").innerHTML = `<div class="verdict"><div class="headline"><span class="call">${v.winner ? "Keep " + esc(v.winner) : "No eligible width"}</span>${pill("decided")}<span class="muted">${esc(v.reason)}</span></div>
+    <div class="checks">${arms.map(col).join("")}</div><p class="muted">${ruleTxt}</p></div>`;
+}
+
+/* ---------- runs ---------- */
+function renderRuns() {
+  const rows = [];
+  for (const a of arms) rows.push(["VAE", a, D.vae[a]]);
+  for (const [k, r] of Object.entries(D.ldm)) rows.push(["DiT", k, r]);
+  const head = `<tr><th>Stage</th><th>Arm</th><th>Run</th><th>Status</th><th class="num">Step</th><th class="num">Wall (h)</th><th>W&amp;B</th></tr>`;
+  $("#runs").innerHTML = head + rows.map(([st, arm, r]) => `<tr><td>${st}</td><td class="mono">${esc(arm)}</td><td class="mono">${esc(r.run)}</td><td>${pill(r.status)}</td>
+    <td class="num">${r.step != null ? fmt(r.step, 0) + (r.n_steps ? " / " + fmt(r.n_steps, 0) : "") : "—"}</td>
+    <td class="num">${r.wall_hours != null ? r.wall_hours.toFixed(1) : "—"}</td>
+    <td>${r.wandb_url ? `<a href="${esc(r.wandb_url)}" target="_blank" rel="noopener">run ↗</a>` : '<span class="muted">—</span>'}</td></tr>`).join("");
+}
+
+/* ---------- methods ---------- */
+function renderMethods() {
+  const c = D.corpus;
+  const corpus = c ? `<p>${fmt(c.train_tokens / 1e9, 2)}B train tokens (${c.train_seq.toLocaleString("en-US")} packed 256-token sequences); ${fmt((c.val_tokens || 0) / 1e6, 1)}M held-out val tokens.</p>
+      <ul>${c.sources.map((s) => `<li><span class="mono">${esc(s.source)}</span>: ${fmt((s.token_end - s.token_start) / 1e9, 2)}B tokens, ${s.n_docs.toLocaleString("en-US")} docs</li>`).join("")}</ul>`
+    : `<p>Target: ~2B tokens, 50/50 FineWeb-Edu (sample-10BT) and OpenWebText. Tokenization has not run yet.</p>`;
+  const blocks = [
+    ["Corpus", corpus + `<p>Documents are joined with &lt;|endoftext|&gt; and packed. ${pct(c ? c.val_frac : 0.005)} of documents go to val by a salted blake2b hash, so train and val share no document.</p>`],
+    ["Traces", `<p>Frozen GPT-2 small; 12 blocks × 9,984 values per position (8 slots per block), 16 positions per sequence drawn from [32, 255], streamed live (fp32 forward, fp16 rounding). Val and the ChunkNorm fit come from cache_s1: 10k val positions plus a 20k-position train slice.</p>`],
+    ["VAE", `<p>Per-block trace VAE, option D (raw decoder output, σ as loss weight). The arms differ only in d_latent (128 vs 256): same β ramp, same per-dim free bits (0.1 nat), same data order. Total KL and the count of dims at the free-bits floor are tracked, since d256 doubles the floor.</p>`],
+    ["DiT", `<p>Rectified-flow DiT over the 12 block latents, conditioned through cross-attention on a masked 256-token prefix window (frozen MDLM block-0 encoder, slot position embeddings, pre-start slots dropped), adaLN-Zero on t. Raw VAE coordinates, z = μ for the width comparison; the winner also gets the posterior-sample arm.</p>`],
+    ["Evaluation", `<ul><li>Teacher top-1, top-5, KL and acceptance through GPT-2's lm_head on the decoded terminal slot</li><li>m-curve: top-1 against visible suffix length</li><li>Latent/residual FD and KID; K-sample diversity; CFG sweep; nearest-neighbour memorization ratio</li><li>OOD probe: rev-7 WikiText-103 val</li></ul>`],
+    ["Compute", D.bench ? `<p>Benchmarked on ${esc(D.bench.gpu)}. bf16 autocast for VAE and DiT training; GPT-2 trace forward kept fp32.</p>` : `<p>Single GPU (Explorer H200 or A100), bf16 autocast for VAE and DiT training; the GPT-2 trace forward stays fp32 pending a parity check. The benchmark has not run yet.</p>`],
+  ];
+  $("#methods").innerHTML = blocks.map(([h, b]) => `<div><h3>${h}</h3>${b}</div>`).join("");
+}
+
+/* ---------- line chart (SVG, one y-scale, hairline grid, hover crosshair) ---------- */
+function lineChart(host, { title, series, yFmt = (v) => fmt(v, 3), xCats = null, yLabel = "" }) {
+  const box = el("div", { class: "chart" });
+  box.appendChild(el("h3", {}, esc(title)));
+  const live = series.filter((s) => s.points.length);
+  if (live.length > 1) box.appendChild(el("div", { class: "legend" }, live.map((s) => `<span><span class="key${s.dash ? " dash" : ""}" style="border-color:${s.color}"></span>${esc(s.label)}</span>`).join("")));
+  host.appendChild(box);
+  if (!live.length) { box.appendChild(el("p", { class: "muted" }, "No points yet.")); return; }
+  const W = 520, H = 220, m = { l: 52, r: 16, t: 10, b: 28 };
+  const xs = live.flatMap((s) => s.points.map((p) => p[0])), ys = live.flatMap((s) => s.points.map((p) => p[1]));
+  let x0 = Math.min(...xs), x1 = Math.max(...xs); if (x0 === x1) { x0 -= 1; x1 += 1; }
+  let y0 = Math.min(...ys), y1 = Math.max(...ys); const pad = (y1 - y0) * 0.08 || Math.abs(y1) * 0.05 || 1; y0 -= pad; y1 += pad;
+  const sx = (x) => m.l + (x - x0) / (x1 - x0) * (W - m.l - m.r), sy = (y) => H - m.b - (y - y0) / (y1 - y0) * (H - m.t - m.b);
+  const ticks = (a, b, n) => { const step = Math.pow(10, Math.floor(Math.log10((b - a) / n))); const k = [1, 2, 5, 10].find((f) => (b - a) / (step * f) <= n) * step; const out = []; for (let v = Math.ceil(a / k) * k; v <= b + 1e-12; v += k) out.push(+v.toPrecision(12)); return out; };
+  let g = "";
+  for (const t of ticks(y0, y1, 4)) g += `<line x1="${m.l}" x2="${W - m.r}" y1="${sy(t)}" y2="${sy(t)}" stroke="var(--grid)" stroke-width="1"/><text x="${m.l - 8}" y="${sy(t) + 4}" text-anchor="end">${yFmt(t)}</text>`;
+  const xt = xCats ? xCats.map((_, i) => i) : ticks(x0, x1, 5);
+  for (const t of xt) if (t >= x0 && t <= x1) g += `<text x="${sx(t)}" y="${H - 8}" text-anchor="middle">${xCats ? esc(xCats[t]) : (t >= 1000 ? (t / 1000) + "k" : t)}</text>`;
+  g += `<line x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}" stroke="var(--rule)" stroke-width="1"/>`;
+  for (const s of live) {
+    const d = s.points.map((p, i) => `${i ? "L" : "M"}${sx(p[0]).toFixed(1)},${sy(p[1]).toFixed(1)}`).join("");
+    const last = s.points[s.points.length - 1];
+    g += `<path class="line" d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${s.dash ? ' stroke-dasharray="5 4"' : ""}/>`;
+    g += `<circle cx="${sx(last[0])}" cy="${sy(last[1])}" r="4" fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+  }
+  g += `<line id="xh" y1="${m.t}" y2="${H - m.b}" stroke="var(--muted)" stroke-width="1" visibility="hidden"/><rect x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/>`;
+  const wrap = el("div", {}, `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(title)}${yLabel ? " (" + esc(yLabel) + ")" : ""}">${g}</svg>`);
+  const svg = wrap.firstElementChild;  // parsed by the HTML parser, so it lands in the SVG namespace
+  box.appendChild(svg);
+  const tip = el("div", { class: "tip", hidden: "" }); box.appendChild(tip);
+  const allX = [...new Set(xs)].sort((a, b) => a - b), xh = svg.querySelector("#xh");
+  svg.addEventListener("pointermove", (ev) => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    const x = allX.reduce((b, v) => Math.abs(sx(v) - px) < Math.abs(sx(b) - px) ? v : b, allX[0]);
+    xh.setAttribute("x1", sx(x)); xh.setAttribute("x2", sx(x)); xh.setAttribute("visibility", "visible");
+    const lines = live.map((s) => { const p = s.points.find((q) => q[0] === x); return p ? `<div><span class="sw" style="background:${s.color}"></span>${esc(s.label)}  ${yFmt(p[1])}</div>` : ""; }).join("");
+    tip.innerHTML = `<div>${xCats ? esc(xCats[x]) : "step " + x.toLocaleString("en-US")}</div>${lines}`; tip.hidden = false;
+    const bx = box.getBoundingClientRect(), left = ev.clientX - bx.left + 12;
+    tip.style.left = Math.min(left, bx.width - tip.offsetWidth - 8) + "px"; tip.style.top = (ev.clientY - bx.top - 10) + "px";
+  });
+  svg.addEventListener("pointerleave", () => { tip.hidden = true; xh.setAttribute("visibility", "hidden"); });
+}
+const pts = (rows, key) => rows.filter((r) => r[key] != null).map((r) => [r.step, r[key]]);
+
+/* ---------- VAE ---------- */
+function renderVAE() {
+  const host = $("#vae"), V = D.vae;
+  if (arms.every((a) => !V[a].inflight.length && !V[a].post)) { host.innerHTML = emptyBox("No VAE results yet", "S1-vae128 and S1-vae256 have not reported. In-flight curves appear after the first 5k steps of either run."); return; }
+  const charts = el("div", { class: "charts" }); host.appendChild(charts);
+  const mk = (title, key, f) => lineChart(charts, { title, yFmt: f, series: arms.map((a) => ({ ...SERIES[a], points: pts(V[a].inflight, key) })) });
+  mk("Val teacher top-1", "val/top1_agreement", pct);
+  mk("OOD (WikiText-103) teacher top-1", "ood/top1_agreement", pct);
+  mk("Total KL (nats per position)", "latent/kl_total", (v) => fmt(v, 0));
+  mk("Latent dims at the free-bits floor", "latent/dims_at_free_bits_floor", (v) => fmt(v, 0));
+  const P = (a) => V[a].post, O = (a) => V[a].post_ood;
+  const rows = [["Teacher top-1", (a) => pct(P(a)?.top1_agreement)], ["Top-5 overlap", (a) => pct(P(a)?.top5_overlap)],
+    ["KL(teacher ‖ student)", (a) => fmt(P(a)?.kl_teacher_student)], ["Acceptance Σ min(p, q)", (a) => pct(P(a)?.acceptance)],
+    ["Min block recon cosine", (a) => fmt(P(a)?.recon_cos_block ? Math.min(...P(a).recon_cos_block) : null)],
+    ["Total KL (nats)", (a) => fmt(P(a)?.kl_total, 0)], ["Active units", (a) => fmt(P(a)?.active_units, 0)],
+    ["OOD teacher top-1", (a) => pct(O(a)?.top1_agreement)], ["Prior-sample top-1", (a) => pct(P(a)?.prior_top1)]];
+  const tw = el("div", { class: "tbl-wrap" });
+  tw.innerHTML = `<table><tr><th>Post-hoc suite (z = μ)</th>${arms.map((a) => `<th class="num"><span class="key" style="border-color:${SERIES[a].color}"></span>${a}</th>`).join("")}</tr>
+    ${rows.map(([n, f]) => `<tr><td>${n}</td>${arms.map((a) => `<td class="num">${f(a)}</td>`).join("")}</tr>`).join("")}</table>`;
+  host.appendChild(el("div", { style: "height:16px" }));
+  host.appendChild(arms.some((a) => P(a)) ? tw : el("div", {}, emptyBox("Post-hoc VAE suite not run", "Runs after training: submit_evaluate.sh on cache_s1 val, plus TAG=vae_ood on the WikiText cache.")));
+}
+
+/* ---------- LDM ---------- */
+function renderLDM() {
+  const host = $("#ldm"), L = D.ldm;
+  const keys = Object.keys(L);
+  const style = (k) => k.endsWith("-sample") ? { label: k, color: "var(--s3)", dash: true } : { ...SERIES[k.slice(0, 4)], label: k };
+  if (keys.every((k) => !L[k].inflight.length && !L[k].post)) { host.innerHTML = emptyBox("No DiT results yet", "The DiT arms start after their VAE finishes and its latents are exported. The in-flight m-curve appears every 5k steps."); return; }
+  const charts = el("div", { class: "charts" }); host.appendChild(charts);
+  const cats = ["null", "m0", "m2", "m8", "m32", "mfull"];
+  lineChart(charts, { title: "m-curve: decoded top-1 by visible context (post-hoc suite)", xCats: cats, yFmt: pct,
+    series: keys.map((k) => { const p = L[k].post; const row = p ? Object.fromEntries(p.rows.map((r) => [r[0], r[1]])) : {}; return { ...style(k), points: cats.map((c, i) => [i, row[c]]).filter((q) => q[1] != null) }; }) });
+  lineChart(charts, { title: "In-flight top-1 at full context", yFmt: pct, series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "top1/mfull") })) });
+  lineChart(charts, { title: "In-flight gap to VAE floor at full context", yFmt: (v) => signed(v), series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "gap_top1/mfull") })) });
+  lineChart(charts, { title: "In-flight shuffled − full top-1 (conditioning)", yFmt: (v) => signed(v), series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "shuffled_minus_full/top1") })) });
+  for (const k of keys.filter((k) => L[k].post)) {
+    const p = L[k].post;
+    const tw = el("div", { class: "tbl-wrap", style: "margin-top:16px" });
+    const numCols = p.columns.slice(1);
+    const f = (c, v) => c === "top1" || c === "sample_agreement" ? pct(v) : c.startsWith("gap") ? signed(v) : fmt(v, 4);
+    tw.innerHTML = `<table><tr><th><span class="key${k.endsWith("-sample") ? " dash" : ""}" style="border-color:${style(k).color}"></span>${esc(k)} · step ${fmt(p.step, 0)} · floor ${pct(p.floor_top1)} · NN ratio ${fmt(p.nn_ratio)}</th>${numCols.map((c) => `<th class="num">${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>
+      ${p.rows.map((r) => `<tr><td class="mono">${esc(r[0])}</td>${r.slice(1).map((v, i) => `<td class="num">${f(numCols[i], v)}</td>`).join("")}</tr>`).join("")}</table>`;
+    host.appendChild(tw);
+  }
+}
+
+/* ---------- notes ---------- */
+function renderNotes() {
+  const notes = [
+    "Primary metric: the rule compares the gap to each arm's own VAE floor at full context. Absolute top-1 is reported next to it; confirm the gap is the intended criterion before both suites land.",
+    "β and free bits are matched per dimension, so d256 carries twice the total free-bits floor. If the verdict is a tie and d256 shows many floor-pinned dims, run one matched-rate d256 control.",
+    "DiT size: both arms use DiT-S for the head-to-head; DiT-B on the winner is the follow-up.",
+  ];
+  for (const a of arms) { const last = D.vae[a].inflight.at(-1); if (last && last["latent/dims_at_free_bits_floor"] > 0) notes.push(`${a}: ${last["latent/dims_at_free_bits_floor"]} latent dims sit at the free-bits floor at step ${last.step.toLocaleString("en-US")}.`); }
+  $("#notes").innerHTML = notes.map((n) => `<li>${esc(n)}</li>`).join("");
+}
+
+if (D) { renderMeta(); renderVerdict(); renderRuns(); renderMethods(); renderVAE(); renderLDM(); renderNotes(); }
+</script>

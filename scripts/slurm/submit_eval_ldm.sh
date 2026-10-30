@@ -32,6 +32,11 @@ REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 RUN_NAME="${RUN_NAME:?set RUN_NAME}"
 CKPT="${CKPT:-${SCRATCH}/specdec_af/outputs/ldm/${RUN_NAME}/checkpoints/final.pt}"
+CONFIG="${CONFIG:-configs/default.yaml}"
+export WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"   # scale-1: post-hoc metrics → the training run ("none" = off)
+export WANDB_DIR="${SCRATCH}/specdec_af/wandb"
+export PYTHONNOUSERSITE=1
+PY="$ENV_PREFIX/bin/python"
 
 mkdir -p "${REPO_DIR}/logs"
 export HF_HOME="${SCRATCH}/huggingface_cache"
@@ -59,6 +64,6 @@ if [[ -n "${CFG_W:-}" ]]; then EXTRA_ARGS+=(--cfg-w "$CFG_W"); fi
 if [[ -n "${WEIGHTS:-}" ]]; then EXTRA_ARGS+=(--weights "$WEIGHTS"); fi
 if [[ -n "${OUT:-}" ]]; then EXTRA_ARGS+=(--out "$OUT"); fi
 
-python -m specdec_af.ldm.evaluate_ldm suite --checkpoint "$CKPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+"$PY" -m specdec_af.ldm.evaluate_ldm suite --checkpoint "$CKPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
 echo "ldm-eval: DONE  RUN_NAME=$RUN_NAME"

@@ -27,6 +27,12 @@
 #   MAX_WALL_MINUTES  — checkpoint + exit cleanly (default 225 under the 4h limit)
 #   WANDB_PROJECT     — default specdec-af-gpt2 ("none" disables)
 #   OVERFIT_EVAL      — 1: run `evaluate_ldm overfit` on final.pt after training
+#   LATENTS_DIR / VAE_CHECKPOINT — scale-1: the arm's latent export and frozen VAE (must match; checked)
+#   CONFIG            — scale-1: yaml (default configs/default.yaml; scale-1 runs use configs/scale1.yaml)
+#   PRECISION         — scale-1: fp32 | bf16 train forward (default: config)
+#   INFLIGHT_EVERY_STEPS — scale-1: in-flight eval cadence → inflight/* in W&B + inflight.jsonl (default: config, 0 = off)
+#   WANDB_RUN_GROUP / WANDB_TAGS (comma-sep) / WANDB_JOB_TYPE — scale-1: W&B run organisation (read by WandbLogger)
+#   GPU type: override the #SBATCH line, e.g. sbatch --gres=gpu:h200:1 (or a100) ...
 #
 # Examples:
 #   # Stage-4 overfit smoke (Gate 4)
@@ -49,6 +55,10 @@ RESUME="${RESUME:-auto}"
 MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-225}"
 WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"
 OVERFIT_EVAL="${OVERFIT_EVAL:-0}"
+CONFIG="${CONFIG:-configs/default.yaml}"
+export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-ldm}"
+export PYTHONNOUSERSITE=1
+PY="$ENV_PREFIX/bin/python"
 
 mkdir -p "${REPO_DIR}/logs"
 export HF_HOME="${SCRATCH}/huggingface_cache"
@@ -72,6 +82,9 @@ echo "RUN_NAME=$RUN_NAME  N_STEPS=${N_STEPS:-(config)}  DATA_SOURCE=${DATA_SOURC
 echo "Z_SOURCE=${Z_SOURCE:-(config)}  TRAIN_HALF=${TRAIN_HALF:-(config)}  MAX_TRAIN_ROWS=${MAX_TRAIN_ROWS:-(config)}"
 echo "CONDITION_PRESET=${CONDITION_PRESET:-default}  SELF_ATTN_MASK=${SELF_ATTN_MASK:-(config)}  EMA_DECAY=${EMA_DECAY:-(config)}"
 echo "RESUME=$RESUME  MAX_WALL_MINUTES=$MAX_WALL_MINUTES  WANDB_PROJECT=$WANDB_PROJECT  OVERFIT_EVAL=$OVERFIT_EVAL"
+echo "CONFIG=$CONFIG  PRECISION=${PRECISION:-(config)}  INFLIGHT_EVERY_STEPS=${INFLIGHT_EVERY_STEPS:-(config)}"
+echo "LATENTS_DIR=${LATENTS_DIR:-(config)}  VAE_CHECKPOINT=${VAE_CHECKPOINT:-(config)}"
+echo "WANDB_RUN_GROUP=${WANDB_RUN_GROUP:-}  WANDB_TAGS=${WANDB_TAGS:-}  WANDB_JOB_TYPE=$WANDB_JOB_TYPE"
 echo "====================="
 
 EXTRA_ARGS=()
@@ -90,14 +103,18 @@ if [[ -n "${VAL_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--val-every-steps "$VAL_EV
 if [[ -n "${CHECKPOINT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--checkpoint-every-steps "$CHECKPOINT_EVERY_STEPS"); fi
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
+if [[ -n "${PRECISION:-}" ]]; then EXTRA_ARGS+=(--precision "$PRECISION"); fi
+if [[ -n "${INFLIGHT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--inflight-every-steps "$INFLIGHT_EVERY_STEPS"); fi
+if [[ -n "${LATENTS_DIR:-}" ]]; then EXTRA_ARGS+=(--latents-dir "$LATENTS_DIR"); fi
+if [[ -n "${VAE_CHECKPOINT:-}" ]]; then EXTRA_ARGS+=(--vae-checkpoint "$VAE_CHECKPOINT"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
 if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 
-python -m specdec_af.ldm.train_ldm --config configs/default.yaml --run-name "$RUN_NAME" "${EXTRA_ARGS[@]}"
+"$PY" -m specdec_af.ldm.train_ldm --config "$CONFIG" --run-name "$RUN_NAME" "${EXTRA_ARGS[@]}"
 
 FINAL="${SCRATCH}/specdec_af/outputs/ldm/${RUN_NAME}/checkpoints/final.pt"
 if [[ "$OVERFIT_EVAL" == "1" && -f "$FINAL" ]]; then
-  python -m specdec_af.ldm.evaluate_ldm overfit --checkpoint "$FINAL"
+  "$PY" -m specdec_af.ldm.evaluate_ldm overfit --checkpoint "$FINAL"
 fi
 
 echo "ldm: DONE  RUN_NAME=$RUN_NAME"

@@ -25,6 +25,9 @@ SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 
 RUN_NAME="${RUN_NAME:?set RUN_NAME}"
 CKPT="${CKPT:-${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/checkpoints/final.pt}"
+CONFIG="${CONFIG:-configs/default.yaml}"   # scale-1: configs/scale1.yaml exports cache_s1 (20k train + 10k val rows)
+export PYTHONNOUSERSITE=1
+PY="$ENV_PREFIX/bin/python"
 
 mkdir -p "${REPO_DIR}/logs"
 export SCRATCH
@@ -44,10 +47,10 @@ echo "git=$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 echo "RUN_NAME=$RUN_NAME  CKPT=$CKPT"
 echo "====================="
 
-python -m specdec_af.export_latents \
+"$PY" -m specdec_af.export_latents \
   --checkpoint "$CKPT" \
   --run-name "$RUN_NAME" \
-  --config configs/default.yaml
+  --config "$CONFIG"
 
 du -sh "${SCRATCH}/specdec_af/outputs/latents/${RUN_NAME}"
 echo "export: DONE  RUN_NAME=$RUN_NAME"

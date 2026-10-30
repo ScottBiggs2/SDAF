@@ -26,3 +26,20 @@ cache_v2:                 # cache_s1 = 1,250 train seqs (20k pos, memorization /
 stream:
   tokens_path: "${SCRATCH:-./outputs}/specdec_af/tokens/s1/train.npy"
   seed: 1302
+  gpt2_precision: fp32    # bf16 GPT-2 forward is off: parity check pending (CPU smoke: ~34× the fp16 floor at block 11)
+
+training:                 # VAE. batch_size / n_steps / beta_anneal_steps: set from the S1-bench results (TBD)
+  precision: bf16         # train forward only; val + in-flight + post-hoc evals stay fp32
+  inflight_every_steps: 5000
+  inflight_positions: 2000
+  ood_cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache_v2"   # rev-7 WikiText-103 val → inflight/ood/*
+
+ldm:
+  training:
+    precision: bf16
+    inflight_every_steps: 5000
+    inflight_positions: 512
+    inflight_sampler_steps: 25
+
+logging:
+  wandb_project: specdec-af-gpt2

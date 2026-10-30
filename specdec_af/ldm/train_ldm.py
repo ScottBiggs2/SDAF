@@ -112,6 +112,10 @@ class LDMTrainConfig:
     sampler: dict = field(default_factory=dict)
     stream: dict | None = None
     precision: str = "fp32"                # scale-1: "bf16" autocasts the train forward (val / eval stay fp32)
+    inflight_every_steps: int = 0          # scale-1: LDMInflight cadence (0 = off) → inflight/* + inflight.jsonl
+    inflight_positions: int = 512          # fixed val subset for the in-flight m-curve
+    inflight_sampler_steps: int = 25       # Euler steps for in-flight samples (post-hoc suite uses sampler.steps)
+    inflight_weights: str = "ema"          # "ema" (what the suite scores; lags early at decay 0.9999) | "raw"
 
     @classmethod
     def from_raw(cls, raw_cfg: dict, **over) -> "LDMTrainConfig":
@@ -207,7 +211,7 @@ class Validator:
             sel = (t >= lo) & (t < hi)
             out[f"loss_t{lo:.1f}-{min(hi, 1.0):.1f}"] = float(loss[sel].mean()) if sel.any() else float("nan")
         bk = np.array(buckets)
-        for name in ("null", "m0", "m1-8", "m9-64", "m65+", "mfull", "holes"):
+        for name in ("null", "m0", "m1-8", "m9-64", "m65+", "mfull", "holes", "spans"):
             sel = torch.from_numpy(bk == name)
             if sel.any():
                 out[f"loss_{name}"] = float(loss[sel].mean())
@@ -367,6 +371,32 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
                            resume_step=step if resume_path is not None else None)
     wb = WandbLogger(cfg.wandb_project, entity=cfg.wandb_entity, run_dir=output_dir, run_name=output_dir.name,
                      config={**asdict(cfg), "n_params": n_params, "steps_per_epoch": steps_per_epoch})
+    inflight = None
+    if cfg.inflight_every_steps > 0:
+        from specdec_af.inflight import LDMInflight
+        from specdec_af.training.checkpoint import load_vae_checkpoint
+        if producer is not None:
+            lm_head = producer.model.lm_head
+        else:
+            from specdec_af.training.overfit_sweep import load_lm_head_only
+            lm_head = load_lm_head_only(device=device)
+        vl = load_vae_checkpoint(cfg.vae_checkpoint, device=device)
+        inflight = LDMInflight(table, sampler, vae=vl["vae"], chunk_norm=vl["chunk_norm"], mode=vl["mode"],
+                               lm_head=lm_head, device=device, n_positions=cfg.inflight_positions,
+                               steps=cfg.inflight_sampler_steps, seed=cfg.seed)
+
+    def _inflight() -> None:
+        from specdec_af.inflight import append_jsonl, mcurve
+        t_e = time.time()
+        m = inflight(ldm, ema if cfg.inflight_weights == "ema" else ldm.dit)
+        m["seconds"] = time.time() - t_e
+        append_jsonl(output_dir / "inflight.jsonl", {"step": step, **m})
+        wb.log({f"inflight/{k}": v for k, v in m.items()}, step=step - 1)
+        xs, ys = mcurve(m)
+        wb.log_media(step=step - 1, lines={"inflight/mcurve": (xs, ys, "condition", "top1")})
+        print(f"    [inflight @ step {step}] " + "  ".join(f"{x}={y:.3f}" for x, y in zip(xs, ys))
+              + f"  shuf-full={m['shuffled_minus_full/top1']:+.3f}  ({m['seconds']:.0f}s)", flush=True)
+
     fl = cfg.flow
     out_of_time = False
     resumed_complete = step >= cfg.n_steps
@@ -414,6 +444,8 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
 
             if cfg.val_every_steps > 0 and step % cfg.val_every_steps == 0:
                 _validate()
+            if inflight is not None and (step % cfg.inflight_every_steps == 0 or step == cfg.n_steps):
+                _inflight()
             if step >= cfg.n_steps:
                 break
             if cfg.checkpoint_every_steps > 0 and step % cfg.checkpoint_every_steps == 0:
@@ -489,6 +521,8 @@ def main() -> int:
     p.add_argument("--max-wall-minutes", type=float, default=None)
     p.add_argument("--wandb-project", default=None, help="'none' disables")
     p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--inflight-every-steps", type=int, default=None,
+                   help="scale-1: in-flight m-curve eval cadence (default: ldm.training.inflight_every_steps, 0 = off)")
     p.add_argument("--precision", choices=PRECISIONS, default=None,
                    help="scale-1: train-forward precision (default: ldm.training.precision, else fp32)")
     p.add_argument("--cpu", action="store_true")
@@ -505,6 +539,7 @@ def main() -> int:
         max_wall_seconds=args.max_wall_minutes * 60 if args.max_wall_minutes else None,
         wandb_project=None if not wandb_project or str(wandb_project).lower() == "none" else wandb_project,
         wandb_entity=args.wandb_entity or raw.get("logging", {}).get("wandb_entity"), precision=args.precision,
+        inflight_every_steps=args.inflight_every_steps,
     )
     cfg.condition = {**cfg.condition, **CONDITION_PRESETS[args.condition_preset]}
     if args.self_attn_mask:

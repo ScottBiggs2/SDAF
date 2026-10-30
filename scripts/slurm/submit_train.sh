@@ -35,6 +35,17 @@
 #   DATA_SOURCE         — rev-8: stream (live GPT-2 traces on this GPU; needs N_STEPS and
 #                          BETA_ANNEAL_STEPS) or cache (cache-v2 shards, reproduces rev-7).
 #                          Default: training.data_source in the config (stream).
+#   D_LATENT          — scale-1: latent width per block (default: config vae.d_latent)
+#   OOD_CACHE_DIR     — scale-1: OOD val cache for inflight/ood/* (e.g. the rev-7 WikiText cache_v2)
+#   CONFIG            — scale-1: yaml (default configs/default.yaml; scale-1 runs use configs/scale1.yaml)
+#   PRECISION         — scale-1: fp32 | bf16 train forward (default: config)
+#   INFLIGHT_EVERY_STEPS — scale-1: in-flight eval cadence → inflight/* in W&B + inflight.jsonl (default: config, 0 = off)
+#   WANDB_RUN_GROUP / WANDB_TAGS (comma-sep) / WANDB_JOB_TYPE — scale-1: W&B run organisation (read by WandbLogger)
+#   GPU type: override the #SBATCH line, e.g. sbatch --gres=gpu:h200:1 (or a100) ...
+#
+# Example (scale-1 d256 arm; see scripts/slurm/README.md):
+#   CONFIG=configs/scale1.yaml RUN_NAME=S1-vae256 D_LATENT=256 PRECISION=bf16 N_STEPS=... BETA_ANNEAL_STEPS=... \
+#     WANDB_RUN_GROUP=scale1 WANDB_TAGS=d256 sbatch --gres=gpu:h200:1 scripts/slurm/submit_train.sh
 #
 # Example (rev-7 Stage A):
 #   RUN_NAME=rev7A_opt4 MODE=option_4 N_STEPS=60000 BETA_ANNEAL_STEPS=24000 sbatch scripts/slurm/submit_train.sh
@@ -60,6 +71,10 @@ RUN_NAME="${RUN_NAME:-rev7_${MODE:-default}}"
 RESUME="${RESUME:-auto}"
 MAX_WALL_MINUTES="${MAX_WALL_MINUTES:-225}"
 WANDB_PROJECT="${WANDB_PROJECT:-specdec-af-gpt2}"
+CONFIG="${CONFIG:-configs/default.yaml}"
+export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-vae}"
+export PYTHONNOUSERSITE=1   # never pick up ~/.local packages
+PY="$ENV_PREFIX/bin/python"  # `source activate` can silently leave base python active in batch jobs
 
 mkdir -p "${REPO_DIR}/logs"
 
@@ -91,7 +106,9 @@ echo "BETA_ANNEAL_STEPS=${BETA_ANNEAL_STEPS:-(config default)}"
 echo "RESUME=$RESUME  MAX_WALL_MINUTES=$MAX_WALL_MINUTES"
 echo "DATA_SOURCE=${DATA_SOURCE:-(config default)}"
 echo "WANDB_PROJECT=$WANDB_PROJECT  WANDB_ENTITY=${WANDB_ENTITY:-(default)}"
-echo "SCRATCH=$SCRATCH"
+echo "SCRATCH=$SCRATCH  CONFIG=$CONFIG  D_LATENT=${D_LATENT:-(config)}  PRECISION=${PRECISION:-(config)}"
+echo "INFLIGHT_EVERY_STEPS=${INFLIGHT_EVERY_STEPS:-(config)}  OOD_CACHE_DIR=${OOD_CACHE_DIR:-(config)}"
+echo "WANDB_RUN_GROUP=${WANDB_RUN_GROUP:-}  WANDB_TAGS=${WANDB_TAGS:-}  WANDB_JOB_TYPE=$WANDB_JOB_TYPE"
 echo "====================="
 
 # Optional CLI overrides only if env var is set; otherwise CLI omits flag and
@@ -107,11 +124,15 @@ if [[ -n "${MODE:-}" ]]; then EXTRA_ARGS+=(--mode "$MODE"); fi
 if [[ -n "${DATA_SOURCE:-}" ]]; then EXTRA_ARGS+=(--data-source "$DATA_SOURCE"); fi
 if [[ -n "${RESUME:-}" ]]; then EXTRA_ARGS+=(--resume "$RESUME"); fi
 if [[ -n "${MAX_WALL_MINUTES:-}" ]]; then EXTRA_ARGS+=(--max-wall-minutes "$MAX_WALL_MINUTES"); fi
+if [[ -n "${D_LATENT:-}" ]]; then EXTRA_ARGS+=(--d-latent "$D_LATENT"); fi
+if [[ -n "${PRECISION:-}" ]]; then EXTRA_ARGS+=(--precision "$PRECISION"); fi
+if [[ -n "${INFLIGHT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--inflight-every-steps "$INFLIGHT_EVERY_STEPS"); fi
+if [[ -n "${OOD_CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--ood-cache-dir "$OOD_CACHE_DIR"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
 if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 
-python -m specdec_af.training.train \
-  --config configs/default.yaml \
+"$PY" -m specdec_af.training.train \
+  --config "$CONFIG" \
   --run-name "$RUN_NAME" \
   --log-every 50 \
   --val-every-steps 1000 \
