@@ -373,7 +373,10 @@ def cache_roundtrip_check_v2(
 # CLI
 # ----------------------------------------------------------------------
 
-def _build_corpus(cfg: dict, split: str, tokens: str | None = None):
+def _build_corpus(cfg: dict, split: str, tokens: str | None = None, interleave: bool = False):
+    if tokens and interleave:
+        from specdec_af.data.mixture import InterleavedSequences
+        return InterleavedSequences(tokens, cfg["cache_v2"]["seq_len"])
     if tokens:
         from specdec_af.data.stream import TokenSequences
         return TokenSequences(tokens, cfg["cache_v2"]["seq_len"])
@@ -408,6 +411,9 @@ def main() -> int:
     p.add_argument("--tokens", type=str, default=None,
                    help="scale-1: read sequences from this pre-tokenized array (mixture train.npy / val.npy) "
                         "instead of the corpus; seq ids index into it")
+    p.add_argument("--interleave", action="store_true",
+                   help="scale-1: with --tokens, read through mixture.InterleavedSequences so contiguous "
+                        "seq ranges are source-balanced (seq ids in shard meta are view ids)")
     p.add_argument("--no-write-split", action="store_true",
                    help="scale-1: don't pin split.json after this collection (a later one adds the val shards)")
     p.add_argument("--cpu", action="store_true")
@@ -433,7 +439,7 @@ def main() -> int:
     for param in model.parameters():
         param.requires_grad_(False)
     tokenizer = load_gpt2_tokenizer(cfg["model"]["name"])
-    corpus_name = args.tokens or f"{cfg['corpus']['name']}/{cfg['corpus']['config']}/{split}"
+    corpus_name = (f"interleaved:{args.tokens}" if args.interleave else args.tokens) or f"{cfg['corpus']['name']}/{cfg['corpus']['config']}/{split}"
 
     if args.stage in ("all", "calibration"):
         stats_path = cache_dir / "chunk_norm_stats.pt"
@@ -442,7 +448,7 @@ def main() -> int:
         else:
             print(f"== Calibration ({n_cal} sequences × {common['n_pos']} positions) ==", flush=True)
             t0 = time.time()
-            cn = run_calibration_v2(model, _build_corpus(cfg, split, args.tokens), tokenizer=tokenizer,
+            cn = run_calibration_v2(model, _build_corpus(cfg, split, args.tokens, args.interleave), tokenizer=tokenizer,
                                     n_seq=n_cal, seed=seed, batch_size=args.batch_size,
                                     device=device, **common)
             torch.save(cn.state_dict(), stats_path)
@@ -453,7 +459,7 @@ def main() -> int:
         shard_offset = (args.shard_offset if args.shard_offset is not None
                         else (int(existing[-1].name.split("_")[1]) + 1 if existing else 0))
         print(f"== Main collection ({n_seq} sequences → shards from {shard_offset:04d}) ==", flush=True)
-        summary = collect_v2(model, _build_corpus(cfg, split, args.tokens), tokenizer=tokenizer,
+        summary = collect_v2(model, _build_corpus(cfg, split, args.tokens, args.interleave), tokenizer=tokenizer,
                              cache_dir=cache_dir, n_seq=n_seq, seqs_per_shard=sps, seed=seed,
                              seq_offset=args.seq_offset, shard_offset=shard_offset,
                              batch_size=args.batch_size, corpus=corpus_name, device=device,

@@ -179,6 +179,39 @@ def concat_mixture(root: Path | str, sources: list[str], *, seq_len: int) -> dic
     return out
 
 
+class InterleavedSequences:
+    """Source-balanced view of a mixture array: sequence ``i`` is local sequence ``i // k`` of source
+    ``i % k`` (``k`` sources, each truncated to the shortest source's whole sequences).
+
+    ``train.npy`` / ``val.npy`` are laid out source by source, so a contiguous id range of the raw
+    array (cache_s1's calibration, train slice and val set take the first N sequences) is one
+    source only. Through this view the same contiguous ranges are balanced. Same ``seqs`` /
+    ``__len__`` interface as :class:`~specdec_af.data.stream.TokenSequences`; ``underlying(ids)``
+    maps view ids back to raw-array sequence ids. Sequences straddling a source boundary are skipped.
+    """
+
+    def __init__(self, tokens_path: Path | str, seq_len: int) -> None:
+        from specdec_af.data.stream import TokenSequences, token_meta
+        self.base = TokenSequences(tokens_path, seq_len)
+        self.path, self.seq_len = self.base.path, int(seq_len)
+        srcs = token_meta(tokens_path)["sources"]
+        self.first = np.array([-(-r["token_start"] // self.seq_len) for r in srcs], dtype=np.int64)
+        per = min(r["token_end"] // self.seq_len - f for r, f in zip(srcs, self.first))
+        self.k, self.n_seq = len(srcs), int(per) * len(srcs)
+
+    def __len__(self) -> int:
+        return self.n_seq
+
+    def underlying(self, ids) -> np.ndarray:
+        ids = np.asarray(ids, dtype=np.int64)
+        if ids.size and (ids.min() < 0 or ids.max() >= self.n_seq):
+            raise IndexError(f"sequence id out of range [0, {self.n_seq})")
+        return self.first[ids % self.k] + ids // self.k
+
+    def seqs(self, ids) -> np.ndarray:
+        return self.base.seqs(self.underlying(ids))
+
+
 def seq_source(meta: dict, seq_ids: np.ndarray) -> np.ndarray:
     """Source index (into ``meta['sources']``) of each sequence's first token."""
     starts = np.array([r["token_start"] for r in meta["sources"]], dtype=np.int64)

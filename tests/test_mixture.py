@@ -110,6 +110,24 @@ def test_collect_from_token_array(mixture_root, gpt2, gpt2_tokenizer, tmp_path):
     np.testing.assert_array_equal(st, seqs.seqs(np.arange(2)))
 
 
+def test_interleaved_view_balances_sources(mixture_root):
+    from specdec_af.data.mixture import InterleavedSequences
+    m = token_meta(mixture_root / "train.npy")
+    raw = TokenSequences(mixture_root / "train.npy", SEQ_LEN)
+    view = InterleavedSequences(mixture_root / "train.npy", SEQ_LEN)
+    ids = np.arange(len(view))
+    src = seq_source(m, view.underlying(ids))
+    assert (src == ids % 2).all() and len(view) == 2 * (len(view) // 2)
+    # every view sequence lies wholly inside its source
+    lo = np.array([m["sources"][s]["token_start"] for s in src])
+    hi = np.array([m["sources"][s]["token_end"] for s in src])
+    under = view.underlying(ids)
+    assert (under * SEQ_LEN >= lo).all() and ((under + 1) * SEQ_LEN <= hi).all()
+    np.testing.assert_array_equal(view.seqs(ids[:3]), raw.seqs(under[:3]))
+    with pytest.raises(IndexError):
+        view.seqs(np.array([len(view)]))
+
+
 def test_scale1_config_inherits_default():
     d, s = load_config("configs/default.yaml"), load_config("configs/scale1.yaml")
     assert "base" not in s

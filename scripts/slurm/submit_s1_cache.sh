@@ -10,7 +10,9 @@
 #SBATCH --output=/home/biggs.s/sdaf-gpt2/SDAF/logs/s1-cache-%j.out
 #SBATCH --error=/home/biggs.s/sdaf-gpt2/SDAF/logs/s1-cache-%j.err
 
-# Scale-1 cache_s1 (configs/scale1.yaml) → ${SCRATCH}/specdec_af/cache_s1/, after submit_s1_tokenize.sh:
+# Scale-1 cache_s1 (configs/scale1.yaml) → ${SCRATCH}/specdec_af/cache_s1/, after submit_s1_tokenize.sh.
+# All reads go through --interleave (mixture.InterleavedSequences): seq i = source i mod 2, so every
+# contiguous range below is 50/50 FineWeb-Edu / OWT (the raw arrays are laid out source by source).
 #   1. ChunkNorm calibration on train.npy (1,000 seqs, calibration RNG stream)
 #   2. train slice: train.npy seqs [0, 1250) → shards 0000–0020 (20k positions; memorization / NN rows)
 #   3. val: val.npy seqs [0, 625) → shards 0021–0031 (10k positions), pinned as val in split.json
@@ -38,10 +40,10 @@ CFG=configs/scale1.yaml
 echo "job=${SLURM_JOB_ID:-?} node=${SLURMD_NODENAME:-?} git=$(git rev-parse --short HEAD)"
 nvidia-smi -L || true
 
-"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage calibration --tokens "$TOK/train.npy"
-"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage main --tokens "$TOK/train.npy" \
+"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage calibration --tokens "$TOK/train.npy" --interleave
+"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage main --tokens "$TOK/train.npy" --interleave \
   --n-seq 1250 --shard-offset 0 --no-write-split
-"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage main --tokens "$TOK/val.npy" \
+"$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage main --tokens "$TOK/val.npy" --interleave \
   --n-seq 625 --seq-offset 0 --shard-offset 21 --val-shards 11
 "$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage roundtrip
 "$PY" -m specdec_af.data.collect_v2 --config "$CFG" --stage scale-variation
