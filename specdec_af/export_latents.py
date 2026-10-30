@@ -39,6 +39,7 @@ from specdec_af.data.dataset import list_shards, read_split
 from specdec_af.evaluate import encode_traces
 from specdec_af.training.checkpoint import load_vae_checkpoint
 from specdec_af.training.train import expand_env, pick_device
+from specdec_af.utils.config import file_sha256
 
 
 @torch.no_grad()
@@ -99,7 +100,8 @@ def export_latents(
                       ("seq_global_idx", seq_global), ("pos", pos), ("is_val", is_val)):
         np.save(out_dir / f"{name}.npy", arr)
     index = {
-        "checkpoint": str(checkpoint), "mode": loaded["mode"], "step": loaded["step"],
+        "checkpoint": str(checkpoint), "checkpoint_sha256": file_sha256(checkpoint),
+        "mode": loaded["mode"], "step": loaded["step"],
         "d_latent": d, "n_layers": J, "n_positions": n_total, "cache_dir": str(cache_dir),
         "n_val_positions": int(is_val.sum()), "shards": ranges,
         "bytes": int(sum(f.stat().st_size for f in out_dir.iterdir() if f.suffix == ".npy")),

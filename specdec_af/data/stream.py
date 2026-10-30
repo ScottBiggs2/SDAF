@@ -496,7 +496,7 @@ def _cmd_bench(args, raw_cfg, scfg, cache_dir, device) -> int:
     cn.load_state_dict(torch.load(Path(cache_dir) / "chunk_norm_stats.pt", map_location="cpu", weights_only=True))
     cn = cn.to(device)
     mode = "option_d" if raw_cfg["vae"].get("decoder_output_space") == "raw" else "option_4"
-    vae = build_vae(mode, cn, device=device).train()
+    vae = build_vae(mode, cn, device=device, d_latent=int(raw_cfg["vae"].get("d_latent", 128))).train()
     opt = torch.optim.Adam(vae.parameters(), lr=1e-4)
     ds.set_epoch(args.n_chunks - 1)
     t_step = []

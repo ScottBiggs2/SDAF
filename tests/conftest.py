@@ -86,6 +86,26 @@ def trained_run(v2_cache, tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def trained_run_d256(v2_cache, tmp_path_factory):
+    """Scale-1: same 25-step recipe as ``trained_run`` at d_latent = 256."""
+    from pathlib import Path
+
+    from specdec_af.training.train import TrainConfig, train
+
+    odir = tmp_path_factory.mktemp("eval_run_d256")
+    cfg = TrainConfig(
+        mode="option_d", batch_size=8, lr=1e-3, n_epochs=5,
+        beta_max=0.1, beta_anneal_epochs=2, free_bits=0.0,
+        log_every=5, val_every_steps=0, checkpoint_every_steps=0,
+        val_max_batches=4, n_steps_override=25, seed=0,
+        num_workers=0, pin_memory=False, grad_clip_norm=None, lr_warmup_steps=0, d_latent=256,
+    )
+    summary = train(v2_cache, odir, cfg, device=torch.device("cpu"))
+    return {"cache_dir": v2_cache, "checkpoint": Path(summary["checkpoint_dir"]) / "final.pt",
+            "output_dir": odir}
+
+
+@pytest.fixture(scope="session")
 def ldm_latents(trained_run, tmp_path_factory):
     """rev-8: latent export of the mini cache with the 25-step VAE (LDM data / train tests)."""
     from specdec_af.export_latents import export_latents

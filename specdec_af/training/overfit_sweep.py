@@ -258,10 +258,11 @@ def eval_pass(
 # Sweep core
 # ----------------------------------------------------------------------
 
-def _build_models(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device | str) -> TraceVAE:
+def _build_models(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device | str,
+                  d_latent: int = 128) -> TraceVAE:
     """Build the trainable VAE (same construction as training)."""
     from specdec_af.training.train import build_vae
-    return build_vae(mode, chunk_norm, device=torch.device(device))
+    return build_vae(mode, chunk_norm, device=torch.device(device), d_latent=d_latent)
 
 
 def run_one_mode(
@@ -279,6 +280,7 @@ def run_one_mode(
     save_path: Path | None = None,
     training_config: dict | None = None,
     grad_clip_norm: float | None = None,
+    d_latent: int = 128,
 ) -> dict:
     """Train one mode for ``n_steps`` on the fixed ``batch``.
 
@@ -287,7 +289,7 @@ def run_one_mode(
     ``eval_qz``/``eval_wrong_z`` dicts from :func:`eval_pass`.
     """
     torch.manual_seed(seed)
-    vae = _build_models(mode, chunk_norm, device=device)
+    vae = _build_models(mode, chunk_norm, device=device, d_latent=d_latent)
 
     params = [p for p in vae.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
@@ -373,6 +375,7 @@ def run_sweep(
     checkpoints_dir: Path | None = None,
     training_config: dict | None = None,
     grad_clip_norm: float | None = None,
+    d_latent: int = 128,
 ) -> dict:
     out = {
         "modes": [],
@@ -391,7 +394,7 @@ def run_sweep(
             log_every=log_every, seed=seed,
             lm_head=lm_head, eval_wrong_z=eval_wrong_z,
             save_path=save_path, training_config=training_config,
-            grad_clip_norm=grad_clip_norm,
+            grad_clip_norm=grad_clip_norm, d_latent=d_latent,
         )
         f = result["final"]
         eq = f["eval_qz"]
@@ -484,6 +487,8 @@ def main() -> int:
                    help="skip the wrong-z ablation eval")
     p.add_argument("--no-save", action="store_true",
                    help="skip writing per-mode checkpoints")
+    p.add_argument("--d-latent", type=int, default=None,
+                   help="latent width (default: vae.d_latent in config; 128 under --smoke)")
     p.add_argument("--grad-clip-norm", type=float, default=None,
                    help="max L2 norm for grad clip; None or 0 = disabled")
     args = p.parse_args()
@@ -497,6 +502,7 @@ def main() -> int:
         chunk_norm = fit_chunk_norm_from_batch(batch["chunk_raw"], batch["block_ids"]).to(device)
         output_dir = Path("./outputs/overfit_sweep_smoke")
         load_lm = args.smoke_with_lm_head and not args.no_downstream_metrics
+        d_latent = args.d_latent or 128
     else:
         cfg = load_config(args.config)
         cache_dir = Path(expand_env(cfg["paths"]["cache_dir"]))
@@ -511,6 +517,7 @@ def main() -> int:
         chunk_norm = chunk_norm.to(device)
         batch = load_overfit_batch_from_cache(cache_dir, n_chunks=args.n_chunks, device=device, seed=args.seed)
         load_lm = not args.no_downstream_metrics
+        d_latent = args.d_latent or int(cfg["vae"].get("d_latent", 128))
 
     lm_head = None
     if load_lm:
@@ -531,9 +538,9 @@ def main() -> int:
         checkpoints_dir=checkpoints_dir,
         training_config={
             "lr": args.lr, "n_chunks": args.n_chunks, "n_steps": args.n_steps,
-            "seed": args.seed, "grad_clip_norm": args.grad_clip_norm,
+            "seed": args.seed, "grad_clip_norm": args.grad_clip_norm, "d_latent": d_latent,
         },
-        grad_clip_norm=args.grad_clip_norm,
+        grad_clip_norm=args.grad_clip_norm, d_latent=d_latent,
     )
     write_summary(results, output_dir)
     print(f"\nresults: {output_dir / 'results.json'}", flush=True)

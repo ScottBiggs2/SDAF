@@ -9,6 +9,7 @@ import torch
 from specdec_af.data.dataset import list_shards
 from specdec_af.export_latents import export_latents
 from specdec_af.training.checkpoint import load_vae_checkpoint
+from specdec_af.utils.config import file_sha256
 
 
 def test_export_latents(trained_run, tmp_path):
@@ -16,6 +17,7 @@ def test_export_latents(trained_run, tmp_path):
     index = export_latents(trained_run["checkpoint"], trained_run["cache_dir"], out,
                            device=torch.device("cpu"), pos_batch=7)
     assert index["n_positions"] == 48 and index["n_val_positions"] == 16 and index["d_latent"] == 128
+    assert index["checkpoint_sha256"] == file_sha256(trained_run["checkpoint"])
     mu = np.load(out / "mu.npy", mmap_mode="r")
     lv = np.load(out / "logvar.npy", mmap_mode="r")
     assert mu.shape == lv.shape == (48, 12, 128) and mu.dtype == np.float16

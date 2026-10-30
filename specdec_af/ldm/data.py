@@ -323,7 +323,7 @@ def condition_batch(raw: dict, sampler: ConditionSampler, *, z_source: str, seed
 # Stream source
 # ----------------------------------------------------------------------
 
-def build_stream_batches(cfg, cache_dir: Path | str, *, device, gpt2=None):
+def build_stream_batches(cfg, cache_dir: Path | str, *, device, gpt2=None, expect_d_latent: int | None = None):
     """``(StreamingLatentBatches, producer)`` for an :class:`~specdec_af.ldm.train_ldm.LDMTrainConfig`:
     live GPT-2 → frozen VAE (``cfg.vae_checkpoint``) on ``device``, val sequences excluded,
     restricted to ``cfg.train_half``. ``cfg.stream`` = :func:`~specdec_af.data.stream.stream_cfg_from`."""
@@ -337,8 +337,11 @@ def build_stream_batches(cfg, cache_dir: Path | str, *, device, gpt2=None):
         raise ValueError("data_source='stream' needs vae_checkpoint (the frozen encoder)")
     n_seq = len(TokenSequences(scfg["tokens_path"], scfg["seq_len"]))
     include = None if cfg.train_half == "all" else half_mask(np.arange(n_seq), cfg.train_half)
-    producer = build_producer(scfg, cache_dir, device=device, gpt2=gpt2, include=include)
     loaded = load_vae_checkpoint(cfg.vae_checkpoint, device=device)
+    if expect_d_latent is not None and loaded["vae"].d_latent != expect_d_latent:
+        raise ValueError(f"vae_checkpoint d_latent={loaded['vae'].d_latent} != latent export d_latent="
+                         f"{expect_d_latent}; the DiT is sized from the export")
+    producer = build_producer(scfg, cache_dir, device=device, gpt2=gpt2, include=include)
     src = StreamingLatentBatches(producer, loaded["vae"], loaded["chunk_norm"], batch_size=cfg.batch_size,
                                  seed=int(scfg["seed"]), chunks_per_buffer=int(scfg["latent_chunks_per_buffer"]))
     print(f"stream: {len(producer.plan.train_ids)} train sequences (half={cfg.train_half}, "

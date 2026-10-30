@@ -669,6 +669,8 @@ def main() -> int:
     p.add_argument("--beta-anneal-epochs", type=int, default=None)
     p.add_argument("--beta-anneal-steps", type=int, default=None,
                    help="rev-7: β ramp length in optimizer steps; overrides --beta-anneal-epochs")
+    p.add_argument("--d-latent", type=int, default=None,
+                   help="latent width per block (default: vae.d_latent in config)")
     p.add_argument("--free-bits", type=float, default=None,
                    help="per-dim KL floor in nats (Kingma+ 2016). 0 = disabled")
     p.add_argument("--log-every", type=int, default=25)
@@ -740,7 +742,7 @@ def main() -> int:
         shard_buffer=args.shard_buffer or raw_cfg["cache_v2"].get("shard_buffer", 4),
         val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
         data_source=args.data_source or tr.get("data_source", "cache"),
-        d_latent=int(raw_cfg["vae"].get("d_latent", 128)),
+        d_latent=args.d_latent or int(raw_cfg["vae"].get("d_latent", 128)),
     )
     if tcfg.data_source == "stream":
         from specdec_af.data.stream import stream_cfg_from

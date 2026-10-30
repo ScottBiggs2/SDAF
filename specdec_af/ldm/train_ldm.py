@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -70,7 +69,7 @@ from specdec_af.training.train import (
     _restore_rng,
     find_resume_checkpoint,
 )
-from specdec_af.utils.config import expand_env, load_config, pick_device
+from specdec_af.utils.config import expand_env, file_sha256, load_config, pick_device
 
 FORMAT = "ldm_v1"
 _TAG_NOISE, _TAG_VAL = 20, 21
@@ -149,16 +148,6 @@ def build_ldm(cfg: LDMTrainConfig, *, d_latent: int, n_positions: int) -> Latent
     dit = LatentDiT(DiTConfig.from_dict(cfg.dit, d_latent=d_latent, d_cond=enc.hidden_dim, n_positions=n_positions,
                                         ctx_len=ccfg.W))
     return LatentLDM(enc, dit, mask_id=ccfg.mask_id)
-
-
-def file_sha256(path: str | Path | None) -> str | None:
-    if not path or not Path(path).exists():
-        return None
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for blk in iter(lambda: fh.read(1 << 24), b""):
-            h.update(blk)
-    return h.hexdigest()
 
 
 def _bucket_m(m: torch.Tensor, regime: torch.Tensor, W: int) -> list[str]:
@@ -279,7 +268,11 @@ def build_train_source(cfg: LDMTrainConfig, table: LatentTable, cache_dir: Path,
         if cfg.max_train_rows is not None:
             raise ValueError("max_train_rows applies to data_source='static' only")
         from specdec_af.ldm.data import build_stream_batches
-        return build_stream_batches(cfg, cache_dir, device=device, gpt2=gpt2)
+        want = table.index.get("checkpoint_sha256")
+        if want is not None and file_sha256(cfg.vae_checkpoint) != want:
+            raise ValueError(f"vae_checkpoint {cfg.vae_checkpoint} is not the VAE that wrote {cfg.latents_dir}")
+        return build_stream_batches(cfg, cache_dir, device=device, gpt2=gpt2,
+                                    expect_d_latent=int(table.mu.shape[-1]))
     raise ValueError(f"data_source={cfg.data_source!r}; expected 'stream' or 'static'")
 
 

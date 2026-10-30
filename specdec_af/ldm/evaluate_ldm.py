@@ -199,6 +199,7 @@ class SuiteConfig:
     loss_gap_positions: int = 2048
     kid_subset: int = 1000
     kid_subsets: int = 50
+    joint_max_dim: int = 4096        # joint FD/KID only when 12·d fits (latents up to d=341; not decoded resid)
 
 
 def eval_conditions(W: int) -> list[tuple[str, dict]]:
@@ -271,7 +272,7 @@ def _dist(x: torch.Tensor, ref: torch.Tensor, sc: SuiteConfig, device) -> dict:
             kid(x[:, b], ref[:, b], subset_size=sc.kid_subset, n_subsets=sc.kid_subsets, seed=sc.seed)["mean"])
            for b in range(x.shape[1])]
     out = {"fd_block": [a for a, _ in blk], "kid_block": [b for _, b in blk]}
-    if x.shape[2] <= 128:  # joint only in latent space (1,536-d); decoded joint would be 9,216-d
+    if x.shape[1] * x.shape[2] <= sc.joint_max_dim:  # latent joint (12·d); decoded joint would be 9,216-d
         out["fd_joint"] = frechet_distance(x, ref)
         out["kid_joint"] = kid(x, ref, subset_size=sc.kid_subset, n_subsets=sc.kid_subsets, seed=sc.seed)
     return out
