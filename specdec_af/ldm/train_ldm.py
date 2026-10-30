@@ -70,6 +70,7 @@ from specdec_af.training.train import (
     find_resume_checkpoint,
 )
 from specdec_af.utils.config import expand_env, file_sha256, load_config, pick_device
+from specdec_af.utils.precision import PRECISIONS, autocast
 
 FORMAT = "ldm_v1"
 _TAG_NOISE, _TAG_VAL = 20, 21
@@ -110,6 +111,7 @@ class LDMTrainConfig:
     flow: dict = field(default_factory=dict)
     sampler: dict = field(default_factory=dict)
     stream: dict | None = None
+    precision: str = "fp32"                # scale-1: "bf16" autocasts the train forward (val / eval stay fp32)
 
     @classmethod
     def from_raw(cls, raw_cfg: dict, **over) -> "LDMTrainConfig":
@@ -380,8 +382,9 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
             t = logit_normal_t(z0.shape[0], z0.shape[1], generator=g, mean=fl.get("t_logit_mean", 0.0),
                                std=fl.get("t_logit_std", 1.0), p_token_t=fl.get("p_token_t", 0.0)).to(device)
             eps = torch.randn(z0.shape, generator=g).to(device)
-            v = ldm(interpolate(z0, eps, t), t, b)
-            per = rf_loss(v, z0, eps)
+            with autocast(cfg.precision, device):
+                v = ldm(interpolate(z0, eps, t), t, b)
+            per = rf_loss(v.float(), z0, eps)
             loss = per.mean()
 
             opt.zero_grad(set_to_none=True)
@@ -486,6 +489,8 @@ def main() -> int:
     p.add_argument("--max-wall-minutes", type=float, default=None)
     p.add_argument("--wandb-project", default=None, help="'none' disables")
     p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--precision", choices=PRECISIONS, default=None,
+                   help="scale-1: train-forward precision (default: ldm.training.precision, else fp32)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -499,7 +504,7 @@ def main() -> int:
         checkpoint_every_steps=args.checkpoint_every_steps, log_every=args.log_every, seed=args.seed,
         max_wall_seconds=args.max_wall_minutes * 60 if args.max_wall_minutes else None,
         wandb_project=None if not wandb_project or str(wandb_project).lower() == "none" else wandb_project,
-        wandb_entity=args.wandb_entity or raw.get("logging", {}).get("wandb_entity"),
+        wandb_entity=args.wandb_entity or raw.get("logging", {}).get("wandb_entity"), precision=args.precision,
     )
     cfg.condition = {**cfg.condition, **CONDITION_PRESETS[args.condition_preset]}
     if args.self_attn_mask:

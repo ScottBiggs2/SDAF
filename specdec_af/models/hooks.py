@@ -47,7 +47,7 @@ def expected_hook_keys(n_layers: int) -> list[str]:
     return keys
 
 
-def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
+def register_hooks(model, *, gather: dict | None = None) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
     """Attach forward hooks to every theta @ data module of HF GPT-2.
 
     Returns:
@@ -55,6 +55,11 @@ def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
         keys match ``expected_hook_keys(n_layers)``. Caller is responsible for
         calling ``h.remove()`` on every handle when done. Use
         :func:`gather_hook_positions` to read selected positions out of it.
+
+    Scale-1 ``gather``: an optional mutable ``{"positions": Tensor [B, n_pos] | None}``.
+    While ``positions`` is set, each hook stores only those positions
+    (``[B, n_pos, D_h]``, exact) instead of the full ``[B, T, D_h]`` output, so a
+    forward never holds all 74 full activations at once.
     """
     buffer: dict[str, Tensor] = {}
     handles: list[RemovableHandle] = []
@@ -62,7 +67,8 @@ def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
 
     def _store(name: str):
         def hook(_module, _inputs, output):
-            buffer[name] = output
+            pos = gather.get("positions") if gather is not None else None
+            buffer[name] = output if pos is None else _gather(output, pos)
 
         return hook
 
@@ -81,6 +87,10 @@ def register_hooks(model) -> tuple[list[RemovableHandle], dict[str, Tensor]]:
     return handles, buffer
 
 
+def _gather(t: Tensor, idx: Tensor) -> Tensor:
+    return torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+
+
 def gather_hook_positions(buffer: dict[str, Tensor], positions: Tensor) -> dict[str, Tensor]:
     """Per-row gather of a populated hook buffer at ``positions [B, n_pos]``.
 
@@ -88,5 +98,4 @@ def gather_hook_positions(buffer: dict[str, Tensor], positions: Tensor) -> dict[
     is a fresh copy, so later forwards that overwrite the buffer don't mutate it.
     """
     idx = positions.to(device=next(iter(buffer.values())).device, dtype=torch.long)
-    return {name: torch.gather(t, 1, idx.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
-            for name, t in buffer.items()}
+    return {name: _gather(t, idx) for name, t in buffer.items()}

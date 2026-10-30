@@ -64,6 +64,7 @@ from torch import Tensor
 from specdec_af.data.collect_v2 import gather_chunks, sample_positions
 from specdec_af.data.dataset import read_split
 from specdec_af.models.hooks import register_hooks
+from specdec_af.utils.precision import autocast
 
 STREAM_POS_BASE = 2  # sample_positions stream for pass k is STREAM_POS_BASE + k
 _TAG_PLAN, _TAG_TRACE_SHUFFLE, _TAG_LATENT_SHUFFLE = 0, 1, 2
@@ -198,14 +199,16 @@ class TraceProducer:
     """GPT-2 forwards → packed traces for a chunk of the plan (owns the hooks)."""
 
     def __init__(self, model, seqs: TokenSequences, plan: SequencePlan, *, n_pos: int, p_min: int,
-                 seed: int, micro_bs: int = 32, round_fp16: bool = True,
+                 seed: int, micro_bs: int = 32, round_fp16: bool = True, gpt2_precision: str = "fp32",
                  device: torch.device | str = "cpu") -> None:
         self.model, self.seqs, self.plan = model, seqs, plan
         self.n_pos, self.p_min, self.seed = int(n_pos), int(p_min), int(seed)
         self.micro_bs, self.round_fp16 = int(micro_bs), bool(round_fp16)
+        self.gpt2_precision = gpt2_precision  # scale-1: "bf16" changes trace numerics; parity-check first
         self.device = torch.device(device)
         self.positions_per_chunk = plan.seqs_per_chunk * self.n_pos
-        self._handles, self._buffer = register_hooks(model)
+        self._gather: dict = {"positions": None}  # scale-1: gather positions inside the hooks
+        self._handles, self._buffer = register_hooks(model, gather=self._gather)
 
     def close(self) -> None:
         for h in self._handles:
@@ -219,8 +222,9 @@ class TraceProducer:
         for s in range(0, tokens.shape[0], self.micro_bs):
             ids = torch.from_numpy(tokens[s:s + self.micro_bs]).to(self.device)
             pos = torch.from_numpy(positions[s:s + self.micro_bs].astype(np.int64)).to(self.device)
-            ch = gather_chunks(self.model, self._buffer, ids, pos)
-            out.append(ch.to(torch.float16) if self.round_fp16 else ch)
+            with autocast(self.gpt2_precision, self.device):
+                ch = gather_chunks(self.model, self._buffer, ids, pos, gather=self._gather)
+            out.append(ch.to(torch.float16) if self.round_fp16 else ch.float())
         return torch.cat(out)
 
     def make_chunk(self, c: int) -> dict:
@@ -373,7 +377,7 @@ class StreamingLatentBatches(_Buffered):
 STREAM_DEFAULTS = dict(
     tokens_path=None, seqs_per_chunk=256, micro_bs=32, round_fp16=True, seed=1236,
     model_name="openai-community/gpt2", seq_len=256, n_pos=16, p_min=32,
-    latent_chunks_per_buffer=4,
+    latent_chunks_per_buffer=4, gpt2_precision="fp32",
 )
 
 
@@ -411,7 +415,8 @@ def build_producer(scfg: dict, cache_dir: Path | str, *, device, val_shards: int
                         exclude=() if held_out else val_seq_ranges(cache_dir, val_shards), include=include)
     model = gpt2 if gpt2 is not None else load_frozen_gpt2(scfg["model_name"], device)
     return TraceProducer(model, seqs, plan, n_pos=scfg["n_pos"], p_min=scfg["p_min"], seed=scfg["seed"],
-                         micro_bs=scfg["micro_bs"], round_fp16=scfg["round_fp16"], device=device)
+                         micro_bs=scfg["micro_bs"], round_fp16=scfg["round_fp16"],
+                         gpt2_precision=scfg["gpt2_precision"], device=device)
 
 
 # ----------------------------------------------------------------------

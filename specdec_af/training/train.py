@@ -73,6 +73,7 @@ from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import load_vae_checkpoint, save_vae_checkpoint
 from specdec_af.utils.config import expand_env, load_config, pick_device  # noqa: F401 (re-exported)
+from specdec_af.utils.precision import PRECISIONS, autocast
 from specdec_af.training.losses import (
     Mode,
     chunk_recon_loss,
@@ -326,6 +327,7 @@ class TrainConfig:
     d_latent: int = 128                    # per-block latent width (vae.d_latent)
     data_source: str = "cache"             # "cache" (cache-v2 shards) | "stream" (live GPT-2, data/stream.py)
     stream: dict | None = None             # stream config (see stream.STREAM_DEFAULTS); data_source="stream"
+    precision: str = "fp32"                # scale-1: "bf16" autocasts the train forward (val stays fp32)
 
 
 def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device, d_latent: int = 128) -> TraceVAE:
@@ -510,8 +512,10 @@ def train(
             chunk_raw = batch["chunk_raw"].to(device, non_blocking=cfg.pin_memory)
             block_ids = batch["block_id"].to(device, non_blocking=cfg.pin_memory)
 
-            chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
-            out = vae(chunk_norm_input, block_ids)
+            with autocast(cfg.precision, device):
+                chunk_norm_input = chunk_norm.forward_per_item(chunk_raw, block_ids)
+                out = vae(chunk_norm_input, block_ids)
+            out = {k: v.float() for k, v in out.items()}
 
             recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode)
             kl = kl_divergence(out["mu"], out["logvar"], free_bits=cfg.free_bits)
@@ -702,6 +706,8 @@ def main() -> int:
     p.add_argument("--data-source", choices=["cache", "stream"], default=None,
                    help="rev-8: train on cache-v2 shards or live GPT-2 traces "
                         "(default: training.data_source in config, else cache)")
+    p.add_argument("--precision", choices=PRECISIONS, default=None,
+                   help="scale-1: train-forward precision (default: training.precision in config, else fp32)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -743,6 +749,7 @@ def main() -> int:
         val_positions=args.val_positions or raw_cfg["cache_v2"].get("val_positions", 5000),
         data_source=args.data_source or tr.get("data_source", "cache"),
         d_latent=args.d_latent or int(raw_cfg["vae"].get("d_latent", 128)),
+        precision=args.precision or tr.get("precision", "fp32"),
     )
     if tcfg.data_source == "stream":
         from specdec_af.data.stream import stream_cfg_from

@@ -110,11 +110,24 @@ def iter_sequences(
 
 
 @torch.no_grad()
-def gather_chunks(model, buffer: dict[str, Tensor], input_ids: Tensor, positions: Tensor) -> Tensor:
-    """Forward ``input_ids`` and return packed chunks ``[B * n_pos, J, D_CHUNK]`` (fp32, on device)."""
+def gather_chunks(model, buffer: dict[str, Tensor], input_ids: Tensor, positions: Tensor, *,
+                  gather: dict | None = None) -> Tensor:
+    """Forward ``input_ids`` and return packed chunks ``[B * n_pos, J, D_CHUNK]`` (fp32, on device).
+
+    ``gather``: the dict passed to ``register_hooks(model, gather=...)`` — positions are
+    then gathered inside the hooks (same values, a fraction of the activation memory)."""
     n_layers = len(model.transformer.h)
-    model(input_ids=input_ids)
-    chunks = pack_chunks(gather_hook_positions(buffer, positions), n_layers=n_layers)  # [B, n_pos, J, D]
+    if gather is None:
+        model(input_ids=input_ids)
+        hooks = gather_hook_positions(buffer, positions)
+    else:
+        gather["positions"] = positions.to(device=input_ids.device, dtype=torch.long)
+        try:
+            model(input_ids=input_ids)
+        finally:
+            gather["positions"] = None
+        hooks = dict(buffer)
+    chunks = pack_chunks(hooks, n_layers=n_layers)  # [B, n_pos, J, D]
     return chunks.reshape(-1, n_layers, chunks.shape[-1])
 
 
