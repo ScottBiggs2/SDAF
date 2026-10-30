@@ -1,0 +1,28 @@
+# Scale-1 series: ~2B-token FineWeb-Edu + OWT mixture; d128 vs d256 VAE → DiT.
+# Only overrides live here; everything else comes from default.yaml (deep-merged).
+# Plan: ~/.claude/plans/we-are-getting-ready-tidy-breeze.md (approved 10-29).
+base: default.yaml
+
+paths:
+  cache_dir: "${SCRATCH:-./outputs}/specdec_af/cache_s1"   # val (held-out docs) + small train slice; see cache_v2 below
+
+mixture:                  # specdec_af/data/mixture.py
+  root: "${SCRATCH:-./outputs}/specdec_af/tokens/s1"
+  val_frac: 0.005         # documents held out by blake2b(salt ‖ text) → val.npy (~10M tokens)
+  salt: "scale1"
+  shard_tokens: 100000000 # uint16 shard size while tokenizing (200 MB)
+  shuffle_seed: 0         # HF streaming shard-order + buffer shuffle (null = file order)
+  sources:                # mixture order = order in train.npy; quota = train tokens per source
+    fineweb_edu: {path: "HuggingFaceFW/fineweb-edu", config: "sample-10BT", split: "train", quota: 1000000000}
+    owt: {path: "Skylion007/openwebtext", config: null, split: "train", quota: 1000000000}
+
+cache_v2:                 # cache_s1 = 1,250 train seqs (20k pos, memorization / NN rows) + 625 val seqs (10k pos)
+  seed: 1301              # position seed for cache_s1 (rev-7 used 1234/1235)
+  n_seq: 1250             # train slice: train.npy seqs [0, 1250) → shards 0000–0020
+  n_calibration_seq: 1000 # ChunkNorm refit on the new corpus (train.npy)
+  val_shards: 11          # val.npy seqs [0, 625) → shards 0021–0031, pinned as val
+  val_positions: 10000
+
+stream:
+  tokens_path: "${SCRATCH:-./outputs}/specdec_af/tokens/s1/train.npy"
+  seed: 1302

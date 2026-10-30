@@ -38,8 +38,20 @@ def pick_device(force_cpu: bool = False) -> torch.device:
     return torch.device("cpu")
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
 def load_config(path: Path | str) -> dict:
-    return yaml.safe_load(Path(path).read_text())
+    """YAML config; a top-level ``base: <file>`` (relative to this file) is loaded first and
+    deep-merged under it (mappings merge, everything else replaces)."""
+    path = Path(path)
+    cfg = yaml.safe_load(path.read_text()) or {}
+    base = cfg.pop("base", None)
+    return _deep_merge(load_config(path.parent / base), cfg) if base else cfg
 
 
 def file_sha256(path: str | Path | None) -> str | None:

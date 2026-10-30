@@ -85,7 +85,16 @@ def iter_sequences(
     seq_offset: int = 0, n_seq: int,
 ) -> Iterator[tuple[int, Tensor]]:
     """Yield ``(global_idx_of_row0, input_ids [B, seq_len])`` for sequences
-    ``[seq_offset, seq_offset + n_seq)`` of the packed stream."""
+    ``[seq_offset, seq_offset + n_seq)`` of the packed stream.
+
+    Scale-1: ``corpus_iter`` may instead be a pre-tokenized
+    :class:`~specdec_af.data.stream.TokenSequences` (anything with ``seqs`` /
+    ``__len__``); sequences are then read from the array and ``tokenizer`` is unused."""
+    if hasattr(corpus_iter, "seqs"):
+        end = min(seq_offset + n_seq, len(corpus_iter))
+        for a in range(seq_offset, end, batch_size):
+            yield a, torch.from_numpy(corpus_iter.seqs(np.arange(a, min(a + batch_size, end))))
+        return
     idx = 0
     end = seq_offset + n_seq
     for ids in iter_token_sequences(tokenizer, corpus_iter, seq_len=seq_len, batch_size=batch_size):
@@ -351,7 +360,10 @@ def cache_roundtrip_check_v2(
 # CLI
 # ----------------------------------------------------------------------
 
-def _build_corpus(cfg: dict, split: str):
+def _build_corpus(cfg: dict, split: str, tokens: str | None = None):
+    if tokens:
+        from specdec_af.data.stream import TokenSequences
+        return TokenSequences(tokens, cfg["cache_v2"]["seq_len"])
     return load_wikitext_iter(
         corpus_name=cfg["corpus"]["name"], corpus_config=cfg["corpus"]["config"],
         split=split, streaming=cfg["corpus"]["streaming"],
@@ -380,6 +392,11 @@ def main() -> int:
                         "(roundtrip.json from Stage A is never overwritten)")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--split", type=str, default=None)
+    p.add_argument("--tokens", type=str, default=None,
+                   help="scale-1: read sequences from this pre-tokenized array (mixture train.npy / val.npy) "
+                        "instead of the corpus; seq ids index into it")
+    p.add_argument("--no-write-split", action="store_true",
+                   help="scale-1: don't pin split.json after this collection (a later one adds the val shards)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -403,7 +420,7 @@ def main() -> int:
     for param in model.parameters():
         param.requires_grad_(False)
     tokenizer = load_gpt2_tokenizer(cfg["model"]["name"])
-    corpus_name = f"{cfg['corpus']['name']}/{cfg['corpus']['config']}/{split}"
+    corpus_name = args.tokens or f"{cfg['corpus']['name']}/{cfg['corpus']['config']}/{split}"
 
     if args.stage in ("all", "calibration"):
         stats_path = cache_dir / "chunk_norm_stats.pt"
@@ -412,7 +429,7 @@ def main() -> int:
         else:
             print(f"== Calibration ({n_cal} sequences × {common['n_pos']} positions) ==", flush=True)
             t0 = time.time()
-            cn = run_calibration_v2(model, _build_corpus(cfg, split), tokenizer=tokenizer,
+            cn = run_calibration_v2(model, _build_corpus(cfg, split, args.tokens), tokenizer=tokenizer,
                                     n_seq=n_cal, seed=seed, batch_size=args.batch_size,
                                     device=device, **common)
             torch.save(cn.state_dict(), stats_path)
@@ -423,7 +440,7 @@ def main() -> int:
         shard_offset = (args.shard_offset if args.shard_offset is not None
                         else (int(existing[-1].name.split("_")[1]) + 1 if existing else 0))
         print(f"== Main collection ({n_seq} sequences → shards from {shard_offset:04d}) ==", flush=True)
-        summary = collect_v2(model, _build_corpus(cfg, split), tokenizer=tokenizer,
+        summary = collect_v2(model, _build_corpus(cfg, split, args.tokens), tokenizer=tokenizer,
                              cache_dir=cache_dir, n_seq=n_seq, seqs_per_shard=sps, seed=seed,
                              seq_offset=args.seq_offset, shard_offset=shard_offset,
                              batch_size=args.batch_size, corpus=corpus_name, device=device,
@@ -433,7 +450,7 @@ def main() -> int:
         print(f"  collection: {summary['n_shards']} shards, {summary['n_pos']} positions, "
               f"{summary['bytes'] / 2**30:.2f} GiB, {summary['wall_seconds']:.0f}s", flush=True)
         val_shards = args.val_shards if args.val_shards is not None else c2["val_shards"]
-        if len(list_shards(cache_dir)) > val_shards:
+        if not args.no_write_split and len(list_shards(cache_dir)) > val_shards:
             print(f"  split: {write_split(cache_dir, val_shards)}", flush=True)
 
     if args.stage in ("all", "roundtrip"):

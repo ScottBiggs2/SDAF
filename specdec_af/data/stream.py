@@ -139,6 +139,12 @@ class TokenSequences:
         return np.asarray(self.tokens[rows.reshape(-1)], dtype=np.int64).reshape(len(ids), self.seq_len)
 
 
+def token_meta(tokens_path: Path | str) -> dict:
+    """``<stem>_meta.json`` next to a token array (``{}`` if absent)."""
+    m = _meta_path(Path(tokens_path))
+    return json.loads(m.read_text()) if m.exists() else {}
+
+
 def val_seq_ranges(cache_dir: Path | str, val_shards: int | None = None) -> list[tuple[int, int]]:
     """Global sequence-index ranges ``[lo, hi)`` of the cache's val shards."""
     _, val = read_split(cache_dir, val_shards)
@@ -394,13 +400,15 @@ def load_frozen_gpt2(name: str, device):
 def build_producer(scfg: dict, cache_dir: Path | str, *, device, val_shards: int | None = None,
                    gpt2=None, include: np.ndarray | None = None) -> TraceProducer:
     """Producer over ``scfg['tokens_path']`` excluding the cache's pinned val sequences
-    (and, rev-8, restricted to ``include`` if given)."""
+    (and, rev-8, restricted to ``include`` if given). Scale-1 corpora hold val out by
+    document into a separate array (``val_held_out`` in the token meta): nothing to exclude."""
     scfg = {**STREAM_DEFAULTS, **scfg}
     if not scfg["tokens_path"]:
         raise ValueError("stream.tokens_path is not set (run `python -m specdec_af.data.stream pretokenize`)")
     seqs = TokenSequences(scfg["tokens_path"], scfg["seq_len"])
+    held_out = token_meta(scfg["tokens_path"]).get("val_held_out", False)
     plan = SequencePlan(len(seqs), seqs_per_chunk=scfg["seqs_per_chunk"], seed=scfg["seed"],
-                        exclude=val_seq_ranges(cache_dir, val_shards), include=include)
+                        exclude=() if held_out else val_seq_ranges(cache_dir, val_shards), include=include)
     model = gpt2 if gpt2 is not None else load_frozen_gpt2(scfg["model_name"], device)
     return TraceProducer(model, seqs, plan, n_pos=scfg["n_pos"], p_min=scfg["p_min"], seed=scfg["seed"],
                          micro_bs=scfg["micro_bs"], round_fp16=scfg["round_fp16"], device=device)
