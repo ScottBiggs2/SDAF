@@ -342,6 +342,7 @@ def test_wandb_backfill_replays_csv(cache_dir_with_stats, tmp_path, monkeypatch)
     cpu = torch.device("cpu")
     run_dir = tmp_path / "bf"
     train(cache_dir_with_stats, run_dir, _resume_cfg(10), device=cpu)  # no wandb
+    (run_dir / "inflight.jsonl").write_text('{"step": 5, "val/top1_agreement": 0.4}\n')
     runs: list = []
     monkeypatch.setitem(sys.modules, "wandb", _fake_wandb(runs))
     assert backfill_run(run_dir, "p") == 10
@@ -351,6 +352,9 @@ def test_wandb_backfill_replays_csv(cache_dir_with_stats, tmp_path, monkeypatch)
     live_keys = {"train/recon", "train/kl", "train/total", "train/beta", "train/lr", "train/epoch"}
     assert live_keys <= set(run.logged[0][1])
     assert any("val/recon" in d for _, d in run.logged)
+    assert [s for s, d in run.logged if "inflight/val/top1_agreement" in d] == [4]  # live: step s-1
+    steps = [s for s, _ in run.logged]
+    assert steps == sorted(set(steps))  # one row per step, in order
     assert run.summary["complete"] is True and "final_val/recon" in run.summary
     with pytest.raises(FileExistsError):
         backfill_run(run_dir, "p")

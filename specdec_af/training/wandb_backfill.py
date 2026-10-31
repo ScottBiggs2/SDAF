@@ -1,10 +1,12 @@
-"""Replay a finished run's ``training_log.csv`` + ``training_summary.json`` into W&B.
+"""Replay a finished run's ``training_log.csv`` + ``training_summary.json`` (+ ``inflight.jsonl``) into W&B.
 
 For runs trained while wandb logging was broken (rev-7 Stage A: wandb 0.30 removed
-``wandb.util.generate_id``). Uses the same keys as live logging in ``train.py``,
-except ``train/grad_norm_preclip``, which the CSV does not record. The run id is
-written to ``<run_dir>/wandb_run_id.txt`` like a live run, so a later
-``--resume`` appends to the same W&B run.
+``wandb.util.generate_id``; scale-1 S1-vae*: wandb missing from the env). Uses the same
+keys and steps as live logging in ``train.py``, except ``train/grad_norm_preclip``, which
+the CSV does not record. The run id is written to ``<run_dir>/wandb_run_id.txt`` like a
+live run, so a later ``--resume`` appends to the same W&B run. ``--force`` appends to an
+existing id instead (e.g. a history-less stub left by a continuation job that found the
+run complete).
 
     python -m specdec_af.training.wandb_backfill RUN_DIR [RUN_DIR ...] --project specdec-af-gpt2
 """
@@ -15,6 +17,7 @@ import csv
 import json
 from pathlib import Path
 
+from specdec_af.inflight import read_jsonl
 from specdec_af.models.chunk_index import N_LAYERS_DEFAULT
 from specdec_af.training.train import WandbLogger
 
@@ -36,7 +39,9 @@ def backfill_run(run_dir: Path, project: str, *, entity: str | None = None, forc
     if wb.run is None:
         raise RuntimeError("wandb init failed (see WARN above)")
 
-    val_by_step = {int(v["step"]): v for v in summary.get("val_history", [])}
+    # One step-ordered stream (W&B drops out-of-order steps). Live logging puts val and in-flight
+    # metrics measured after step s at step s-1, the last optimizer step before them.
+    rows: dict[int, dict] = {}
     n = 0
     with open(run_dir / "training_log.csv", newline="") as fh:
         for r in csv.DictReader(fh):
@@ -49,14 +54,14 @@ def backfill_run(run_dir: Path, project: str, *, entity: str | None = None, forc
                     v = _f(r.get(f"{pfx}_b{b}", ""))
                     if v == v:
                         row[f"block_{pfx}/b{b:02d}"] = v
-            # Live logging puts val@step s at step s-1 (the last optimizer step before it).
-            v = val_by_step.pop(idx + 1, None)
-            if v is not None:
-                row.update({f"val/{k[4:]}": x for k, x in v.items() if k.startswith("val_")})
-            wb.log(row, step=idx)
+            rows.setdefault(idx, {}).update(row)
             n += 1
-    for s, v in sorted(val_by_step.items()):  # val points not aligned to a CSV row
-        wb.log({f"val/{k[4:]}": x for k, x in v.items() if k.startswith("val_")}, step=s - 1)
+    for v in summary.get("val_history", []):
+        rows.setdefault(int(v["step"]) - 1, {}).update({f"val/{k[4:]}": x for k, x in v.items() if k.startswith("val_")})
+    for r in read_jsonl(run_dir / "inflight.jsonl"):
+        rows.setdefault(int(r["step"]) - 1, {}).update({f"inflight/{k}": x for k, x in r.items() if k != "step"})
+    for step in sorted(rows):
+        wb.log(rows[step], step=step)
 
     final_val = summary.get("final_val") or {}
     wb.summary({"complete": summary.get("complete"), "n_steps_completed": summary.get("n_steps_completed"),

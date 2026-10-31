@@ -16,6 +16,7 @@
 #   RUN_NAMES      — space-separated run names under outputs/train (required)
 #   WANDB_PROJECT  — default specdec-af-gpt2
 #   WANDB_ENTITY   — default: your wandb default entity
+#   FORCE=1        — append to an existing wandb_run_id.txt (e.g. a stub from a no-op continuation job)
 #
 # Example:
 #   RUN_NAMES="rev7A_opt4 rev7A_optd" sbatch scripts/slurm/submit_wandb_backfill.sh
@@ -32,8 +33,9 @@ mkdir -p "$WANDB_DIR" "${REPO_DIR}/logs"
 if command -v module &>/dev/null; then
   module load anaconda3 || module load miniconda3 || true
 fi
-# shellcheck disable=SC1091
-source activate "$ENV_PREFIX"
+# Env python directly: `source activate` can leave base py3.12 active in batch jobs.
+PY="${ENV_PREFIX}/bin/python"
+export PYTHONNOUSERSITE=1
 cd "$REPO_DIR"
 echo "job=${SLURM_JOB_ID:-?} git=$(git rev-parse --short HEAD) RUN_NAMES=${RUN_NAMES}"
 
@@ -42,5 +44,5 @@ for r in $RUN_NAMES; do DIRS+=("${SCRATCH}/specdec_af/outputs/train/$r"); done
 ENTITY_ARGS=()
 if [[ -n "${WANDB_ENTITY:-}" ]]; then ENTITY_ARGS+=(--entity "$WANDB_ENTITY"); fi
 
-python -m specdec_af.training.wandb_backfill "${DIRS[@]}" --project "$WANDB_PROJECT" "${ENTITY_ARGS[@]}"
+"$PY" -m specdec_af.training.wandb_backfill "${DIRS[@]}" --project "$WANDB_PROJECT" "${ENTITY_ARGS[@]}" ${FORCE:+--force}
 echo "wandb-backfill: DONE"
