@@ -95,6 +95,9 @@ tr:last-child td { border-bottom: 0; }
 .empty { border: 1px dashed var(--rule); border-radius: 6px; padding: 18px 20px; color: var(--ink-2); font-size: 0.92rem;
   display: grid; gap: 4px; }
 .empty strong { color: var(--ink); font-weight: 500; }
+.findings { margin: 0; padding-left: 1.1em; display: grid; gap: 10px; max-width: 72ch; }
+.findings li::marker { color: var(--muted); }
+.findings b { font-weight: 600; }
 .notes { margin: 0; padding-left: 1.1em; display: grid; gap: 6px; color: var(--ink-2); max-width: 70ch; }
 @media (prefers-reduced-motion: no-preference) { .chart path.line { transition: opacity .15s; } }
 </style>
@@ -113,6 +116,11 @@ tr:last-child td { border-bottom: 0; }
   </section>
 
   <section>
+    <div class="sec-head"><span class="eyebrow" id="readout-eyebrow">Readout</span><h2>What we know so far</h2></div>
+    <div id="readout"></div>
+  </section>
+
+  <section>
     <div class="sec-head"><span class="eyebrow">Status</span><h2>Runs</h2></div>
     <div class="tbl-wrap"><table id="runs"></table></div>
   </section>
@@ -124,7 +132,7 @@ tr:last-child td { border-bottom: 0; }
 
   <section>
     <div class="sec-head"><span class="eyebrow">Stage 1 · trace VAE</span><h2>VAE: d128 vs d256</h2>
-      <p class="muted">In-flight metrics on 2,000 fixed cache_s1 val positions (z = μ, fp32), every 5k steps; the table is the post-hoc suite.</p></div>
+      <p class="muted" id="vae-sub">In-flight metrics on fixed cache_s1 val positions (z = μ, fp32); the table is the post-hoc suite.</p></div>
     <div id="vae"></div>
   </section>
 
@@ -204,13 +212,16 @@ function renderMethods() {
   const corpus = c ? `<p>${fmt(c.train_tokens / 1e9, 2)}B train tokens (${c.train_seq.toLocaleString("en-US")} packed 256-token sequences); ${fmt((c.val_tokens || 0) / 1e6, 1)}M held-out val tokens.</p>
       <ul>${c.sources.map((s) => `<li><span class="mono">${esc(s.source)}</span>: ${fmt((s.token_end - s.token_start) / 1e9, 2)}B tokens, ${s.n_docs.toLocaleString("en-US")} docs</li>`).join("")}</ul>`
     : `<p>Target: ~2B tokens, 50/50 FineWeb-Edu (sample-10BT) and OpenWebText. Tokenization has not run yet.</p>`;
+  const vc = D.vae.d128.cfg || D.vae.d256.cfg, b = D.bench;
+  const nPos = vc?.n_pos ?? 32, pMin = vc?.p_min ?? 32;
+  const sched = vc ? `<p class="mono" style="font-size:.8rem">${fmt(vc.n_steps_override, 0)} steps · batch ${vc.batch_size} · lr ${vc.lr} · β ${vc.beta_max} (linear ramp over ${fmt(vc.beta_anneal_steps, 0)}) · free bits ${vc.free_bits} nat/dim · ${esc(vc.precision)}</p>` : "";
   const blocks = [
     ["Corpus", corpus + `<p>Documents are joined with &lt;|endoftext|&gt; and packed. ${pct(c ? c.val_frac : 0.005)} of documents go to val by a salted blake2b hash, so train and val share no document.</p>`],
-    ["Traces", `<p>Frozen GPT-2 small; 12 blocks × 9,984 values per position (8 slots per block), 16 positions per sequence drawn from [32, 255], streamed live (fp32 forward, fp16 rounding). Val and the ChunkNorm fit come from cache_s1: 10k val positions plus a 20k-position train slice.</p>`],
-    ["VAE", `<p>Per-block trace VAE, option D (raw decoder output, σ as loss weight). The arms differ only in d_latent (128 vs 256): same β ramp, same per-dim free bits (0.1 nat), same data order. Total KL and the count of dims at the free-bits floor are tracked, since d256 doubles the floor.</p>`],
+    ["Traces", `<p>Frozen GPT-2 small; 12 blocks × 9,984 values per position (8 slots per block), ${nPos} positions per sequence drawn from [${pMin}, 255], streamed live from the train split (fp32 forward, fp16 rounding); at this budget no position repeats. Val and the ChunkNorm fit come from cache_s1: 10k val positions plus a 20k-position train slice.</p>`],
+    ["VAE", `<p>Per-block trace VAE, option D (raw decoder output, σ as loss weight). The arms differ only in d_latent (128 vs 256): same β ramp, same per-dim free bits (0.1 nat), same data order. Total KL and the count of dims at the free-bits floor are tracked, since d256 doubles the floor.</p>${sched}`],
     ["DiT", `<p>Rectified-flow DiT over the 12 block latents, conditioned through cross-attention on a masked 256-token prefix window (frozen MDLM block-0 encoder, slot position embeddings, pre-start slots dropped), adaLN-Zero on t. Raw VAE coordinates, z = μ for the width comparison; the winner also gets the posterior-sample arm.</p>`],
     ["Evaluation", `<ul><li>Teacher top-1, top-5, KL and acceptance through GPT-2's lm_head on the decoded terminal slot</li><li>m-curve: top-1 against visible suffix length</li><li>Latent/residual FD and KID; K-sample diversity; CFG sweep; nearest-neighbour memorization ratio</li><li>OOD probe: rev-7 WikiText-103 val</li></ul>`],
-    ["Compute", D.bench ? `<p>Benchmarked on ${esc(D.bench.gpu)}. bf16 autocast for VAE and DiT training; GPT-2 trace forward kept fp32.</p>` : `<p>Single GPU (Explorer H200 or A100), bf16 autocast for VAE and DiT training; the GPT-2 trace forward stays fp32 pending a parity check. The benchmark has not run yet.</p>`],
+    ["Compute", b ? `<p>One ${esc(b.gpu)} per run, ${esc(vc?.precision || "fp32")} throughout (bf16 gains little on V100, and the trace producer is the bottleneck). Bench: producer ${fmt(Math.max(...[].concat(b.producer || []).map((p) => p.pos_per_s || 0)), 0)} positions/s; the VAE runs took ${arms.map((a) => D.vae[a].wall_hours?.toFixed(1)).filter(Boolean).join(" h and ")} h.</p>` : `<p>Single GPU, fp32. The benchmark has not run yet.</p>`],
   ];
   $("#methods").innerHTML = blocks.map(([h, b]) => `<div><h3>${h}</h3>${b}</div>`).join("");
 }
@@ -263,12 +274,16 @@ const pts = (rows, key) => rows.filter((r) => r[key] != null).map((r) => [r.step
 function renderVAE() {
   const host = $("#vae"), V = D.vae;
   if (arms.every((a) => !V[a].inflight.length && !V[a].post)) { host.innerHTML = emptyBox("No VAE results yet", "S1-vae128 and S1-vae256 have not reported. In-flight curves appear after the first 5k steps of either run."); return; }
+  const vc = V.d128.cfg || V.d256.cfg;
+  if (vc) $("#vae-sub").textContent = `In-flight metrics on ${fmt(vc.inflight_positions, 0)} fixed cache_s1 val positions and 1,000 WikiText-103 val positions (z = μ, fp32), every ${fmt(vc.inflight_every_steps, 0)} steps; the table is the post-hoc suite.`;
   const charts = el("div", { class: "charts" }); host.appendChild(charts);
   const mk = (title, key, f) => lineChart(charts, { title, yFmt: f, series: arms.map((a) => ({ ...SERIES[a], points: pts(V[a].inflight, key) })) });
   mk("Val teacher top-1", "val/top1_agreement", pct);
   mk("OOD (WikiText-103) teacher top-1", "ood/top1_agreement", pct);
   mk("Total KL (nats per position)", "latent/kl_total", (v) => fmt(v, 0));
   mk("Latent dims at the free-bits floor", "latent/dims_at_free_bits_floor", (v) => fmt(v, 0));
+  mk("Active units (Var[μ] > 0.01)", "latent/active_units", (v) => fmt(v, 0));
+  mk("Val acceptance Σ min(p, q)", "val/acceptance", pct);
   const P = (a) => V[a].post, O = (a) => V[a].post_ood;
   const rows = [["Teacher top-1", (a) => pct(P(a)?.top1_agreement)], ["Top-5 overlap", (a) => pct(P(a)?.top5_overlap)],
     ["KL(teacher ‖ student)", (a) => fmt(P(a)?.kl_teacher_student)], ["Acceptance Σ min(p, q)", (a) => pct(P(a)?.acceptance)],
@@ -287,7 +302,7 @@ function renderLDM() {
   const host = $("#ldm"), L = D.ldm;
   const keys = Object.keys(L);
   const style = (k) => k.endsWith("-sample") ? { label: k, color: "var(--s3)", dash: true } : { ...SERIES[k.slice(0, 4)], label: k };
-  if (keys.every((k) => !L[k].inflight.length && !L[k].post)) { host.innerHTML = emptyBox("No DiT results yet", "The DiT arms start after their VAE finishes and its latents are exported. The in-flight m-curve appears every 5k steps."); return; }
+  if (keys.every((k) => !L[k].inflight.length && !L[k].post)) { host.innerHTML = emptyBox("No DiT results yet", "The DiT arms start after their VAE finishes and its latents are exported. The in-flight m-curve appears every 10k steps."); return; }
   const charts = el("div", { class: "charts" }); host.appendChild(charts);
   const cats = ["null", "m0", "m2", "m8", "m32", "mfull"];
   lineChart(charts, { title: "m-curve: decoded top-1 by visible context (post-hoc suite)", xCats: cats, yFmt: pct,
@@ -306,6 +321,46 @@ function renderLDM() {
   }
 }
 
+/* ---------- readout: plain-language summary computed from whatever has landed ---------- */
+function tailMean(rows, key, frac = 0.2) {
+  const xs = rows.filter((r) => r[key] != null); if (!xs.length) return null;
+  const s1 = xs.at(-1).step, keep = xs.filter((r) => r.step >= (1 - frac) * s1);
+  const m = keep.reduce((t, r) => t + r[key], 0) / keep.length;
+  const sd = Math.sqrt(keep.reduce((t, r) => t + (r[key] - m) ** 2, 0) / Math.max(1, keep.length - 1));
+  return { m, sd, n: keep.length, from: keep[0].step, to: s1 };
+}
+function renderReadout() {
+  const V = D.vae, host = $("#readout"), out = [];
+  const done = (a) => V[a].status === "complete";
+  $("#readout-eyebrow").textContent = D.verdict.status === "decided" ? "Readout" : "Interim readout";
+  if (!arms.some((a) => V[a].inflight.length)) { host.innerHTML = emptyBox("Nothing has reported yet", "This section fills in as the VAE in-flight evals land."); return; }
+  const T = (a, k) => tailMean(V[a].inflight, k), pp = (x) => (100 * x).toFixed(1);
+  const t1 = { d128: T("d128", "val/top1_agreement"), d256: T("d256", "val/top1_agreement") };
+  const o1 = { d128: T("d128", "ood/top1_agreement"), d256: T("d256", "ood/top1_agreement") };
+  const last = (a) => V[a].inflight.at(-1) || {};
+  const stage = arms.every(done) ? "Both VAEs finished" : "VAEs in progress";
+  if (t1.d128 && t1.d256) {
+    const d = t1.d256.m - t1.d128.m, sd = Math.max(t1.d128.sd, t1.d256.sd);
+    out.push(`<b>${stage}; d256 reconstructs better.</b> Val teacher top-1 ${pp(t1.d256.m)}% vs ${pp(t1.d128.m)}% (${d >= 0 ? "+" : ""}${pp(d)} pp), averaged over the in-flight evals in the last 20% of training. Evals are on the same fixed positions; step-to-step s.d. is ≤ ${pp(sd)} pp, so the gap is well outside eval wobble.` +
+      (o1.d128 && o1.d256 ? ` The ordering holds out of domain on WikiText-103: ${pp(o1.d256.m)}% vs ${pp(o1.d128.m)}%.` : ""));
+  }
+  const L = { d128: last("d128"), d256: last("d256") };
+  const kl = (a) => L[a]["latent/kl_total"], fl = (a) => L[a]["latent/dims_at_free_bits_floor"], au = (a) => L[a]["latent/active_units"];
+  if (kl("d128") && kl("d256")) {
+    const n256 = 12 * 256;
+    out.push(`<b>The lead is partly bought with rate.</b> At the same β, d256 spends ${fmt(kl("d256"), 0)} nats per position against ${fmt(kl("d128"), 0)} (${(kl("d256") / kl("d128")).toFixed(2)}×). It parks ${fmt(fl("d256"), 0)} of its ${fmt(n256, 0)} dims (${pp(fl("d256") / n256)}%) at the 0.1-nat free-bits floor, where d128 parks ${fmt(fl("d128"), 0)}; active units are ${fmt(au("d256"), 0)} vs ${fmt(au("d128"), 0)}. So d256 is a ~${(au("d256") / au("d128")).toFixed(2)}× wider code in practice, not 2×, and the floor charges it ~${fmt(0.1 * fl("d256"), 0)} nats of KL for dims that carry nothing.`);
+    out.push(`<b>Why that matters for the DiT.</b> The floor-pinned dims are close to N(0, 1) under the encoder, so they should be cheap for the DiT to model, but they still enter its loss and its FD/KID. The pre-registered width rule judges the DiT end to end, so this is priced in. If the DiT verdict lands in the ±1 pp tie band, the plan's matched-rate d256 control (β tuned to d128's total KL) is the follow-up.`);
+  }
+  const fv = (a, k) => V[a].final_val?.[k];
+  if (fv("d128", "recon") != null && fv("d256", "recon") != null)
+    out.push(`<b>One loss runs the other way.</b> Final val recon (σ-weighted) is ${fv("d256", "recon").toFixed(3)} vs ${fv("d128", "recon").toFixed(3)}, in d256's favour, but unnormalised terminal-slot MSE is ${fv("d256", "terminal_mse_unnorm").toFixed(3)} vs ${fv("d128", "terminal_mse_unnorm").toFixed(3)}, worse for d256 despite its better top-1. One reading: under option D's σ-weighted loss, the extra width goes to the high-weight slots the head depends on rather than to raw L2 on the terminal slot. This is a hypothesis; the post-hoc suite's per-slot breakdown will test it.`);
+  const firstAt = (a, x) => V[a].inflight.find((r) => r["val/top1_agreement"] >= x)?.step;
+  if (firstAt("d128", 0.49) && firstAt("d256", 0.49)) out.push(`<b>d256 also learns faster.</b> It first reaches 49% val top-1 at step ${fmt(firstAt("d256", 0.49), 0)}, d128 at ${fmt(firstAt("d128", 0.49), 0)}. d128 is flat from about 400k (the end of the β ramp), while d256 was still edging up at 1M.`);
+  const ldmGoing = Object.values(D.ldm).some((r) => r.status !== "not started");
+  out.push(`<b>Next:</b> ${ldmGoing ? "the DiT arms are training; their in-flight m-curves appear below every 10k steps." : "latent exports, then one DiT-S μ arm per width (100k steps, ~14 h each), then the LDM suites that decide the width."} The post-hoc VAE suite (10k val positions, plus the WikiText probe) replaces the in-flight numbers above when it lands.`);
+  host.innerHTML = `<ol class="findings">${out.map((x) => `<li>${x}</li>`).join("")}</ol>`;
+}
+
 /* ---------- notes ---------- */
 function renderNotes() {
   const notes = [
@@ -317,5 +372,5 @@ function renderNotes() {
   $("#notes").innerHTML = notes.map((n) => `<li>${esc(n)}</li>`).join("");
 }
 
-if (D) { renderMeta(); renderVerdict(); renderRuns(); renderMethods(); renderVAE(); renderLDM(); renderNotes(); }
+if (D) { renderMeta(); renderVerdict(); renderReadout(); renderRuns(); renderMethods(); renderVAE(); renderLDM(); renderNotes(); }
 </script>

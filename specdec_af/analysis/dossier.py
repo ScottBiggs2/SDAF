@@ -31,6 +31,8 @@ VAE_RUNS = {"d128": "S1-vae128", "d256": "S1-vae256"}
 LDM_RUNS = {"d128-mu": "S1-ldm128-mu", "d256-mu": "S1-ldm256-mu"}  # + any ldm/S1-ldm*-sample
 MCURVE = ("null", "m0", "m2", "m8", "m32", "mfull")
 TEMPLATE = Path(__file__).with_name("dossier_template.html")
+CFG_KEYS = ("d_latent", "batch_size", "lr", "beta_max", "beta_anneal_steps", "free_bits", "n_steps_override",
+            "precision", "inflight_every_steps", "inflight_positions", "z_source", "n_steps")
 
 # Pre-registered width rule (plan Phase 4, written 10-29 before any scale-1 run).
 RULE = {"primary": "gap_top1 at mfull (LDM suite, S1 val, EMA)", "tie_band": 0.01, "tie_prefers": "d128",
@@ -81,8 +83,16 @@ def _run_status(run_dir: Path, n_steps_key: str) -> dict:
         step = int(ckpts[-1].stem.split("_")[1]) if ckpts else 0
     else:
         return {"status": "not started"}
-    return {"status": status, "step": step, "n_steps": total,
-            "wall_hours": wall / 3600 if wall else None, "wandb_url": _text(run_dir / "wandb_url.txt")}
+    out = {"status": status, "step": step, "n_steps": total,
+           "wall_hours": wall / 3600 if wall else None, "wandb_url": _text(run_dir / "wandb_url.txt")}
+    if s is not None:  # schedule + final val, so the methods sheet quotes what actually ran
+        tc = s.get("training_config") or {}
+        out["cfg"] = {k: tc[k] for k in CFG_KEYS if k in tc} | {
+            k: tc["stream"][k] for k in ("n_pos", "p_min", "gpt2_precision") if k in (tc.get("stream") or {})}
+        out["n_params"] = s.get("n_params")
+        out["final_val"] = {k.removeprefix("val_"): v for k, v in (s.get("final_val") or {}).items()
+                            if k.startswith("val_") and k != "val_n_batches"}
+    return out
 
 
 def _latest_eval(run_dir: Path) -> dict | None:
