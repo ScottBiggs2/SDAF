@@ -54,7 +54,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 from torch import Tensor
 
 from specdec_af.analysis.consistency import (
@@ -70,6 +69,7 @@ from specdec_af.models.chunk_norm import ChunkNorm, build_mask
 from specdec_af.training.checkpoint import load_vae_checkpoint
 from specdec_af.training.losses import Mode
 from specdec_af.training.train import expand_env, pick_device
+from specdec_af.utils.config import load_config
 
 Condition = Literal["qz_mean", "qz_sample", "prior", "wrong_z"]
 ALL_CONDITIONS: tuple[Condition, ...] = ("qz_mean", "qz_sample", "prior", "wrong_z")
@@ -565,7 +565,7 @@ def main() -> int:
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
+    cfg = load_config(args.config)
     cache_dir = Path(args.cache_dir or expand_env(cfg["paths"]["cache_dir"]))
     n_positions = args.n_positions or cfg["cache_v2"]["val_positions"]
     device = pick_device(force_cpu=args.cpu)

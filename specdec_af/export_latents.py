@@ -33,13 +33,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 
 from specdec_af.data.dataset import list_shards, read_split
 from specdec_af.evaluate import encode_traces
 from specdec_af.training.checkpoint import load_vae_checkpoint
 from specdec_af.training.train import expand_env, pick_device
-from specdec_af.utils.config import file_sha256
+from specdec_af.utils.config import file_sha256, load_config
 
 
 @torch.no_grad()
@@ -122,7 +121,7 @@ def main() -> int:
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
+    cfg = load_config(args.config)
     cache_dir = Path(args.cache_dir or expand_env(cfg["paths"]["cache_dir"]))
     out_dir = Path(args.out or Path(expand_env(cfg["paths"]["output_dir"])) / "latents" / args.run_name)
     if (out_dir / "index.json").exists():

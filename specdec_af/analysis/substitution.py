@@ -52,7 +52,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 from torch import Tensor
 
 from specdec_af.data.dataset import PositionSet, read_split
@@ -62,6 +61,7 @@ from specdec_af.models.chunk_norm import ChunkNorm, build_mask
 from specdec_af.models.hooks import HOOK_NAMES_PER_BLOCK
 from specdec_af.training.checkpoint import load_vae_checkpoint
 from specdec_af.training.train import expand_env, pick_device
+from specdec_af.utils.config import load_config
 
 J = N_LAYERS_DEFAULT
 MODES = ("vae", "identity", "meanabl", "noise")
@@ -578,7 +578,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cpu", action="store_true")
     a = ap.parse_args()
-    cfg = yaml.safe_load(open(a.config))
+    cfg = load_config(a.config)
     cache_dir = a.cache_dir or Path(expand_env(cfg["paths"]["cache_dir"]))
     n_pos = a.n_positions or int(cfg["cache_v2"]["val_positions"])
     device = pick_device(force_cpu=a.cpu)

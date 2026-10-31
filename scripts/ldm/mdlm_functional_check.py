@@ -31,11 +31,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 
 from specdec_af.data.dataset import read_split
 from specdec_af.ldm.prefix_block import MDLM_REVISION, MDLMFull, load_mdlm_state
-from specdec_af.utils.config import expand_env, pick_device
+from specdec_af.utils.config import expand_env, pick_device, load_config
 
 MASK_ID = 50257
 VARIANTS = {
@@ -95,7 +94,7 @@ def main() -> int:
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
+    cfg = load_config(args.config)
     cache_dir = Path(args.cache_dir or expand_env(cfg["paths"]["cache_dir"]))
     device = pick_device(force_cpu=args.cpu)
     if device.type == "cuda":
