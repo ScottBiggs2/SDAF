@@ -26,6 +26,9 @@ SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 RUN_NAME="${RUN_NAME:?set RUN_NAME}"
 CKPT="${CKPT:-${SCRATCH}/specdec_af/outputs/train/${RUN_NAME}/checkpoints/final.pt}"
 CONFIG="${CONFIG:-configs/default.yaml}"   # scale-1: configs/scale1.yaml exports cache_s1 (20k train + 10k val rows)
+OUT_NAME="${OUT_NAME:-$RUN_NAME}"           # scale-1 OOD: OUT_NAME=S1-vae128_wt CACHE_DIR=<rev-7 cache_v2>
+EXTRA_ARGS=()
+if [[ -n "${CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--cache-dir "$CACHE_DIR"); fi
 export PYTHONNOUSERSITE=1
 PY="$ENV_PREFIX/bin/python"
 
@@ -49,8 +52,8 @@ echo "====================="
 
 "$PY" -m specdec_af.export_latents \
   --checkpoint "$CKPT" \
-  --run-name "$RUN_NAME" \
-  --config "$CONFIG"
+  --run-name "$OUT_NAME" \
+  --config "$CONFIG" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
-du -sh "${SCRATCH}/specdec_af/outputs/latents/${RUN_NAME}"
+du -sh "${SCRATCH}/specdec_af/outputs/latents/${OUT_NAME}"
 echo "export: DONE  RUN_NAME=$RUN_NAME"

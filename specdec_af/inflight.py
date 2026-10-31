@@ -108,10 +108,14 @@ class LDMInflight:
         was_training = dit.training
         dit.eval()
         try:
-            accs, floor, _, ref = score_conditions(ldm, dit, self.table, self.sampler, self.dec, self.rows,
+            accs, floor, real, ref = score_conditions(ldm, dit, self.table, self.sampler, self.dec, self.rows,
                                                    self.conds, self.sc, self.device, verbose=False)
             floor_top1 = float(floor.cat("top1").mean())
+            from specdec_af.ldm.evaluate_ldm import true_text_summary
             out: dict = {"floor/top1": floor_top1, "floor/kl": float(floor.cat("kl").mean())}
+            for who, acc in (("floor", floor), ("teacher", real)):
+                t = true_text_summary(acc)
+                out[f"{who}/true_top1"], out[f"{who}/ppl"] = t["true_top1"], t["ppl"]
             for name, _ in self.conds:
                 a = accs[name]
                 top1 = float(a.cat("top1").mean())
@@ -119,6 +123,8 @@ class LDMInflight:
                 out[f"gap_top1/{name}"] = top1 - floor_top1
                 out[f"kl/{name}"] = float(a.cat("kl").mean())
                 out[f"latent_cos/{name}"] = float(a.cat("lat_cos").mean())
+                t = true_text_summary(a)
+                out[f"true_top1/{name}"], out[f"ppl/{name}"] = t["true_top1"], t["ppl"]
             out["shuffled_minus_full/top1"] = out["top1/shuffled"] - out["top1/mfull"]
             d = _dist(accs["null"].cat("z"), ref.cat("mu"), self.sc, self.device)
             out["null/kid_joint"] = float(d["kid_joint"]["mean"]) if "kid_joint" in d else float("nan")

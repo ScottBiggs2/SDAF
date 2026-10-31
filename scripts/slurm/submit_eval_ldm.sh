@@ -20,7 +20,9 @@
 #   STEPS       — Euler steps (default 50)
 #   CFG_W       — guidance scale for the main table (default 1.0)
 #   WEIGHTS     — ema | raw (default ema)
-#   OUT         — output dir (default ${RUN_NAME}/eval_step<step>)
+#   OUT         — output dir (default ${RUN_NAME}/eval_step<step>[_<TAG>])
+#   LATENTS_DIR / CACHE_DIR / TAG — scale-1 OOD: eval on another export, e.g.
+#                 LATENTS_DIR=$SCRATCH/specdec_af/outputs/latents/S1-vae128_wt CACHE_DIR=$SCRATCH/specdec_af/cache_v2 TAG=ood
 #
 #   RUN_NAME=rev8_mu sbatch scripts/slurm/submit_eval_ldm.sh
 #   python -m specdec_af.ldm.evaluate_ldm compare <run_dir>/eval_step50000 <other>/eval_step50000
@@ -63,6 +65,9 @@ if [[ -n "${STEPS:-}" ]]; then EXTRA_ARGS+=(--steps "$STEPS"); fi
 if [[ -n "${CFG_W:-}" ]]; then EXTRA_ARGS+=(--cfg-w "$CFG_W"); fi
 if [[ -n "${WEIGHTS:-}" ]]; then EXTRA_ARGS+=(--weights "$WEIGHTS"); fi
 if [[ -n "${OUT:-}" ]]; then EXTRA_ARGS+=(--out "$OUT"); fi
+if [[ -n "${LATENTS_DIR:-}" ]]; then EXTRA_ARGS+=(--latents-dir "$LATENTS_DIR"); fi
+if [[ -n "${CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--cache-dir "$CACHE_DIR"); fi
+if [[ -n "${TAG:-}" ]]; then EXTRA_ARGS+=(--tag "$TAG"); fi
 
 "$PY" -m specdec_af.ldm.evaluate_ldm suite --checkpoint "$CKPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 

@@ -134,6 +134,6 @@ def test_scale1_config_inherits_default():
     assert s["vae"] == d["vae"] and s["ldm"]["dit"] == d["ldm"]["dit"]
     assert s["ldm"]["training"]["lr"] == d["ldm"]["training"]["lr"] and s["ldm"]["training"]["precision"] == "fp32"
     assert s["stream"]["tokens_path"].endswith("tokens/s1/train.npy")
-    assert s["stream"]["micro_bs"] == d["stream"]["micro_bs"]  # merged, not replaced
+    assert s["stream"]["seqs_per_chunk"] == d["stream"]["seqs_per_chunk"] and s["stream"]["micro_bs"] == 64  # merged, not replaced
     assert s["stream"]["n_pos"] == 32 and s["cache_v2"]["n_pos"] == 16
     assert s["cache_v2"]["seq_len"] == d["cache_v2"]["seq_len"] and s["cache_v2"]["val_shards"] == 11

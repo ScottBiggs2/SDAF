@@ -138,7 +138,7 @@ tr:last-child td { border-bottom: 0; }
 
   <section>
     <div class="sec-head"><span class="eyebrow">Stage 2 · prompt-conditioned DiT</span><h2>Latent diffusion</h2>
-      <p class="muted">Decoded teacher top-1 by condition: null, suffix context m ∈ {0, 2, 8, 32, full}, holes, shuffled. The VAE floor is decode(μ).</p></div>
+      <p class="muted">Sample a latent, decode it, read GPT-2's head off the terminal slot, and score it against the text's real next token (accuracy and perplexity) and against GPT-2's own prediction (agreement, acceptance). Conditions: null, suffix context m ∈ {0, 2, 8, 32, full}, holes, shuffled. The VAE floor is decode(μ); GPT-2 itself is the ceiling.</p></div>
     <div id="ldm"></div>
   </section>
 
@@ -175,7 +175,7 @@ function renderMeta() {
 /* ---------- verdict ---------- */
 function renderVerdict() {
   const v = D.verdict, r = v.rule;
-  const ruleTxt = `Primary: ${esc(r.primary)}. Guards: m-curve non-decreasing (tolerance ${r.monotone_tol}), shuffled − full top-1 &lt; ${r.shuffled_minus_full_max}, null-sample joint KID ≤ ${r.null_kid_max_ratio}× the other arm. Within ±${r.tie_band} on the primary, prefer ${esc(r.tie_prefers)} (easier to diffuse).`;
+  const ruleTxt = `Primary: ${esc(r.primary)}. Guards: m-curve non-decreasing (tolerance ${r.monotone_tol}), shuffled − full top-1 &lt; ${r.shuffled_minus_full_max}, null-sample joint KID ≤ ${r.null_kid_max_ratio}× the other arm. Within ±${r.tie_band} on the primary, the ${esc(r.tie_break || "")} wins; if that ties too, prefer ${esc(r.tie_prefers)}.${r.amended ? ` <em>Amended ${esc(r.amended)}.</em>` : ""}`;
   if (v.status !== "decided") {
     $("#verdict").innerHTML = `<div class="verdict"><div class="headline"><span class="call">Pending</span>${pill("pending")}</div>
       <p>${esc(v.reason)}. The verdict fills in when both μ-arm LDM suites have run.</p><p class="muted">${ruleTxt}</p></div>`;
@@ -184,8 +184,10 @@ function renderVerdict() {
   const c = v.checks;
   const chip = (ok) => ok ? `<span class="pill good">pass</span>` : `<span class="pill bad">fail</span>`;
   const col = (a) => `<div class="check"><h3><span class="key" style="border-color:${SERIES[a].color}"></span>${a}${v.winner === a ? " · selected" : ""}</h3><ul>
-      <li><span>gap top-1 @ mfull</span><span class="num">${signed(c[a].gap_top1_mfull)}</span></li>
-      <li><span>top-1 @ mfull</span><span class="num">${pct(c[a].top1_mfull)}</span></li>
+      <li><span>next-token top-1 @ mfull (primary)</span><span class="num">${pct(c[a].primary)}</span></li>
+      <li><span>perplexity @ mfull (tie-break)</span><span class="num">${fmt(c[a].ppl_mfull, 2)}</span></li>
+      <li><span>teacher agreement @ mfull</span><span class="num">${pct(c[a].top1_mfull)}</span></li>
+      <li><span>gap to own VAE floor</span><span class="num">${signed(c[a].gap_top1_mfull)}</span></li>
       <li><span>m-curve monotone</span>${chip(c[a].monotone)}</li>
       <li><span>shuffled − full <span class="num">${signed(c[a].shuffled_minus_full)}</span></span>${chip(c[a].shuffle_ok)}</li>
       <li><span>null KID <span class="num">${fmt(c[a].null_kid, 4)}</span></span>${chip(c[a].kid_ok)}</li>
@@ -220,7 +222,7 @@ function renderMethods() {
     ["Traces", `<p>Frozen GPT-2 small; 12 blocks × 9,984 values per position (8 slots per block), ${nPos} positions per sequence drawn from [${pMin}, 255], streamed live from the train split (fp32 forward, fp16 rounding); at this budget no position repeats. Val and the ChunkNorm fit come from cache_s1: 10k val positions plus a 20k-position train slice.</p>`],
     ["VAE", `<p>Per-block trace VAE, option D (raw decoder output, σ as loss weight). The arms differ only in d_latent (128 vs 256): same β ramp, same per-dim free bits (0.1 nat), same data order. Total KL and the count of dims at the free-bits floor are tracked, since d256 doubles the floor.</p>${sched}`],
     ["DiT", `<p>Rectified-flow DiT over the 12 block latents, conditioned through cross-attention on a masked 256-token prefix window (frozen MDLM block-0 encoder, slot position embeddings, pre-start slots dropped), adaLN-Zero on t. Raw VAE coordinates, z = μ for the width comparison; the winner also gets the posterior-sample arm.</p>`],
-    ["Evaluation", `<ul><li>Teacher top-1, top-5, KL and acceptance through GPT-2's lm_head on the decoded terminal slot</li><li>m-curve: top-1 against visible suffix length</li><li>Latent/residual FD and KID; K-sample diversity; CFG sweep; nearest-neighbour memorization ratio</li><li>OOD probe: rev-7 WikiText-103 val</li></ul>`],
+    ["Evaluation", `<ul><li><b>Primary:</b> next-token accuracy and perplexity on the real text, read through GPT-2's lm_head from the decoded terminal slot; GPT-2's own numbers on the same positions are the ceiling</li><li>Teacher agreement (top-1, top-5), KL and acceptance Σ min(p, q) against GPT-2's own distribution</li><li>m-curve: top-1 against visible suffix length</li><li>Latent/residual FD and KID; K-sample diversity; CFG sweep; nearest-neighbour memorization ratio</li><li>OOD probe: rev-7 WikiText-103 val</li></ul>`],
     ["Compute", b ? `<p>One ${esc(b.gpu)} per run, ${esc(vc?.precision || "fp32")} throughout (bf16 gains little on V100, and the trace producer is the bottleneck). Bench: producer ${fmt(Math.max(...[].concat(b.producer || []).map((p) => p.pos_per_s || 0)), 0)} positions/s; the VAE runs took ${arms.map((a) => D.vae[a].wall_hours?.toFixed(1)).filter(Boolean).join(" h and ")} h.</p>` : `<p>Single GPU, fp32. The benchmark has not run yet.</p>`],
   ];
   $("#methods").innerHTML = blocks.map(([h, b]) => `<div><h3>${h}</h3>${b}</div>`).join("");
@@ -305,17 +307,20 @@ function renderLDM() {
   if (keys.every((k) => !L[k].inflight.length && !L[k].post)) { host.innerHTML = emptyBox("No DiT results yet", "The DiT arms start after their VAE finishes and its latents are exported. The in-flight m-curve appears every 10k steps."); return; }
   const charts = el("div", { class: "charts" }); host.appendChild(charts);
   const cats = ["null", "m0", "m2", "m8", "m32", "mfull"];
-  lineChart(charts, { title: "m-curve: decoded top-1 by visible context (post-hoc suite)", xCats: cats, yFmt: pct,
+  lineChart(charts, { title: "m-curve: next-token top-1 on the real text, by visible context (post-hoc suite)", xCats: cats, yFmt: pct,
     series: keys.map((k) => { const p = L[k].post; const row = p ? Object.fromEntries(p.rows.map((r) => [r[0], r[1]])) : {}; return { ...style(k), points: cats.map((c, i) => [i, row[c]]).filter((q) => q[1] != null) }; }) });
-  lineChart(charts, { title: "In-flight top-1 at full context", yFmt: pct, series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "top1/mfull") })) });
-  lineChart(charts, { title: "In-flight gap to VAE floor at full context", yFmt: (v) => signed(v), series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "gap_top1/mfull") })) });
+  lineChart(charts, { title: "In-flight next-token top-1 at full context (primary)", yFmt: pct, series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "true_top1/mfull") })) });
+  lineChart(charts, { title: "In-flight perplexity at full context", yFmt: (v) => fmt(v, 1), series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "ppl/mfull") })) });
+  lineChart(charts, { title: "In-flight teacher agreement at full context", yFmt: pct, series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "top1/mfull") })) });
   lineChart(charts, { title: "In-flight shuffled − full top-1 (conditioning)", yFmt: (v) => signed(v), series: keys.map((k) => ({ ...style(k), points: pts(L[k].inflight, "shuffled_minus_full/top1") })) });
-  for (const k of keys.filter((k) => L[k].post)) {
-    const p = L[k].post;
+  const f = (c, v) => ["top1", "true_top1", "acceptance", "sample_agreement"].includes(c) ? pct(v) : c.startsWith("gap") ? signed(v) : c === "ppl" ? fmt(v, 2) : fmt(v, 4);
+  for (const [k, which, label] of keys.flatMap((k) => [[k, "post", "S1 val"], [k, "post_ood", "WikiText-103 (OOD)"]])) {
+    const p = L[k][which]; if (!p) continue;
     const tw = el("div", { class: "tbl-wrap", style: "margin-top:16px" });
     const numCols = p.columns.slice(1);
-    const f = (c, v) => c === "top1" || c === "sample_agreement" ? pct(v) : c.startsWith("gap") ? signed(v) : fmt(v, 4);
-    tw.innerHTML = `<table><tr><th><span class="key${k.endsWith("-sample") ? " dash" : ""}" style="border-color:${style(k).color}"></span>${esc(k)} · step ${fmt(p.step, 0)} · floor ${pct(p.floor_top1)} · NN ratio ${fmt(p.nn_ratio)}</th>${numCols.map((c) => `<th class="num">${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>
+    const ref = p.teacher ? ` · GPT-2 ${pct(p.teacher.true_top1)} / ppl ${fmt(p.teacher.ppl, 2)}` : "";
+    const fl = p.floor_true_top1 != null ? `floor ${pct(p.floor_true_top1)} / ppl ${fmt(p.floor_ppl, 2)}` : `floor ${pct(p.floor_top1)}`;
+    tw.innerHTML = `<table><tr><th><span class="key${k.endsWith("-sample") ? " dash" : ""}" style="border-color:${style(k).color}"></span>${esc(k)} · ${label} · step ${fmt(p.step, 0)} · ${fl}${ref} · NN ratio ${fmt(p.nn_ratio)}</th>${numCols.map((c) => `<th class="num">${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>
       ${p.rows.map((r) => `<tr><td class="mono">${esc(r[0])}</td>${r.slice(1).map((v, i) => `<td class="num">${f(numCols[i], v)}</td>`).join("")}</tr>`).join("")}</table>`;
     host.appendChild(tw);
   }
@@ -357,14 +362,14 @@ function renderReadout() {
   const firstAt = (a, x) => V[a].inflight.find((r) => r["val/top1_agreement"] >= x)?.step;
   if (firstAt("d128", 0.49) && firstAt("d256", 0.49)) out.push(`<b>d256 also learns faster.</b> It first reaches 49% val top-1 at step ${fmt(firstAt("d256", 0.49), 0)}, d128 at ${fmt(firstAt("d128", 0.49), 0)}. d128 is flat from about 400k (the end of the β ramp), while d256 was still edging up at 1M.`);
   const ldmGoing = Object.values(D.ldm).some((r) => r.status !== "not started");
-  out.push(`<b>Next:</b> ${ldmGoing ? "the DiT arms are training; their in-flight m-curves appear below every 10k steps." : "latent exports, then one DiT-S μ arm per width (100k steps, ~14 h each), then the LDM suites that decide the width."} The post-hoc VAE suite (10k val positions, plus the WikiText probe) replaces the in-flight numbers above when it lands.`);
+  out.push(`<b>Next:</b> ${ldmGoing ? "the DiT arms are training; their in-flight m-curves appear below every 10k steps." : "latent exports, then one DiT-S μ arm per width (100k steps, ~14 h each), then the LDM suites that decide the width on next-token accuracy on real text."} The post-hoc VAE suite (10k val positions, plus the WikiText probe) replaces the in-flight numbers above when it lands.`);
   host.innerHTML = `<ol class="findings">${out.map((x) => `<li>${x}</li>`).join("")}</ol>`;
 }
 
 /* ---------- notes ---------- */
 function renderNotes() {
   const notes = [
-    "Primary metric: the rule compares the gap to each arm's own VAE floor at full context. Absolute top-1 is reported next to it; confirm the gap is the intended criterion before both suites land.",
+    "Primary metric (settled 10-30, before any DiT step): absolute next-token accuracy of the decoded DiT sample on the real text at full context, perplexity as the tie-break. The old primary, gap to each arm's own VAE floor, is still reported but no longer decides.",
     "β and free bits are matched per dimension, so d256 carries twice the total free-bits floor. If the verdict is a tie and d256 shows many floor-pinned dims, run one matched-rate d256 control.",
     "DiT size: both arms use DiT-S for the head-to-head; DiT-B on the winner is the follow-up.",
   ];

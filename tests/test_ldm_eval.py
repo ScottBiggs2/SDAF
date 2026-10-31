@@ -101,6 +101,13 @@ def test_eval_conditions_and_shuffle(ldm_latents, trained_run):
     assert not null["visible"].any()
 
 
+def test_next_tokens_reads_pos_plus_one():
+    from specdec_af.ldm.evaluate_ldm import next_tokens
+    toks = torch.arange(20).view(2, 10)
+    out = next_tokens({"seq_tokens": toks, "pos": torch.tensor([3, 9])})
+    assert out.tolist() == [4, -1]  # last position has no next token in its sequence
+
+
 def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     cfg = LDMTrainConfig(latents_dir=str(ldm_latents), vae_checkpoint=str(trained_run["checkpoint"]),
                          data_source="static", z_source="sample", max_train_rows=12, batch_size=8, lr=1e-3, lr_warmup_steps=2,
@@ -116,6 +123,11 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     c = res["conditions"]["mfull"]
     assert len(c["latent_cos_block"]) == len(c["gap_recon_cos_block"]) == 12
     assert c["gap_top1"] == pytest.approx(c["top1"] - res["floor"]["top1"])
+    for m in (c, res["floor"], res["teacher"]):  # true-text next-token metrics (scale-1 primary)
+        assert 0.0 <= m["true_top1"] <= 1.0 and np.isfinite(m["ppl"]) and m["ppl"] == pytest.approx(np.exp(m["nll"]))
+    assert 0.0 < c["acceptance"] <= 1.0 and "true_top1" in res["conditioning"]["shuffled_minus_full"]
+    # Real GPT-2 on real text: the cached trace at ``pos`` predicts ``pos + 1`` (an off-by-one gives ppl ≫ 1e3).
+    assert res["teacher"]["ppl"] < 300 and res["teacher"]["true_top1"] > 0.15
     assert len(c["dist_z"]["fd_block"]) == len(c["dist_resid"]["kid_block"]) == 12 and "kid_joint" in c["dist_z"]
     assert "fd_joint" not in c["dist_resid"] and "dist_z_vs_posterior_samples" in c  # z_source=sample
     assert set(res["dist_floors"]) == {"z_data", "z_prior", "resid_vae"}

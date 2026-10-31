@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -34,9 +35,13 @@ TEMPLATE = Path(__file__).with_name("dossier_template.html")
 CFG_KEYS = ("d_latent", "batch_size", "lr", "beta_max", "beta_anneal_steps", "free_bits", "n_steps_override",
             "precision", "inflight_every_steps", "inflight_positions", "z_source", "n_steps")
 
-# Pre-registered width rule (plan Phase 4, written 10-29 before any scale-1 run).
-RULE = {"primary": "gap_top1 at mfull (LDM suite, S1 val, EMA)", "tie_band": 0.01, "tie_prefers": "d128",
-        "monotone_tol": 0.005, "shuffled_minus_full_max": -0.10, "null_kid_max_ratio": 1.20}
+# Width rule. Pre-registered 10-29 (plan Phase 4); primary amended 10-30 by Scott, after the VAEs and
+# before any DiT step: absolute decoded next-token accuracy on the real text replaces the gap to each
+# arm's own VAE floor (which rewards a weaker floor). Perplexity breaks ties; guards unchanged.
+RULE = {"primary": "true-text next-token top-1 at mfull (LDM suite, S1 val, EMA)", "primary_key": "true_top1",
+        "tie_band": 0.01, "tie_break": "lower perplexity at mfull", "tie_prefers": "d128",
+        "monotone_tol": 0.005, "shuffled_minus_full_max": -0.10, "null_kid_max_ratio": 1.20,
+        "amended": "2026-10-30: primary was gap_top1 at mfull (teacher agreement minus own VAE floor)"}
 
 
 def _json(p: Path) -> dict | None:
@@ -95,9 +100,12 @@ def _run_status(run_dir: Path, n_steps_key: str) -> dict:
     return out
 
 
-def _latest_eval(run_dir: Path) -> dict | None:
-    evals = sorted(run_dir.glob("eval_step*/metrics.json"), key=lambda p: int(p.parent.name[len("eval_step"):]))
-    return _json(evals[-1]) if evals else None
+def _latest_eval(run_dir: Path, tag: str | None = None) -> dict | None:
+    """Newest ``eval_step<N>[_<tag>]/metrics.json``; untagged = the S1 val suite."""
+    pat = re.compile(rf"eval_step(\d+){'_' + re.escape(tag) if tag else ''}$")
+    evals = sorted(((int(m.group(1)), p) for p in run_dir.glob("eval_step*/metrics.json")
+                    if (m := pat.match(p.parent.name))), key=lambda x: x[0])
+    return _json(evals[-1][1]) if evals else None
 
 
 def collect_vae(root: Path) -> dict:
@@ -140,10 +148,12 @@ def collect_ldm(root: Path) -> dict:
     for arm, name in runs.items():
         d = root / "ldm" / name
         res = _latest_eval(d)
-        out[arm] = {"run": name, **_run_status(d, "n_steps_total"),
+        out[arm] = {"run": name, **_run_status(d, "n_steps_total"), "post_ood": _ldm_post(_latest_eval(d, "ood")),
                     "train": _csv_curve(d / "training_log.csv", ("loss",)),
-                    "inflight": [{k: v for k, v in r.items() if k == "step" or k.startswith(("top1/", "gap_top1/"))
-                                  or k in ("shuffled_minus_full/top1", "null/kid_joint", "floor/top1")}
+                    "inflight": [{k: v for k, v in r.items() if k == "step"
+                                  or k.startswith(("top1/", "gap_top1/", "true_top1/", "ppl/"))
+                                  or k in ("shuffled_minus_full/top1", "null/kid_joint", "floor/top1", "floor/true_top1",
+                                           "floor/ppl", "teacher/true_top1", "teacher/ppl")}
                                  for r in read_jsonl(d / "inflight.jsonl")],
                     "post": _ldm_post(res)}
     return out
@@ -156,7 +166,8 @@ def _ldm_post(res: dict | None) -> dict | None:
     cols, rows = suite_table(res)
     mem = res.get("memorization", {})
     return {"step": res["step"], "z_source": res.get("z_source"), "n_positions": res.get("n_positions"),
-            "floor_top1": res["floor"]["top1"], "columns": cols, "rows": rows,
+            "floor_top1": res["floor"]["top1"], "floor_true_top1": res["floor"].get("true_top1"),
+            "floor_ppl": res["floor"].get("ppl"), "teacher": res.get("teacher"), "columns": cols, "rows": rows,
             "shuffled_minus_full_top1": res["conditioning"]["shuffled_minus_full"]["top1"],
             "nn_ratio": mem.get("nn_ratio"), "cfg_sweep": res["conditioning"].get("cfg_sweep")}
 
@@ -170,8 +181,9 @@ def width_verdict(ldm: dict, vae: dict) -> dict:
     checks = {}
     for a, p in arms.items():
         row = {r[0]: dict(zip(p["columns"], r)) for r in p["rows"]}
-        curve = [row[c]["top1"] for c in MCURVE if c in row]
-        checks[a] = {"gap_top1_mfull": row["mfull"]["gap_top1"], "top1_mfull": row["mfull"]["top1"],
+        curve = [row[c][RULE["primary_key"]] for c in MCURVE if c in row]
+        checks[a] = {"primary": row["mfull"][RULE["primary_key"]], "ppl_mfull": row["mfull"]["ppl"],
+                     "gap_top1_mfull": row["mfull"]["gap_top1"], "top1_mfull": row["mfull"]["top1"],
                      "monotone": all(b >= x - RULE["monotone_tol"] for x, b in zip(curve, curve[1:])),
                      "shuffled_minus_full": p["shuffled_minus_full_top1"],
                      "null_kid": row["null"]["kid_joint"],
@@ -188,13 +200,19 @@ def width_verdict(ldm: dict, vae: dict) -> dict:
     if len(eligible) == 1:
         return {"status": "decided", "winner": eligible[0], "reason": f"only {eligible[0]} passes the guards",
                 "checks": checks, "rule": RULE}
-    diff = checks["d256"]["gap_top1_mfull"] - checks["d128"]["gap_top1_mfull"]
+    diff = checks["d256"]["primary"] - checks["d128"]["primary"]
     if abs(diff) <= RULE["tie_band"]:
+        p128, p256 = checks["d128"]["ppl_mfull"], checks["d256"]["ppl_mfull"]
+        if p128 != p256:
+            win = "d256" if p256 < p128 else "d128"
+            return {"status": "decided", "winner": win, "tie": True, "checks": checks, "rule": RULE,
+                    "reason": f"tie on true top-1 (|Δ| = {abs(diff):.3f} ≤ {RULE['tie_band']}); "
+                              f"{win} has lower perplexity ({min(p128, p256):.2f} vs {max(p128, p256):.2f})"}
         return {"status": "decided", "winner": RULE["tie_prefers"], "tie": True, "checks": checks, "rule": RULE,
-                "reason": f"tie (|Δ gap| = {abs(diff):.3f} ≤ {RULE['tie_band']}); prefer {RULE['tie_prefers']}"}
+                "reason": f"tie on true top-1 and perplexity; prefer {RULE['tie_prefers']}"}
     win = "d256" if diff > 0 else "d128"
     return {"status": "decided", "winner": win, "checks": checks, "rule": RULE,
-            "reason": f"higher mfull gap_top1 by {abs(diff):.3f}"}
+            "reason": f"higher true-text top-1 at mfull by {abs(diff):.3f}"}
 
 
 def corpus_info(tokens_dir: Path | None) -> dict | None:

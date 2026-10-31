@@ -82,9 +82,11 @@ def test_ldm_inflight(ldm_latents, trained_run, tmp_path, fake_wandb):
     xs, ys = mcurve(r)
     assert xs[0] == "null" and xs[-1] == "mfull" and all(0.0 <= y <= 1.0 for y in ys)
     assert np.isfinite(r["shuffled_minus_full/top1"]) and "diversity/m0" in r and "null/kid_block_mean" in r
+    assert 0.0 <= r["true_top1/mfull"] <= 1.0 and np.isfinite(r["ppl/mfull"]) and np.isfinite(r["teacher/ppl"])
     (run,) = fake_wandb
     lines = [d["inflight/mcurve"] for _, d in run.logged if "inflight/mcurve" in d]
     assert lines and lines[0][0] == "line"
+    assert any("inflight/mcurve_true" in d for _, d in run.logged)
 
 
 def test_attach_reuses_run_id(tmp_path, fake_wandb):

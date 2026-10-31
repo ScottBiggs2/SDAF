@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -251,13 +252,37 @@ class _Decoded:
         s0, s1 = SLOT_OFFSETS["boundary_out"]
         return self.lm_head(traces[:, TERMINAL_BLOCK, s0:s1])
 
-    def score(self, acc: _Acc, z: torch.Tensor, real: torch.Tensor, teacher: torch.Tensor) -> None:
+    def score(self, acc: _Acc, z: torch.Tensor, real: torch.Tensor, teacher: torch.Tensor,
+              target: torch.Tensor | None = None) -> None:
         rec = self.traces(z)
-        m = _downstream_metrics(self.logits(rec), teacher)
-        acc.add(top1=m["top1"], top5=m["top5_overlap"], kl=m["kl"],
+        logits = self.logits(rec)
+        m = _downstream_metrics(logits, teacher)
+        acc.add(top1=m["top1"], top5=m["top5_overlap"], kl=m["kl"], acceptance=m["acceptance"],
                 recon_cos=F.cosine_similarity(rec, real, dim=-1), resid=residual_stream(rec).half())
+        if target is not None:
+            add_true_text(acc, logits, target)
         if self.weights is not None:
             acc.cons.append(trace_consistency(rec, self.weights))
+
+
+def next_tokens(raw: dict) -> torch.Tensor:
+    """The text's actual next token ``seq_tokens[pos + 1]`` per row; −1 where ``pos`` is the last position."""
+    toks, pos = raw["seq_tokens"], raw["pos"]
+    nxt = toks.gather(1, (pos + 1).clamp(max=toks.shape[1] - 1).unsqueeze(1)).squeeze(1)
+    return torch.where(pos + 1 < toks.shape[1], nxt, torch.full_like(nxt, -1))
+
+
+def add_true_text(acc: _Acc, logits: torch.Tensor, target: torch.Tensor) -> None:
+    """Scale-1 primary metrics: accuracy and NLL of the decoded head on the real next token."""
+    ok = target >= 0
+    t = target.clamp(min=0)
+    acc.add(true_top1=(logits.argmax(-1) == t).float()[ok], nll=F.cross_entropy(logits.float(), t, reduction="none")[ok])
+
+
+def true_text_summary(acc: _Acc) -> dict:
+    """``{true_top1, nll, ppl}``; ppl = exp(mean NLL) over positions with a next token."""
+    nll = float(acc.cat("nll").double().mean())
+    return {"true_top1": float(acc.cat("true_top1").mean()), "nll": nll, "ppl": math.exp(nll)}
 
 
 def _cons_summary(parts: list[dict]) -> dict:
@@ -291,19 +316,21 @@ def score_conditions(ldm, dit, table: LatentTable, sampler: ConditionSampler, de
         raw = table.raw_batch(r, device)
         real = cached_chunks(table, r).to(device)
         teacher = dec.logits(real)
+        target = next_tokens(raw)
+        add_true_text(real_acc, teacher, target)  # GPT-2's own next-token accuracy / perplexity
         mu = raw["mu"]
         ref.add(mu=mu, z_post=mu + (0.5 * raw["logvar"]).exp()
                 * torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, 10**6 + bi)).to(device))
         real_acc.add(resid=residual_stream(real).half())
         if dec.weights is not None:
             real_acc.cons.append(trace_consistency(real, dec.weights))
-        dec.score(floor, mu, real, teacher)
+        dec.score(floor, mu, real, teacher, target)
         noise = torch.randn(mu.shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, bi)).to(device)
         for ci, (name, spec) in enumerate(conds):
             cond = _make_cond(sampler, raw, spec, batch_generator(sc.seed, _TAG_EVAL_COND, bi, ci))
             z = ldm.sample(cond, noise, steps=sc.steps, cfg_w=sc.cfg_w, dit=dit)
             accs[name].add(z=z, lat_cos=F.cosine_similarity(z, mu, dim=-1), lat_mse=(z - mu).pow(2).mean(-1))
-            dec.score(accs[name], z, real, teacher)
+            dec.score(accs[name], z, real, teacher, target)
         if verbose:
             print(f"  suite batch {bi + 1}/{-(-len(rows) // sc.batch)}", flush=True)
     return accs, floor, real_acc, ref
@@ -311,11 +338,12 @@ def score_conditions(ldm, dit, table: LatentTable, sampler: ConditionSampler, de
 
 @torch.no_grad()
 def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = None, gpt2=None,
-                   cache_dir: Path | str | None = None) -> dict:
+                   cache_dir: Path | str | None = None, latents_dir: Path | str | None = None) -> dict:
     """Stage-5 suite on the fixed eval set (plan §6). Samples share noise across conditions (paired).
 
     Per condition: latent per-block MSE / cosine vs μ_true; decoded teacher top-1 / top-5 / KL vs the
-    real trace's teacher logits; per-block recon cosine vs the real chunk; weight consistency; all next
+    real trace's teacher logits; true-text next-token accuracy and perplexity (scale-1 primary; GPT-2's
+    own under ``teacher``); per-block recon cosine vs the real chunk; weight consistency; all next
     to the VAE floor ``decode(μ_true)`` (``gap_*`` = sample − floor). Distribution: FD + KID per block
     and joint in z, per block in the decoded residual stream, against data / prior / VAE floors.
     Diversity vs m (K samples per position); conditioning sensitivity (shuffled vs full m; CFG sweep);
@@ -326,7 +354,7 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
     cfg, ldm = ck["config"], ck["ldm"]
     dit = ck["ema"] if sc.weights == "ema" else ldm.dit
     cache_dir = Path(cache_dir or ck["raw"]["cache_dir"])
-    table = LatentTable(cfg.latents_dir, cache_dir)
+    table = LatentTable(latents_dir or cfg.latents_dir, cache_dir)  # override: e.g. the WikiText OOD export
     sampler = ConditionSampler(ConditionConfig.from_dict(cfg.condition))
     W = sampler.cfg.W
     rows = table.eval_rows(sc.n_positions)
@@ -344,10 +372,13 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
     mu_val, z_post = ref.cat("mu"), ref.cat("z_post")
     floor_res = {"top1": float(floor.cat("top1").mean()), "top5": float(floor.cat("top5").mean()),
                  "kl": float(floor.cat("kl").mean()), "recon_cos_block": floor.cat("recon_cos").mean(0).tolist(),
+                 "acceptance": float(floor.cat("acceptance").mean()), **true_text_summary(floor),
                  "consistency": _cons_summary(floor.cons), "real_consistency": _cons_summary(real_acc.cons)}
     res: dict = {"format": "ldm_eval_v1", "checkpoint": str(checkpoint), "step": ck["step"],
                  "z_source": cfg.z_source, "suite": asdict(sc), "W": W, "n_positions": int(len(rows)),
-                 "floor": floor_res, "conditions": {}}
+                 "latents_dir": str(table.latents_dir),
+                 "cache_dir": str(cache_dir), "floor": floor_res, "teacher": true_text_summary(real_acc),
+                 "conditions": {}}
 
     # Distribution floors.
     train_all = table.train_rows()
@@ -365,6 +396,7 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
         top1, kl, rc = float(a.cat("top1").mean()), float(a.cat("kl").mean()), a.cat("recon_cos").mean(0)
         c = {"latent_cos_block": a.cat("lat_cos").mean(0).tolist(), "latent_mse_block": a.cat("lat_mse").mean(0).tolist(),
              "top1": top1, "top5": float(a.cat("top5").mean()), "kl": kl, "recon_cos_block": rc.tolist(),
+             "acceptance": float(a.cat("acceptance").mean()), **true_text_summary(a),
              "gap_top1": top1 - floor_res["top1"], "gap_kl": kl - floor_res["kl"],
              "gap_recon_cos_block": (rc - torch.tensor(floor_res["recon_cos_block"])).tolist(),
              **{f"consistency_{k}": v for k, v in _cons_summary(a.cons).items()},
@@ -372,13 +404,13 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
         if cfg.z_source == "sample":
             c["dist_z_vs_posterior_samples"] = _dist(z, z_post, sc, device)
         res["conditions"][name] = c
-        print(f"  {name:<9} top1={top1:.4f} (gap {c['gap_top1']:+.4f})  kl={kl:.4f}  "
+        print(f"  {name:<9} true_top1={c['true_top1']:.4f}  ppl={c['ppl']:.2f}  top1={top1:.4f} (gap {c['gap_top1']:+.4f})  kl={kl:.4f}  "
               f"kid_joint={c['dist_z']['kid_joint']['mean']:.4g}  cons_cross={c['consistency_cross_median']:.4g}", flush=True)
 
     res["diversity"] = _diversity(ldm, dit, table, sampler, dec, rows[:sc.diversity_positions], conds, sc, device)
     res["conditioning"] = {
         "shuffled_minus_full": {k: res["conditions"]["shuffled"][k] - res["conditions"]["mfull"][k]
-                                for k in ("top1", "kl")},
+                                for k in ("top1", "kl", "true_top1", "ppl")},
         "cfg_sweep": _cfg_sweep(ldm, dit, table, sampler, dec, rows[:sc.cfg_positions], sc, device),
     }
     # Memorization is judged against the rows this run could have trained on (respects
@@ -459,7 +491,8 @@ MCURVE_ORDER = ("null", "m0", "m2", "m8", "m32", "mfull", "holes0.1", "shuffled"
 
 def suite_table(res: dict) -> tuple[list[str], list[list]]:
     """Per-condition headline table (the m-curve plus controls) for W&B and the dossier."""
-    cols = ["condition", "top1", "gap_top1", "kl", "latent_cos", "kid_joint", "diversity", "sample_agreement"]
+    cols = ["condition", "true_top1", "ppl", "top1", "gap_top1", "acceptance", "kl", "latent_cos", "kid_joint",
+            "diversity", "sample_agreement"]
     rows = []
     for name in MCURVE_ORDER:
         c = res["conditions"].get(name)
@@ -467,22 +500,27 @@ def suite_table(res: dict) -> tuple[list[str], list[list]]:
             continue
         div = res.get("diversity", {}).get(name, {})
         kid = c["dist_z"].get("kid_joint", {}).get("mean", float("nan"))
-        rows.append([name, c["top1"], c["gap_top1"], c["kl"], float(np.mean(c["latent_cos_block"])), kid,
+        rows.append([name, c.get("true_top1", float("nan")), c.get("ppl", float("nan")), c["top1"], c["gap_top1"],
+                     c.get("acceptance", float("nan")), c["kl"], float(np.mean(c["latent_cos_block"])), kid,
                      div.get("latent_dist", float("nan")), div.get("top1_agreement", float("nan"))])
     return cols, rows
 
 
-def log_suite_wandb(res: dict, run_dir: Path, out_dir: Path, *, project: str | None = None) -> str | None:
+def log_suite_wandb(res: dict, run_dir: Path, out_dir: Path, *, project: str | None = None,
+                    kind: str = "ldm") -> str | None:
     from specdec_af.analysis.wandb_post import log_posthoc
     cols, rows = suite_table(res)
     curve = [r for r in rows if r[0] in MCURVE_ORDER[:6]]
-    scalars = {"step": res["step"], "floor": res["floor"], "conditioning": res["conditioning"],
+    scalars = {"step": res["step"], "floor": res["floor"], "teacher": res.get("teacher", {}),
+               "conditioning": res["conditioning"],
                "memorization": {k: v for k, v in res["memorization"].items() if k != "loss"},
-               "conditions": {c: {k: v for k, v in m.items() if k in ("top1", "top5", "kl", "gap_top1", "gap_kl")}
+               "conditions": {c: {k: v for k, v in m.items() if k in ("top1", "top5", "kl", "gap_top1", "gap_kl",
+                                                                      "acceptance", "true_top1", "nll", "ppl")}
                               for c, m in res["conditions"].items()}}
-    return log_posthoc(run_dir, "ldm", scalars, out_dir=out_dir, project=project,
+    return log_posthoc(run_dir, kind, scalars, out_dir=out_dir, project=project,
                        tables={"conditions": (cols, rows)},
-                       lines={"mcurve": ([r[0] for r in curve], [r[1] for r in curve], "condition", "top1")})
+                       lines={"mcurve": ([r[0] for r in curve], [r[3] for r in curve], "condition", "top1"),
+                              "mcurve_true": ([r[0] for r in curve], [r[1] for r in curve], "condition", "true_top1")})
 
 
 def write_suite_report(res: dict, out_dir: Path) -> None:
@@ -498,6 +536,9 @@ def write_suite_report(res: dict, out_dir: Path) -> None:
              f"w={res['suite']['cfg_w']})", "",
              f"VAE floor decode(μ): top1={fl['top1']:.4f}  top5={fl['top5']:.4f}  kl={fl['kl']:.4f}  "
              f"cons_cross={fl['consistency']['cross_median']:.4g}  (real/fp16 floor {fl['real_consistency']['cross_median']:.3g})",
+             "true text (next token): " + "  ".join(
+                 f"{k} acc={v['true_top1']:.4f} ppl={v['ppl']:.2f}" for k, v in
+                 [("GPT-2", res["teacher"]), ("floor", fl)] + [(n, c) for n, c in conds.items() if n in ("m0", "mfull")]),
              "", f"{'condition':<10} {'top1':>7} {'gap':>8} {'kl':>7} {'gap_kl':>8} {'lat_cos':>8} "
              f"{'kid_z':>9} {'fd_z':>9} {'kid_res':>9} {'cons_x':>8}"]
     for name, c in conds.items():
@@ -592,7 +633,10 @@ def main() -> int:
     su.add_argument("--weights", choices=["ema", "raw"], default="ema")
     su.add_argument("--batch", type=int, default=250)
     su.add_argument("--seed", type=int, default=0)
-    su.add_argument("--out", default=None, help="default: <run_dir>/eval_step<step>")
+    su.add_argument("--out", default=None, help="default: <run_dir>/eval_step<step>[_<tag>]")
+    su.add_argument("--latents-dir", default=None, help="eval on another export (e.g. the WikiText OOD one)")
+    su.add_argument("--cache-dir", default=None, help="the cache that export was made from")
+    su.add_argument("--tag", default=None, help="suffix for the out dir and W&B prefix post/ldm_<tag>, e.g. ood")
     su.add_argument("--wandb-project", default=None,
                     help="scale-1: send post/ldm/* to the training run (default: $WANDB_PROJECT; 'none' = off)")
     su.add_argument("--cpu", action="store_true")
@@ -607,14 +651,18 @@ def main() -> int:
     if args.cmd == "suite":
         sc = SuiteConfig(n_positions=args.n_positions, steps=args.steps, cfg_w=args.cfg_w, weights=args.weights,
                          batch=args.batch, seed=args.seed)
-        res = evaluate_suite(args.checkpoint, device=device, sc=sc)
-        out = Path(args.out or Path(args.checkpoint).parent.parent / f"eval_step{res['step']}")
+        res = evaluate_suite(args.checkpoint, device=device, sc=sc, latents_dir=args.latents_dir,
+                             cache_dir=args.cache_dir)
+        res["tag"] = args.tag
+        sfx = f"_{args.tag}" if args.tag else ""
+        out = Path(args.out or Path(args.checkpoint).parent.parent / f"eval_step{res['step']}{sfx}")
         write_suite_report(res, out)
         print((out / "summary.txt").read_text())
         print(f"wrote {out}")
-        url = log_suite_wandb(res, Path(args.checkpoint).parent.parent, out, project=args.wandb_project)
+        kind = f"ldm_{args.tag}" if args.tag else "ldm"
+        url = log_suite_wandb(res, Path(args.checkpoint).parent.parent, out, project=args.wandb_project, kind=kind)
         if url:
-            print(f"wandb: post/ldm/* → {url}", flush=True)
+            print(f"wandb: post/{kind}/* → {url}", flush=True)
         return 0
     res = overfit_eval(args.checkpoint, device=device, steps=args.steps, cfg_w=args.cfg_w, max_rows=args.max_rows)
     _print_overfit(res)

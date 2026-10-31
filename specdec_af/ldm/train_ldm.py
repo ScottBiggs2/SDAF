@@ -393,9 +393,13 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
         append_jsonl(output_dir / "inflight.jsonl", {"step": step, **m})
         wb.log({f"inflight/{k}": v for k, v in m.items()}, step=step - 1)
         xs, ys = mcurve(m)
-        wb.log_media(step=step - 1, lines={"inflight/mcurve": (xs, ys, "condition", "top1")})
+        xt, yt = mcurve(m, "true_")
+        wb.log_media(step=step - 1, lines={"inflight/mcurve": (xs, ys, "condition", "top1"),
+                                           "inflight/mcurve_true": (xt, yt, "condition", "true_top1")})
         print(f"    [inflight @ step {step}] " + "  ".join(f"{x}={y:.3f}" for x, y in zip(xs, ys))
-              + f"  shuf-full={m['shuffled_minus_full/top1']:+.3f}  ({m['seconds']:.0f}s)", flush=True)
+              + f"  shuf-full={m['shuffled_minus_full/top1']:+.3f}  true@mfull={m.get('true_top1/mfull', float('nan')):.3f}"
+              + f" ppl@mfull={m.get('ppl/mfull', float('nan')):.1f} (GPT-2 {m.get('teacher/ppl', float('nan')):.1f})"
+              + f"  ({m['seconds']:.0f}s)", flush=True)
 
     fl = cfg.flow
     out_of_time = False
