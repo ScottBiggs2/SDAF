@@ -137,7 +137,8 @@ def _vae_post(m: dict | None) -> dict | None:
             **{k: c.get(k) for k in ("top1_agreement", "top5_overlap", "kl_teacher_student", "acceptance")},
             "recon_cos_block": c.get("recon_cosine"), "kl_total": float(sum(ls["kl_block"])),
             "active_units": int(sum(ls["active_units_block"])),
-            "prior_top1": v["conditions"].get("prior", {}).get("top1_agreement")}
+            "prior_top1": v["conditions"].get("prior", {}).get("top1_agreement"),
+            "train_top1": m["splits"].get("train", {}).get("conditions", {}).get("qz_mean", {}).get("top1_agreement")}
 
 
 def collect_ldm(root: Path) -> dict:

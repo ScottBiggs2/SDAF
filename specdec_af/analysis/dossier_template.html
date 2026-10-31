@@ -344,7 +344,13 @@ function renderReadout() {
   const o1 = { d128: T("d128", "ood/top1_agreement"), d256: T("d256", "ood/top1_agreement") };
   const last = (a) => V[a].inflight.at(-1) || {};
   const stage = arms.every(done) ? "Both VAEs finished" : "VAEs in progress";
-  if (t1.d128 && t1.d256) {
+  const P = (a) => V[a].post, PO = (a) => V[a].post_ood;
+  if (P("d128") && P("d256")) {
+    const d = P("d256").top1_agreement - P("d128").top1_agreement;
+    out.push(`<b>${stage}; d256 reconstructs better.</b> On the post-hoc suite (${fmt(P("d256").n_positions, 0)} held-out S1 val positions, z = μ), teacher top-1 is ${pct(P("d256").top1_agreement)} vs ${pct(P("d128").top1_agreement)} (${d >= 0 ? "+" : ""}${pp(d)} pp) and acceptance ${pct(P("d256").acceptance)} vs ${pct(P("d128").acceptance)}.` +
+      (PO("d128") && PO("d256") ? ` Out of domain, on WikiText-103 val, it is ${pct(PO("d256").top1_agreement)} vs ${pct(PO("d128").top1_agreement)}. (rev7B, trained in domain on WikiText at d128, scored 48.3% there.)` : "") +
+      (t1.d128 && t1.d256 ? ` The in-flight curves (2k positions) agree: ${pp(t1.d256.m)}% vs ${pp(t1.d128.m)}% over the last 20% of training.` : ""));
+  } else if (t1.d128 && t1.d256) {
     const d = t1.d256.m - t1.d128.m, sd = Math.max(t1.d128.sd, t1.d256.sd);
     out.push(`<b>${stage}; d256 reconstructs better.</b> Val teacher top-1 ${pp(t1.d256.m)}% vs ${pp(t1.d128.m)}% (${d >= 0 ? "+" : ""}${pp(d)} pp), averaged over the in-flight evals in the last 20% of training. Evals are on the same fixed positions; step-to-step s.d. is ≤ ${pp(sd)} pp, so the gap is well outside eval wobble.` +
       (o1.d128 && o1.d256 ? ` The ordering holds out of domain on WikiText-103: ${pp(o1.d256.m)}% vs ${pp(o1.d128.m)}%.` : ""));
@@ -362,7 +368,8 @@ function renderReadout() {
   const firstAt = (a, x) => V[a].inflight.find((r) => r["val/top1_agreement"] >= x)?.step;
   if (firstAt("d128", 0.49) && firstAt("d256", 0.49)) out.push(`<b>d256 also learns faster.</b> It first reaches 49% val top-1 at step ${fmt(firstAt("d256", 0.49), 0)}, d128 at ${fmt(firstAt("d128", 0.49), 0)}. d128 is flat from about 400k (the end of the β ramp), while d256 was still edging up at 1M.`);
   const ldmGoing = Object.values(D.ldm).some((r) => r.status !== "not started");
-  out.push(`<b>Next:</b> ${ldmGoing ? "the DiT arms are training; their in-flight m-curves appear below every 10k steps." : "latent exports, then one DiT-S μ arm per width (100k steps, ~14 h each), then the LDM suites that decide the width on next-token accuracy on real text."} The post-hoc VAE suite (10k val positions, plus the WikiText probe) replaces the in-flight numbers above when it lands.`);
+  const vaePost = arms.every((a) => P(a));
+  out.push(`<b>Next:</b> ${ldmGoing || vaePost ? "one DiT-S μ arm per width (100k steps, ~14 h each) is training; their in-flight m-curves appear below every 10k steps. The LDM suites on S1 val and WikiText then decide the width on next-token accuracy on the real text." : "latent exports, then one DiT-S μ arm per width (100k steps, ~14 h each), then the LDM suites that decide the width on next-token accuracy on real text."}`);
   host.innerHTML = `<ol class="findings">${out.map((x) => `<li>${x}</li>`).join("")}</ol>`;
 }
 
@@ -373,6 +380,8 @@ function renderNotes() {
     "β and free bits are matched per dimension, so d256 carries twice the total free-bits floor. If the verdict is a tie and d256 shows many floor-pinned dims, run one matched-rate d256 control.",
     "DiT size: both arms use DiT-S for the head-to-head; DiT-B on the winner is the follow-up.",
   ];
+  const tg = arms.map((a) => D.vae[a].post && D.vae[a].post.train_top1 != null ? D.vae[a].post.train_top1 - D.vae[a].post.top1_agreement : null);
+  if (tg.every((g) => g != null && g > 0.01)) notes.push(`Both VAEs score ~${(50 * (tg[0] + tg[1])).toFixed(1)} pp higher on the cache_s1 train slice than on held-out val (d128 ${(100 * tg[0]).toFixed(1)}, d256 ${(100 * tg[1]).toFixed(1)}). The stream sees ~1 pass over train sequences at different positions, so memorization should be small; a split-difficulty or slice-selection difference is more likely. Worth one check before the DiT numbers are compared with VAE train numbers.`);
   for (const a of arms) { const last = D.vae[a].inflight.at(-1); if (last && last["latent/dims_at_free_bits_floor"] > 0) notes.push(`${a}: ${last["latent/dims_at_free_bits_floor"]} latent dims sit at the free-bits floor at step ${last.step.toLocaleString("en-US")}.`); }
   $("#notes").innerHTML = notes.map((n) => `<li>${esc(n)}</li>`).join("");
 }
