@@ -24,5 +24,15 @@ H200 gres `gpu:h200:1` (4 nodes × 8); `short` limit 2 days.
 | 10-30 | 11504243 | S1 bench A100 (afterok 11504228) | CANCELLED with 11504228 |
 | 10-30 | 11505153 | cache_s1, source-balanced (--interleave): ChunkNorm refit, 20k train + 10k val positions, round-trip, scale variation (A100 → retargeted to v100-sxm2 via scontrol after ~1 h pending; gpu queue had 96 H200 / 27 A100 / 14 V100 jobs pending) | COMPLETED 11:28 (d1020) — ChunkNorm refit 9 s; train slice 21 shards / 20k pos / 4.46 GiB in 28 s; val shards 0021–0031 / 10k pos / 2.23 GiB in 15 s; round-trip ok; scale_variation.json written |
 | 10-30 | 11508820 | S1 bench, V100-SXM2 fp32 only (producer at n_pos 32, VAE bs 256/1024, DiT-S bs 256) → sets head-to-head budgets (a39ed14) | COMPLETED 1:50 — producer 5,419 pos/s @ micro_bs 64 (2,621 @ 32); VAE 10.5 ms/step bs256 (both d), 25 ms bs1024; DiT-S 0.43 s/step bs256 (both d) |
-| 10-30 | 11505156 | S1 bench + bf16 parity on H200 (afterok 11505153) | pending |
+| 10-30 | 11509233 | S1-vae128: 1M steps, β ramp 400k, bs 256, fp32, V100, in-flight /25k, 8 h / 465 min (30be33e) | COMPLETED 4:46 — in-flight val top-1 0.496 (last-20% mean), OOD 0.447; KL 3,283; floor dims 9; AU 1,524; final val recon 0.420. W&B disabled (wandb missing) |
+| 10-30 | 11509234 | S1-vae128 continuation (afterany 11509233, RESUME=auto) | COMPLETED 0:38 — found final.pt, no-op; opened W&B run 360f8ade6531 (summary only, no history) |
+| 10-30 | 11509235 | S1-vae256: same schedule, d_latent 256 | COMPLETED 4:47 — in-flight val top-1 0.515, OOD 0.471; KL 4,777; floor dims ~920 (29%); AU 1,932; final val recon 0.404, terminal MSE 1.256 (d128 1.156) |
+| 10-30 | 11509236 | S1-vae256 continuation (afterany 11509235) | COMPLETED 0:39 — no-op; W&B stub run 83039010b4d6 |
+| 10-30 | 11510357 | dry-run `pip install wandb==0.30.0` into specdec_af env (short) | COMPLETED — adds only wandb's dep tree (pydantic, protobuf, opentelemetry, click, platformdirs) |
+| 10-30 | 11510371 | install wandb 0.30.0 into specdec_af env (short). Root cause: wandb only ever lived in ~/.local (py3.12 base); older jobs reached it via the `source activate` bug, scale-1 scripts call the env python with PYTHONNOUSERSITE=1 → S1-vae runs started with W&B disabled | COMPLETED — `import wandb, torch, transformers` ok (0.30.0 / 2.5.1+cu121 / 4.57.1) |
+| 10-30 | 11505156 | S1 bench + bf16 parity on H200 (afterok 11505153) | CANCELLED pending — freed a submit slot for the DiT chain |
 | 10-30 | 11505158 | S1 bench + bf16 parity on A100 (afterok 11505153) | pending |
+| 10-30 | 11514509 | W&B backfill S1-vae128/256 into the stub runs (FORCE=1; CSV + val + inflight.jsonl, 40437a7) | submitted |
+| 10-30 | 11514510 / 11514515 | export latents S1-vae128 / S1-vae256 (CONFIG=scale1 → cache_s1) | submitted |
+| 10-30 | 11514511 / 11514516 | S1-ldm128-mu / S1-ldm256-mu: DiT-S 100k steps, μ, fp32, V100, 8 h / 465 min (afterok export) | submitted; continuations still to chain |
+| 10-30 | 11514512 / 11514518 | post-hoc VAE suite on cache_s1 S1-vae128 / S1-vae256 (afterok backfill) | submitted; OOD suites wait for a free slot |
