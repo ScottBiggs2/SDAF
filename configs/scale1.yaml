@@ -28,6 +28,7 @@ stream:
   seed: 1302
   n_pos: 32               # positions per streamed sequence (cache_s1 keeps 16): 2× producer throughput per GPT-2 forward;
                           # same uniform marginal over [p_min, 255], fewer distinct prefixes per position budget (10-30)
+  micro_bs: 64            # V100 bench 11508820: 5,419 pos/s at 64 (2,621 at 32; 128 adds nothing), 7.8 GB peak
   gpt2_precision: fp32    # bf16 GPT-2 forward is off: parity check pending (CPU smoke: ~34× the fp16 floor at block 11)
 
 training:                 # VAE. batch_size / n_steps / beta_anneal_steps: set from the S1-bench results (TBD)
