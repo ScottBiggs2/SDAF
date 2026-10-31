@@ -32,7 +32,18 @@ H200 gres `gpu:h200:1` (4 nodes × 8); `short` limit 2 days.
 | 10-30 | 11510371 | install wandb 0.30.0 into specdec_af env (short). Root cause: wandb only ever lived in ~/.local (py3.12 base); older jobs reached it via the `source activate` bug, scale-1 scripts call the env python with PYTHONNOUSERSITE=1 → S1-vae runs started with W&B disabled | COMPLETED — `import wandb, torch, transformers` ok (0.30.0 / 2.5.1+cu121 / 4.57.1) |
 | 10-30 | 11505156 | S1 bench + bf16 parity on H200 (afterok 11505153) | CANCELLED pending — freed a submit slot for the DiT chain |
 | 10-30 | 11505158 | S1 bench + bf16 parity on A100 (afterok 11505153) | pending |
-| 10-30 | 11514509 | W&B backfill S1-vae128/256 into the stub runs (FORCE=1; CSV + val + inflight.jsonl, 40437a7) | submitted |
-| 10-30 | 11514510 / 11514515 | export latents S1-vae128 / S1-vae256 (CONFIG=scale1 → cache_s1) | submitted |
-| 10-30 | 11514511 / 11514516 | S1-ldm128-mu / S1-ldm256-mu: DiT-S 100k steps, μ, fp32, V100, 8 h / 465 min (afterok export) | submitted; continuations still to chain |
-| 10-30 | 11514512 / 11514518 | post-hoc VAE suite on cache_s1 S1-vae128 / S1-vae256 (afterok backfill) | submitted; OOD suites wait for a free slot |
+| 10-30 | 11514509 | W&B backfill S1-vae128/256 into the stub runs (FORCE=1; CSV + val + inflight.jsonl, 40437a7) | COMPLETED 0:55 — 20,001 train rows each |
+| 10-30 | 11514510 / 11514515 | export latents S1-vae128 / S1-vae256 (CONFIG=scale1 → cache_s1) | FAILED 0:20 — KeyError 'output_dir': export/evaluate/substitution read yaml raw, skipping `base:` (fixed 6fd31dd) |
+| 10-30 | 11514511 / 11514516 | S1-ldm128-mu / S1-ldm256-mu (afterok export) | CANCELLED by dependency (export failed) |
+| 10-30 | 11514512 / 11514518 | post-hoc VAE suite (afterok backfill) | FAILED 0:06 — KeyError 'model' (same base: bug) |
+| 10-31 | 11514660 / 11514665 | export latents S1-vae128 / S1-vae256 → cache_s1 (6fd31dd) | COMPLETED 0:56 / 1:22 |
+| 10-31 | 11514661 / 11514666 | post-hoc VAE suite, cache_s1 (10k val + 10k train-slice positions) | COMPLETED — val top-1 d128 0.521 / d256 0.534; acceptance 0.610 / 0.622; KL 3,266 / 4,753; AU 1,524 / 1,932. Train slice ~3 pp higher for both (0.550 / 0.563) |
+| 10-31 | 11514664 / 11514667 | post-hoc VAE suite, WikiText OOD (TAG=vae_ood, cache_v2) | COMPLETED — val top-1 d128 0.443 / d256 0.460 (rev7B in-domain 0.483) |
+
+**Width rule amended 10-31 (Scott, before any DiT step):** primary = true-text next-token top-1 at mfull (LDM suite, S1 val, EMA); tie band ±0.01 → lower perplexity at mfull → d128. Guards unchanged (m-curve monotonicity now on the primary). Old primary (gap to own VAE floor) still reported. Commit 2f064dc.
+
+| date | job | purpose | result |
+|---|---|---|---|
+| 10-31 | 11514802 / 11514806 | S1-ldm128-mu / S1-ldm256-mu: DiT-S 100k steps, μ, fp32, V100, 8 h / 465 min, in-flight /10k with true-text acc + ppl (2f064dc) | submitted |
+| 10-31 | 11514803 / 11514807 | continuations (afterany, RESUME=auto) | submitted |
+| 10-31 | 11514804 / 11514808 | WikiText latent exports S1-vae{128,256}_wt (cache_v2, CONFIG=default) → LDM OOD suite | submitted |
