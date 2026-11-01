@@ -13,6 +13,8 @@ the primes depend on the mode:
   - ``meanabl``  : per-block dataset means of the two contributions (lower anchor)
   - ``noise``    : the real contributions + isotropic Gaussian noise with the same
                    per-slot norm as the VAE error (is the VAE error worse than random?)
+  - ``dit``      : the block's chunk decoded from a DiT sample conditioned on the prompt
+                   ``x_{≤p}`` (suffix m = W−1), i.e. what the generator produces for p
 
 Blocks after the last active block are computed by GPT-2 itself, so the run
 measures how a block's reconstruction error propagates. Positions < ``p`` are
@@ -23,25 +25,37 @@ Conditions (``CONDITIONS``): ``clean``; ``{vae,identity,meanabl,noise}_b`` for e
 block b; ``stack_closed`` (vae at every block in sequence: each block runs on the
 already-perturbed residual and its live chunk is round-tripped again);
 ``stack_identity``; and ``stack_open`` (no GPT-2 continuation: residuals rebuilt
-from the decoded trace alone, i.e. what a generated trace gives as-is).
+from the decoded trace alone, i.e. what a generated trace gives as-is). With an LDM
+checkpoint: ``dit_b`` per block, ``dit_stack`` (DiT writes spliced at every block on
+the real embedding) and ``dit_stack_open`` (the whole generated trace; its terminal
+readout is the LDM suite's decoded head).
 
 Metrics against ``clean``, at ``p``, for every measured block ``l``:
 per-slot relative error / cosine of the chunk, residual-stream relative error /
 cosine, logit lens (``ln_f`` + ``lm_head`` on the block's output residual) KL,
-TV and top-1 agreement; and on the final logits KL, top-1, top-5, acceptance
-α = Σ min(p, q), CE on the real next token and ΔCE. ``fraction_recovered`` per
-block b = (CE_meanabl_b − CE_x_b) / (CE_meanabl_b − CE_clean).
+TV and top-1 agreement, lens CE on the real next token and its Δ vs clean; and on
+the final logits KL, top-1, top-5, acceptance α = Σ min(p, q), true next-token top-1,
+CE on the real next token, ΔCE, perplexity ``exp(mean CE)`` and Δppl / ppl ratio vs
+clean. Substituted blocks also report the σ-weighted MSE per slot of the replacement
+chunk vs the live chunk (``recon_slot``, the VAE loss by block and component).
+``fraction_recovered`` per block b = (CE_meanabl_b − CE_x_b) / (CE_meanabl_b − CE_clean).
+Headline scalars carry 95% bootstrap CIs (``ci``). ``--split train`` runs the same
+study on the cache's train slice.
 
 Usage::
 
     python -m specdec_af.analysis.substitution \\
       --checkpoint /scratch/biggs.s/specdec_af/outputs/train/rev7B_optd/checkpoints/final.pt \\
       --out /scratch/biggs.s/specdec_af/outputs/substitution/rev7B_optd --n-positions 5000
+    python -m specdec_af.analysis.substitution \\
+      --ldm-checkpoint /scratch/biggs.s/specdec_af/outputs/ldm/S1-ldm256-mu/checkpoints/final.pt \\
+      --cache-dir /scratch/biggs.s/specdec_af/cache_s1 --out .../substitution/S1-ldm256-mu
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -54,6 +68,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from specdec_af.analysis.stats import bootstrap_ci
 from specdec_af.data.dataset import PositionSet, read_split
 from specdec_af.evaluate import _downstream_metrics
 from specdec_af.models.chunk_index import D_CHUNK, N_LAYERS_DEFAULT, SLOT_NAMES, SLOT_OFFSETS, TERMINAL_BLOCK
@@ -66,27 +81,49 @@ from specdec_af.utils.config import load_config
 J = N_LAYERS_DEFAULT
 MODES = ("vae", "identity", "meanabl", "noise")
 CONTRIB_SLOTS = ("attn_proj_out", "mlp_proj_out")
+OPEN_LOOP = ("stack_open", "dit_stack_open")
+# Headline per-position scalars that get a bootstrap CI in the summary.
+CI_KEYS = ("final_kl", "final_top1", "acceptance", "true_top1", "ce", "dce",
+           "terminal_top1", "terminal_acceptance", "terminal_true_top1", "terminal_ce")
+_TAG_DIT_COND, _TAG_DIT_NOISE = 40, 41
 
 
-def all_conditions(n_layers: int = J) -> list[str]:
+def all_conditions(n_layers: int = J, *, dit: bool = False) -> list[str]:
     conds = ["clean"]
     for m in MODES:
         conds += [f"{m}_{b}" for b in range(n_layers)]
-    return conds + ["stack_closed", "stack_identity", "stack_open"]
+    conds += ["stack_closed", "stack_identity", "stack_open"]
+    if dit:
+        conds += [f"dit_{b}" for b in range(n_layers)] + ["dit_stack", "dit_stack_open"]
+    return conds
 
 
 def parse_condition(cond: str, n_layers: int = J) -> tuple[str, set[int]]:
-    """``"vae_3"`` → ``("vae", {3})``; ``"stack_closed"`` → ``("vae", all)``."""
+    """``"vae_3"`` → ``("vae", {3})``; ``"stack_closed"`` → ``("vae", all)``;
+    ``"dit_stack"`` → ``("dit", all)``."""
     if cond == "clean":
         return "passthrough", set()
     if cond == "stack_closed":
         return "vae", set(range(n_layers))
     if cond == "stack_identity":
         return "identity", set(range(n_layers))
+    if cond == "dit_stack":
+        return "dit", set(range(n_layers))
     mode, b = cond.rsplit("_", 1)
-    if mode not in MODES or not 0 <= int(b) < n_layers:
+    if mode not in (*MODES, "dit") or not b.isdigit() or not 0 <= int(b) < n_layers:
         raise ValueError(f"unknown condition {cond!r}")
     return mode, {int(b)}
+
+
+def slot_loss(rec: Tensor, chunk: Tensor, lw: Tensor) -> Tensor:
+    """σ-weighted MSE per slot (the option-D loss by component): ``[B, D]`` → ``[B, n_slots]``;
+    NaN for slots padded at this block (``lw`` zero)."""
+    out = []
+    for name in SLOT_NAMES:
+        s, e = SLOT_OFFSETS[name]
+        w = lw[:, s:e]
+        out.append(torch.where(w[:, 0] > 0, ((rec[:, s:e] - chunk[:, s:e]).pow(2) * w).mean(-1), torch.nan))
+    return torch.stack(out, -1)
 
 
 def _rows(t: Tensor, pos: Tensor) -> Tensor:
@@ -101,8 +138,10 @@ class SubstitutionHooks:
     Set ``mode``, ``active`` and ``pos`` before each forward; read ``chunks``
     ``[B, J, D_CHUNK]`` (the live chunks GPT-2 computed, padded slots zero) and
     ``resid`` ``[B, J + 1, 768]`` (``resid[:, l]`` = input to block l; ``resid[:, J]``
-    = final residual) afterwards. ``recon_err`` holds, for vae / noise blocks, the
-    per-slot norm of the VAE error ``[B, 2]`` (attn, mlp).
+    = final residual) afterwards. ``recon_err`` holds, for vae / noise / dit blocks, the
+    per-slot norm of the replacement error ``[B, 2]`` (attn, mlp), and ``recon_slot`` the
+    σ-weighted MSE per slot of the replacement chunk ``[B, n_slots]``. ``dit`` mode reads
+    its replacement chunks from ``dit_chunks`` ``[B, J, D_CHUNK]`` (raw, set per batch).
     """
 
     def __init__(self, model, vae, chunk_norm: ChunkNorm, mode_space: str, *,
@@ -111,6 +150,7 @@ class SubstitutionHooks:
         self.block_means = block_means
         self.seed = seed
         self.mode, self.active, self.pos = "passthrough", set(), None
+        self.dit_chunks: Tensor | None = None
         self.n_layers = len(model.transformer.h)
         self._handles = []
         self._slots: dict[tuple[int, str], Tensor] = {}
@@ -195,10 +235,16 @@ class SubstitutionHooks:
             B = chunk.shape[0]
             return (self.block_means["attn_proj_out"][l].expand(B, -1),
                     self.block_means["mlp_proj_out"][l].expand(B, -1))
-        rec = self.round_trip(chunk, l)
+        if self.mode == "dit":
+            if self.dit_chunks is None:
+                raise ValueError("dit mode needs dit_chunks for this batch")
+            rec = self.dit_chunks[:, l]
+        else:
+            rec = self.round_trip(chunk, l)
         ra, rm = rec[:, sa:ea], rec[:, sm:em]
         self.recon_err[:, l] = torch.stack([(ra - attn).norm(dim=-1), (rm - mlp).norm(dim=-1)], -1)
-        if self.mode == "vae":
+        self.recon_slot[:, l] = slot_loss(rec, chunk, self._lw(l, chunk.shape[0]))
+        if self.mode in ("vae", "dit"):
             return ra, rm
         if self.mode == "noise":
             g = torch.Generator(device=chunk.device).manual_seed(self.seed * 1000 + l)
@@ -208,6 +254,10 @@ class SubstitutionHooks:
                 out.append(x + n / n.norm(dim=-1, keepdim=True) * err.unsqueeze(-1))
             return out[0], out[1]
         raise ValueError(self.mode)
+
+    def _lw(self, l: int, B: int) -> Tensor:
+        bid = torch.full((B,), l, dtype=torch.long, device=self.chunk_norm.std.device)
+        return self.chunk_norm.loss_weight_per_item(bid)
 
     # -- driver -------------------------------------------------------------
     @torch.no_grad()
@@ -220,10 +270,11 @@ class SubstitutionHooks:
         self.chunks = torch.zeros(B, self.n_layers, D_CHUNK, device=dev)
         self.resid = torch.zeros(B, self.n_layers + 1, self.model.config.n_embd, device=dev)
         self.recon_err = torch.full((B, self.n_layers, 2), float("nan"), device=dev)
+        self.recon_slot = torch.full((B, self.n_layers, len(SLOT_NAMES)), float("nan"), device=dev)
         T = int(pos.max()) + 1
         logits = self.model(input_ids=tokens[:, :T]).logits
         return {"logits": _rows(logits, self.pos).float(), "chunks": self.chunks,
-                "resid": self.resid, "recon_err": self.recon_err}
+                "resid": self.resid, "recon_err": self.recon_err, "recon_slot": self.recon_slot}
 
 
 # ----------------------------------------------------------------------
@@ -231,11 +282,14 @@ class SubstitutionHooks:
 # ----------------------------------------------------------------------
 
 @torch.no_grad()
-def open_loop(hooks: SubstitutionHooks, clean_chunks: Tensor) -> dict[str, Tensor]:
-    """Round-trip every block of the clean trace and rebuild the residual stream
-    from the decoded slots only: r̂_0 = boundary_in, r̂_{l+1} = r̂_l + attn̂_l + mlp̂_l."""
+def open_loop(hooks: SubstitutionHooks, clean_chunks: Tensor, dec: Tensor | None = None) -> dict[str, Tensor]:
+    """Round-trip every block of the clean trace (or take ``dec``, e.g. a decoded DiT
+    sample) and rebuild the residual stream from the decoded slots only:
+    r̂_0 = boundary_in, r̂_{l+1} = r̂_l + attn̂_l + mlp̂_l."""
     B, L, _ = clean_chunks.shape
-    dec = torch.stack([hooks.round_trip(clean_chunks[:, l], l) for l in range(L)], 1)
+    if dec is None:
+        dec = torch.stack([hooks.round_trip(clean_chunks[:, l], l) for l in range(L)], 1)
+    recon_slot = torch.stack([slot_loss(dec[:, l], clean_chunks[:, l], hooks._lw(l, B)) for l in range(L)], 1)
     s0, e0 = SLOT_OFFSETS["boundary_in"]
     (sa, ea), (sm, em) = SLOT_OFFSETS["attn_proj_out"], SLOT_OFFSETS["mlp_proj_out"]
     resid = torch.zeros(B, L + 1, e0 - s0, device=clean_chunks.device)
@@ -247,7 +301,7 @@ def open_loop(hooks: SubstitutionHooks, clean_chunks: Tensor) -> dict[str, Tenso
     s7, e7 = SLOT_OFFSETS["boundary_out"]
     terminal_logits = hooks.model.lm_head(dec[:, TERMINAL_BLOCK, s7:e7])
     return {"logits": logits.float(), "chunks": dec, "resid": resid,
-            "terminal_logits": terminal_logits.float()}
+            "terminal_logits": terminal_logits.float(), "recon_slot": recon_slot}
 
 
 # ----------------------------------------------------------------------
@@ -262,15 +316,25 @@ def _cos(a: Tensor, b: Tensor) -> Tensor:
     return F.cosine_similarity(a, b, dim=-1)
 
 
-def _lens_metrics(model, r: Tensor, r_clean: Tensor) -> dict[str, Tensor]:
-    """Logit lens at every block output: ``r [B, J, 768]`` → KL / TV / top-1 vs clean, ``[B, J]``."""
+def _lens_metrics(model, r: Tensor, r_clean: Tensor, next_tok: Tensor, has_next: Tensor) -> dict[str, Tensor]:
+    """Logit lens at every block output: ``r [B, J, 768]`` → KL / TV / top-1 vs clean and
+    CE / ΔCE on the real next token, ``[B, J]``."""
     tr = model.transformer
     lp = F.log_softmax(model.lm_head(tr.ln_f(r)).float(), -1)
     lq = F.log_softmax(model.lm_head(tr.ln_f(r_clean)).float(), -1)
     pc, ps = lq.exp(), lp.exp()
+    idx = next_tok[:, None, None].expand(-1, r.shape[1], 1)
+    ce, ce_clean = -lp.gather(-1, idx).squeeze(-1), -lq.gather(-1, idx).squeeze(-1)
+    nan = torch.full_like(ce, torch.nan)
     return {"lens_kl": (pc * (lq - lp)).sum(-1),
             "lens_tv": 0.5 * (pc - ps).abs().sum(-1),
-            "lens_top1": (lp.argmax(-1) == lq.argmax(-1)).float()}
+            "lens_top1": (lp.argmax(-1) == lq.argmax(-1)).float(),
+            "lens_ce": torch.where(has_next[:, None], ce, nan),
+            "lens_dce": torch.where(has_next[:, None], ce - ce_clean, nan)}
+
+
+def _true_top1(logits: Tensor, next_tok: Tensor, has_next: Tensor) -> Tensor:
+    return torch.where(has_next, (logits.argmax(-1) == next_tok).float(), torch.nan)
 
 
 def per_item_metrics(model, out: dict, clean: dict, next_tok: Tensor, has_next: Tensor) -> dict[str, Tensor]:
@@ -290,13 +354,16 @@ def per_item_metrics(model, out: dict, clean: dict, next_tok: Tensor, has_next: 
     ce_clean = F.cross_entropy(clean["logits"], next_tok, reduction="none")
     m = {"slot_rel": slot_rel, "slot_cos": slot_cos,
          "resid_rel": _rel(r, rc), "resid_cos": _cos(r, rc),
-         **_lens_metrics(model, r, rc),
+         **_lens_metrics(model, r, rc, next_tok, has_next),
          "final_kl": d["kl"], "final_top1": d["top1"], "final_top5": d["top5_overlap"],
-         "acceptance": d["acceptance"],
+         "acceptance": d["acceptance"], "true_top1": _true_top1(out["logits"], next_tok, has_next),
          "ce": torch.where(has_next, ce, torch.nan), "dce": torch.where(has_next, ce - ce_clean, torch.nan)}
     if "terminal_logits" in out:
         t = _downstream_metrics(out["terminal_logits"], clean["logits"])
-        m.update(terminal_kl=t["kl"], terminal_top1=t["top1"], terminal_acceptance=t["acceptance"])
+        tce = F.cross_entropy(out["terminal_logits"], next_tok, reduction="none")
+        m.update(terminal_kl=t["kl"], terminal_top1=t["top1"], terminal_acceptance=t["acceptance"],
+                 terminal_true_top1=_true_top1(out["terminal_logits"], next_tok, has_next),
+                 terminal_ce=torch.where(has_next, tce, torch.nan))
     return m
 
 
@@ -326,11 +393,16 @@ def _nanmean(t: Tensor, dim: int = 0):
     return v.tolist() if v.ndim else float(v)
 
 
-def summarize(cat: dict[str, Tensor]) -> dict:
+def summarize(cat: dict[str, Tensor], *, seed: int = 0) -> dict:
     out = {k: _nanmean(v) for k, v in cat.items() if k not in ("recon_err",)}
     out["n_positions"] = int(cat["final_kl"].numel())
     if "recon_err" in cat:
         out["vae_err_norm"] = _nanmean(cat["recon_err"])  # [J, 2]
+    out["ci"] = {k: bootstrap_ci(cat[k], seed=seed) for k in CI_KEYS if k in cat}
+    for pre in ("", "terminal_"):  # perplexity = exp(mean CE); its CI maps through exp
+        if f"{pre}ce" in out:
+            out[f"{pre}ppl"] = math.exp(out[f"{pre}ce"])
+            out["ci"][f"{pre}ppl"] = [math.exp(x) for x in out["ci"][f"{pre}ce"]]
     return out
 
 
@@ -361,15 +433,71 @@ def block_means(train_shards: list[Path], *, n_positions: int, out_path: Path, b
 # Driver
 # ----------------------------------------------------------------------
 
+class DiTSampler:
+    """Decoded DiT samples for a batch of prompts ``x_{≤p}``: suffix condition m = W−1
+    (the LDM suite's ``mfull``), fixed noise per batch, raw-space chunks ``[B, J, D_CHUNK]``."""
+
+    def __init__(self, ldm_checkpoint: Path, *, device: torch.device, steps: int = 50, cfg_w: float = 1.0,
+                 weights: str = "ema", seed: int = 0) -> None:
+        from specdec_af.ldm.data import ConditionConfig, ConditionSampler  # lazy: LDM stack
+        from specdec_af.ldm.train_ldm import load_ldm_checkpoint
+
+        ck = load_ldm_checkpoint(ldm_checkpoint, device=device)
+        self.cfg, self.ldm = ck["config"], ck["ldm"]
+        self.dit = ck["ema"] if weights == "ema" else self.ldm.dit
+        self.sampler = ConditionSampler(ConditionConfig.from_dict(self.cfg.condition))
+        self.step, self.steps, self.cfg_w, self.seed, self.weights = ck["step"], steps, cfg_w, seed, weights
+        self.vae_checkpoint = Path(self.cfg.vae_checkpoint)
+
+    @torch.no_grad()
+    def chunks(self, tokens: Tensor, pos: Tensor, bi: int, vae, chunk_norm: ChunkNorm, space: str) -> Tensor:
+        from specdec_af.ldm.data import batch_generator
+
+        W = self.sampler.cfg.W
+        cond = self.sampler.sample(tokens, pos, generator=batch_generator(self.seed, _TAG_DIT_COND, bi),
+                                   regime="suffix", m=W - 1)
+        B, d = tokens.shape[0], vae.d_latent
+        noise = torch.randn(B, J, d, generator=batch_generator(self.seed, _TAG_DIT_NOISE, bi)).to(tokens.device)
+        z = self.ldm.sample(cond, noise, steps=self.steps, cfg_w=self.cfg_w, dit=self.dit)
+        out = []
+        for l in range(J):
+            bid = torch.full((B,), l, dtype=torch.long, device=tokens.device)
+            rec = vae.decode(z[:, l], bid)
+            out.append(chunk_norm.invert_per_item(rec, bid) if space == "option_4" else rec)
+        return torch.stack(out, 1)
+
+    def describe(self) -> dict:
+        return {"step": self.step, "steps": self.steps, "cfg_w": self.cfg_w, "weights": self.weights,
+                "z_source": self.cfg.z_source, "vae_checkpoint": str(self.vae_checkpoint)}
+
+
 def run_substitution(
-    checkpoint: Path, cache_dir: Path, out_dir: Path, *, n_positions: int, device: torch.device,
+    checkpoint: Path | None, cache_dir: Path, out_dir: Path, *, n_positions: int, device: torch.device,
     conditions: list[str] | None = None, batch_size: int = 32, n_mean_positions: int = 10000,
     dump_residuals: bool = False, seed: int = 0, model_name: str = "openai-community/gpt2",
-    val_shards: int | None = None, model=None,
+    val_shards: int | None = None, model=None, split: str = "val", ldm_checkpoint: Path | None = None,
+    ldm_steps: int = 50, ldm_cfg_w: float = 1.0, ldm_weights: str = "ema",
 ) -> dict:
+    """``split``: ``val`` (the pinned val shards) or ``train`` (the cache's train slice).
+    ``ldm_checkpoint`` adds the ``dit_*`` conditions; the VAE is then the one the LDM was
+    trained on (``checkpoint`` may be omitted, and must match if given)."""
     from transformers import GPT2LMHeadModel  # lazy
 
-    conditions = conditions or all_conditions()
+    if split not in ("val", "train"):
+        raise ValueError(f"split must be val or train, got {split!r}")
+    dit = None
+    if ldm_checkpoint is not None:
+        dit = DiTSampler(ldm_checkpoint, device=device, steps=ldm_steps, cfg_w=ldm_cfg_w, weights=ldm_weights,
+                         seed=seed)
+        if checkpoint is None:
+            checkpoint = dit.vae_checkpoint
+        elif Path(checkpoint).resolve() != dit.vae_checkpoint.resolve():
+            raise ValueError(f"LDM was trained on {dit.vae_checkpoint}, not {checkpoint}")
+    if checkpoint is None:
+        raise ValueError("need a VAE checkpoint or an LDM checkpoint")
+    conditions = conditions or all_conditions(dit=dit is not None)
+    if dit is None and any(c.startswith("dit_") for c in conditions):
+        raise ValueError("dit_* conditions need ldm_checkpoint")
     loaded = load_vae_checkpoint(checkpoint, device=device)
     vae, cn, space = loaded["vae"], loaded["chunk_norm"].to(device), loaded["mode"]
     vae.eval()
@@ -384,7 +512,7 @@ def run_substitution(
         means = {k: v.to(device) for k, v in
                  block_means(train_shards, n_positions=n_mean_positions,
                              out_path=out_dir / "block_means.pt").items() if k in CONTRIB_SLOTS}
-    ds = PositionSet(val_list, max_positions=n_positions)
+    ds = PositionSet(val_list if split == "val" else train_shards, max_positions=n_positions)
     hooks = SubstitutionHooks(model, vae, cn, space, block_means=means, seed=seed)
     accs = {c: _Acc() for c in conditions}
     dumps: dict[str, list[Tensor]] = {}
@@ -401,17 +529,22 @@ def run_substitution(
             clean = {k: v.clone() for k, v in clean.items()}
             cached = ds.trace(s, e).to(device)
             live_vs_cache.append(_rel(clean["chunks"], cached).nanmean(1).cpu())
+            hooks.dit_chunks = (dit.chunks(tokens, pos, s // batch_size, vae, cn, space)
+                                if dit is not None and any(c.startswith("dit_") for c in conditions) else None)
             for c in conditions:
                 if c == "stack_open":
                     out = open_loop(hooks, clean["chunks"])
+                elif c == "dit_stack_open":
+                    out = open_loop(hooks, clean["chunks"], dec=hooks.dit_chunks)
                 else:
                     mode, active = parse_condition(c)
                     out = hooks.run(tokens, pos, mode=mode, active=active)
                 m = per_item_metrics(model, out, clean, next_tok, has_next)
-                if "recon_err" in out and c != "clean" and not torch.isnan(out["recon_err"]).all():
-                    m["recon_err"] = out["recon_err"]
+                for k in ("recon_err", "recon_slot"):
+                    if k in out and c != "clean" and not torch.isnan(out[k]).all():
+                        m[k] = out[k]
                 accs[c].add(m)
-                if dump_residuals and (c in ("clean", "stack_closed", "stack_open") or c.startswith("vae_")):
+                if dump_residuals and (c in ("clean", "stack_closed", *OPEN_LOOP) or c.startswith(("vae_", "dit_"))):
                     dumps.setdefault(c, []).append(out["resid"].half().cpu())
             done = e
             if (s // batch_size) % 20 == 0:
@@ -422,17 +555,22 @@ def run_substitution(
     cats = {c: a.cat() for c, a in accs.items()}
     res = {
         "format": "rev7_substitution", "checkpoint": str(checkpoint), "cache_dir": str(cache_dir),
-        "mode": space, "step": loaded["step"], "n_positions": ds.n_positions, "seed": seed,
-        "shards": ds.shards_loaded, "conditions": {c: summarize(v) for c, v in cats.items()},
+        "mode": space, "step": loaded["step"], "split": split, "n_positions": ds.n_positions, "seed": seed,
+        "shards": ds.shards_loaded, "conditions": {c: summarize(v, seed=seed) for c, v in cats.items()},
         "live_vs_cache_rel_err_max": float(torch.cat(live_vs_cache).max()),
         "wall_seconds": time.time() - t0,
     }
+    if dit is not None:
+        res["ldm_checkpoint"], res["ldm"] = str(ldm_checkpoint), dit.describe()
     ce_clean = res["conditions"]["clean"]["ce"]
+    ppl_clean = math.exp(ce_clean)
+    for c in res["conditions"].values():  # Δppl vs the unperturbed model on the same positions
+        c["dppl"], c["ppl_ratio"] = c["ppl"] - ppl_clean, c["ppl"] / ppl_clean
     for b in range(J):
         anchor = res["conditions"].get(f"meanabl_{b}", {}).get("ce")
         if anchor is None or anchor == ce_clean:
             continue
-        for mode in ("vae", "noise", "identity"):
+        for mode in ("vae", "noise", "identity", "dit"):
             c = res["conditions"].get(f"{mode}_{b}")
             if c is not None:
                 c["fraction_recovered"] = (anchor - c["ce"]) / (anchor - ce_clean)
@@ -440,7 +578,7 @@ def run_substitution(
     (out_dir / "metrics.json").write_text(json.dumps(_json_safe(res), indent=2))
     np.savez_compressed(out_dir / "per_position.npz",
                         **{f"{c}__{k}": cats[c][k].numpy() for c in cats
-                           for k in ("final_kl", "acceptance", "dce", "final_top1")})
+                           for k in ("final_kl", "acceptance", "dce", "final_top1", "true_top1")})
     if dump_residuals:
         rd = out_dir / "residuals"
         rd.mkdir(exist_ok=True)
@@ -456,30 +594,41 @@ def run_substitution(
 def write_summary(res: dict, out_dir: Path) -> Path:
     C = res["conditions"]
     lines = [f"rev-7 block substitution — {res['checkpoint']}",
-             f"mode={res['mode']}  step={res['step']}  positions={res['n_positions']}  "
-             f"live-vs-cache max rel err={res['live_vs_cache_rel_err_max']:.2e}", ""]
-    hdr = f"{'cond':<15}{'final_kl':>10}{'accept':>9}{'top1':>8}{'dCE':>9}{'frac_rec':>10}{'resid_rel@11':>14}"
+             f"mode={res['mode']}  step={res['step']}  split={res.get('split', 'val')}  positions={res['n_positions']}  "
+             f"live-vs-cache max rel err={res['live_vs_cache_rel_err_max']:.2e}"]
+    if "ldm" in res:
+        lines.append(f"LDM {res['ldm_checkpoint']}  {res['ldm']}")
+    lines.append("")
+    hdr = (f"{'cond':<15}{'final_kl':>10}{'accept':>9}{'top1':>8}{'true1':>8}{'dCE':>9}{'ppl':>9}{'dppl':>9}"
+           f"{'frac_rec':>10}{'resid_rel@11':>14}")
     lines.append(hdr)
 
     def row(c: str) -> str:
         m = C[c]
         fr = m.get("fraction_recovered")
-        return (f"{c:<15}{m['final_kl']:>10.4g}{m['acceptance']:>9.4f}{m['final_top1']:>8.4f}"
-                f"{m['dce']:>9.4f}{(f'{fr:.4f}' if fr is not None else '—'):>10}{m['resid_rel'][-1]:>14.4g}")
+        return (f"{c:<15}{m['final_kl']:>10.4g}{m['acceptance']:>9.4f}{m['final_top1']:>8.4f}{m['true_top1']:>8.4f}"
+                f"{m['dce']:>9.4f}{m['ppl']:>9.2f}{m['dppl']:>+9.2f}"
+                f"{(f'{fr:.4f}' if fr is not None else '—'):>10}{m['resid_rel'][-1]:>14.4g}")
 
-    order = ["clean"] + [f"{m}_{b}" for b in range(J) for m in MODES] + ["stack_identity", "stack_closed", "stack_open"]
+    order = (["clean"] + [f"{m}_{b}" for b in range(J) for m in (*MODES, "dit")]
+             + ["stack_identity", "stack_closed", "stack_open", "dit_stack", "dit_stack_open"])
     for c in order:
         if c in C:
             lines.append(row(c))
-        if c.startswith("noise_"):
+        if c.startswith("dit_") and c[4:].isdigit() or (c.startswith("noise_") and "dit_0" not in C):
             lines.append("")
-    if "stack_open" in C and "terminal_kl" in C["stack_open"]:
-        so = C["stack_open"]
-        lines.append(f"\nstack_open via decoded boundary_out → lm_head: KL {so['terminal_kl']:.4g}  "
-                     f"acceptance {so['terminal_acceptance']:.4f}  top1 {so['terminal_top1']:.4f}")
+    for c in OPEN_LOOP:
+        if c in C and "terminal_kl" in C[c]:
+            so = C[c]
+            lines.append(f"\n{c} via decoded boundary_out → lm_head: KL {so['terminal_kl']:.4g}  "
+                         f"acceptance {so['terminal_acceptance']:.4f}  top1 {so['terminal_top1']:.4f}  "
+                         f"true top1 {so['terminal_true_top1']:.4f}  ppl {so['terminal_ppl']:.2f}")
     p = out_dir / "summary.txt"
     p.write_text("\n".join(lines) + "\n")
     return p
+
+
+_STACKS = {"vae": ("stack_closed", "stack_open"), "dit": ("dit_stack", "dit_stack_open")}
 
 
 def _grid(res: dict, key: str, mode: str = "vae") -> tuple[np.ndarray, list[str]]:
@@ -490,22 +639,27 @@ def _grid(res: dict, key: str, mode: str = "vae") -> tuple[np.ndarray, list[str]
         if c in C:
             rows.append(C[c][key])
             labels.append(f"sub b{b}")
-    for c in ("stack_closed", "stack_open"):
-        if c in C and mode == "vae":
+    for c in _STACKS.get(mode, ()):
+        if c in C:
             rows.append(C[c][key])
             labels.append(c)
     return np.array(rows, dtype=float), labels
 
 
+def _grid_modes(res: dict) -> tuple[str, ...]:
+    return ("vae", "noise", "dit") if "dit_0" in res["conditions"] else ("vae", "noise")
+
+
 def plot_all(res: dict, out_dir: Path) -> list[Path]:
     paths = []
+    modes = _grid_modes(res)
     for key, title in (("resid_rel", "residual-stream relative error"), ("lens_kl", "logit-lens KL vs clean")):
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        grids = {mode: _grid(res, key, mode) for mode in ("vae", "noise")}
+        fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
+        grids = {mode: _grid(res, key, mode) for mode in modes}
         logs = [np.log10(np.clip(g, 1e-6, None)) for g, _ in grids.values() if g.size]
         finite = np.concatenate([x[np.isfinite(x) & (x > -6)] for x in logs]) if logs else np.array([0.0])
         vmin, vmax = float(finite.min()), float(finite.max())  # shared scale: panels are comparable
-        for ax, mode in zip(axes, ("vae", "noise")):
+        for ax, mode in zip(axes, modes):
             g, labels = grids[mode]
             if g.size == 0:
                 ax.axis("off")
@@ -523,18 +677,62 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
         plt.close(fig)
         paths.append(p)
 
+    # Lens ΔCE on the real next token (signed, linear): where the loss appears downstream.
+    fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
+    grids = {mode: _grid(res, "lens_dce", mode) for mode in modes}
+    vmax = max([float(np.nanmax(np.abs(g))) for g, _ in grids.values() if g.size and np.isfinite(g).any()] or [1.0])
+    for ax, mode in zip(axes, modes):
+        g, labels = grids[mode]
+        if g.size == 0:
+            ax.axis("off")
+            continue
+        im = ax.imshow(g, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        ax.set_yticks(range(len(labels)), labels, fontsize=8)
+        ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
+        ax.set_xlabel("measured at output of block (logit lens)")
+        ax.set_title(f"{mode}: lens ΔCE vs clean (nats)")
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    p = out_dir / "grid_lens_dce.png"
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
+    # Replacement loss by block × component (σ-weighted MSE of the substituted chunk).
+    rs_modes = [m for m in ("vae", "dit") if f"{m}_0" in res["conditions"]
+                and "recon_slot" in res["conditions"][f"{m}_0"]]
+    if rs_modes:
+        fig, axes = plt.subplots(1, len(rs_modes), figsize=(8 * len(rs_modes), 6), squeeze=False)
+        for ax, mode in zip(axes[0], rs_modes):
+            g = np.array([res["conditions"][f"{mode}_{b}"]["recon_slot"][b] if f"{mode}_{b}" in res["conditions"]
+                          else [np.nan] * len(SLOT_NAMES) for b in range(J)], dtype=float)
+            im = ax.imshow(np.log10(np.clip(g, 1e-6, None)), aspect="auto", cmap="viridis")
+            ax.set_xticks(range(len(SLOT_NAMES)), SLOT_NAMES, rotation=40, ha="right", fontsize=8)
+            ax.set_yticks(range(J), [f"b{l}" for l in range(J)])
+            ax.set_title(f"{mode}_b: log10 σ-weighted MSE per slot (block b substituted)")
+            fig.colorbar(im, ax=ax)
+        fig.tight_layout()
+        p = out_dir / "recon_slot.png"
+        fig.savefig(p, dpi=110)
+        plt.close(fig)
+        paths.append(p)
+
     C = res["conditions"]
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
     x = np.arange(J)
     for ax, key, title, log in ((axes[0], "final_kl", "final KL vs clean", True),
                                 (axes[1], "acceptance", "acceptance α", False),
                                 (axes[2], "fraction_recovered", "fraction of loss recovered", False)):
-        for k, (mode, col) in enumerate((("vae", "tab:green"), ("noise", "tab:gray"), ("meanabl", "tab:red"))):
+        bars = [("vae", "tab:green"), ("noise", "tab:gray"), ("meanabl", "tab:red")]
+        if "dit_0" in C:
+            bars.append(("dit", "tab:purple"))
+        w = 0.8 / len(bars)
+        for k, (mode, col) in enumerate(bars):
             v = [C.get(f"{mode}_{b}", {}).get(key, np.nan) for b in range(J)]
             if mode == "meanabl" and key == "fraction_recovered":
                 continue
-            ax.bar(x + (k - 1) * 0.27, v, width=0.27, color=col, label=mode)
-        for c, ls in (("stack_closed", "--"), ("stack_open", ":")):
+            ax.bar(x + (k - (len(bars) - 1) / 2) * w, v, width=w, color=col, label=mode)
+        for c, ls in (("stack_closed", "--"), ("stack_open", ":"), ("dit_stack", "-."), ("dit_stack_open", (0, (1, 3)))):
             if c in C and key in C[c]:
                 ax.axhline(C[c][key], color="tab:blue", ls=ls, label=c)
         ax.set_xticks(x, [f"b{b}" for b in range(J)])
@@ -566,7 +764,7 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--checkpoint", type=Path, required=True)
+    ap.add_argument("--checkpoint", type=Path, default=None, help="VAE; default: the LDM's VAE")
     ap.add_argument("--config", type=str, default="configs/default.yaml")
     ap.add_argument("--cache-dir", type=Path, default=None)
     ap.add_argument("--out", type=Path, required=True)
@@ -576,6 +774,11 @@ def main() -> int:
     ap.add_argument("--n-mean-positions", type=int, default=10000)
     ap.add_argument("--dump-residuals", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--split", choices=["val", "train"], default="val")
+    ap.add_argument("--ldm-checkpoint", type=Path, default=None, help="adds the dit_* conditions")
+    ap.add_argument("--ldm-steps", type=int, default=50)
+    ap.add_argument("--ldm-cfg-w", type=float, default=1.0)
+    ap.add_argument("--ldm-weights", choices=["ema", "raw"], default="ema")
     ap.add_argument("--cpu", action="store_true")
     a = ap.parse_args()
     cfg = load_config(a.config)
@@ -584,7 +787,9 @@ def main() -> int:
     device = pick_device(force_cpu=a.cpu)
     res = run_substitution(a.checkpoint, cache_dir, a.out, n_positions=n_pos, device=device,
                            conditions=a.conditions, batch_size=a.batch_size,
-                           n_mean_positions=a.n_mean_positions, dump_residuals=a.dump_residuals, seed=a.seed)
+                           n_mean_positions=a.n_mean_positions, dump_residuals=a.dump_residuals, seed=a.seed,
+                           split=a.split, ldm_checkpoint=a.ldm_checkpoint, ldm_steps=a.ldm_steps,
+                           ldm_cfg_w=a.ldm_cfg_w, ldm_weights=a.ldm_weights)
     print(write_summary(res, a.out).read_text(), flush=True)
     for p in plot_all(res, a.out):
         print("  plot:", p)

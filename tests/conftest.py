@@ -113,3 +113,19 @@ def ldm_latents(trained_run, tmp_path_factory):
     out = tmp_path_factory.mktemp("ldm_latents")
     export_latents(trained_run["checkpoint"], trained_run["cache_dir"], out, device=torch.device("cpu"))
     return out
+
+
+@pytest.fixture(scope="session")
+def tiny_ldm(ldm_latents, trained_run, tmp_path_factory):
+    """A 6-step DiT on the mini export (random tiny prefix encoder): checkpoint for eval-path tests."""
+    from specdec_af.ldm.train_ldm import LDMTrainConfig, train_ldm
+
+    run = tmp_path_factory.mktemp("tiny_ldm") / "run"
+    cfg = LDMTrainConfig(latents_dir=str(ldm_latents), vae_checkpoint=str(trained_run["checkpoint"]),
+                         data_source="static", z_source="mu", max_train_rows=12, batch_size=8, lr=1e-3,
+                         lr_warmup_steps=2, ema_decay=0.9, n_steps=6, val_every_steps=0, val_positions=16,
+                         val_max_positions=16, checkpoint_every_steps=0, log_every=1, seed=0, condition={},
+                         encoder=dict(init="random", vocab_size=50258, hidden_dim=32, n_heads=4, cond_dim=8),
+                         dit=dict(depth=2, d_model=32, n_heads=4))
+    train_ldm(cfg, trained_run["cache_dir"], run, device=torch.device("cpu"))
+    return {"run_dir": run, "checkpoint": run / "checkpoints" / "final.pt", "latents_dir": ldm_latents}

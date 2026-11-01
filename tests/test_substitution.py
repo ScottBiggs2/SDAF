@@ -6,6 +6,8 @@
   4. The live chunk at p matches the cached chunk.
   5. Acceptance α = Σ min(p, q) = 1 − TV.
   6. End-to-end: all conditions, metric shapes, files and plots.
+  7. DiT mode: splicing the live chunk through the dit path is clean; the dit_* conditions,
+     per-slot replacement loss, lens ΔCE, Δppl, CIs and the train split run end-to-end.
 """
 from __future__ import annotations
 
@@ -113,6 +115,9 @@ def test_parse_condition():
     with pytest.raises(ValueError):
         parse_condition("vae_12")
     assert len(all_conditions()) == 1 + 4 * J + 3
+    assert parse_condition("dit_7") == ("dit", {7})
+    assert parse_condition("dit_stack") == ("dit", set(range(J)))
+    assert len(all_conditions(dit=True)) == 1 + 4 * J + 3 + J + 2
 
 
 def test_run_substitution_end_to_end(trained_run, gpt2, tmp_path):
@@ -146,3 +151,52 @@ def test_run_substitution_end_to_end(trained_run, gpt2, tmp_path):
     write_summary(res, out)
     for p in plot_all(res, out):
         assert p.exists() and p.stat().st_size > 1000
+
+
+def test_dit_mode_with_live_chunks_is_clean(setup):
+    """The dit splice path with the live chunks as the 'sample' reproduces the clean run."""
+    h, toks, pos = setup["hooks"], setup["tokens"], setup["pos"]
+    clean = {k: v.clone() for k, v in h.run(toks, pos, mode="passthrough", active=set()).items()}
+    h.dit_chunks = clean["chunks"]
+    try:
+        out = h.run(toks, pos, mode="dit", active=set(range(J)))
+    finally:
+        h.dit_chunks = None
+    d = _downstream_metrics(out["logits"], clean["logits"])
+    assert d["kl"].max() < 1e-4 and d["top1"].min() == 1.0
+    assert out["recon_slot"].nan_to_num(0).abs().max() < 1e-8  # zero replacement loss
+
+
+def test_run_substitution_dit_and_train_split(tiny_ldm, trained_run, gpt2, tmp_path):
+    out = tmp_path / "sub_dit"
+    conds = ["clean", "vae_0", "vae_5", "stack_open", "dit_0", "dit_5", "dit_11", "dit_stack", "dit_stack_open"]
+    res = run_substitution(None, trained_run["cache_dir"], out, n_positions=6, device=torch.device("cpu"),
+                           conditions=conds, batch_size=3, model=gpt2, ldm_checkpoint=tiny_ldm["checkpoint"],
+                           ldm_steps=2)
+    C = res["conditions"]
+    assert set(C) == set(conds) and res["ldm"]["steps"] == 2
+    assert res["checkpoint"] == str(trained_run["checkpoint"])  # the LDM's own VAE
+    for c, m in C.items():
+        assert {"true_top1", "ppl", "dppl", "ppl_ratio", "ci"} <= set(m)
+        assert len(m["lens_dce"]) == J
+        lo, hi = m["ci"]["acceptance"]
+        assert lo <= m["acceptance"] + 1e-9 and m["acceptance"] <= hi + 1e-9
+    assert abs(C["clean"]["dppl"]) < 1e-9 and C["clean"]["ppl_ratio"] == pytest.approx(1.0)
+    for mode in ("vae", "dit"):
+        rs = np.array(C[f"{mode}_5"]["recon_slot"], dtype=float)
+        assert rs.shape == (J, 8) and np.isfinite(rs[5, 1:7]).all() and np.isnan(rs[4]).all()
+        assert max(abs(x) for x in C[f"{mode}_5"]["lens_dce"][:5]) < 1e-5  # upstream of the splice
+    for c in ("stack_open", "dit_stack_open"):
+        assert {"terminal_true_top1", "terminal_ppl"} <= set(C[c])
+        assert np.isfinite(np.array(C[c]["recon_slot"], dtype=float)[:, 1:7]).all()
+    write_summary(res, out)
+    paths = {p.name for p in plot_all(res, out)}
+    assert {"grid_lens_dce.png", "recon_slot.png", "grid_resid_rel.png"} <= paths
+
+    tr = run_substitution(trained_run["checkpoint"], trained_run["cache_dir"], tmp_path / "sub_train",
+                          n_positions=4, device=torch.device("cpu"), conditions=["clean", "vae_3"],
+                          batch_size=2, model=gpt2, split="train")
+    assert tr["split"] == "train" and tr["conditions"]["vae_3"]["n_positions"] == 4
+    with pytest.raises(ValueError):
+        run_substitution(trained_run["checkpoint"], trained_run["cache_dir"], tmp_path / "x", n_positions=2,
+                         device=torch.device("cpu"), conditions=["dit_0"], model=gpt2)

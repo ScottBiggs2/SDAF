@@ -22,6 +22,11 @@
 #   CONDITIONS      — space-separated subset (default: all)
 #   DUMP_RESIDUALS  — 1 = save residuals for clean / vae_b / stack_* (for SAE analysis later)
 #   BATCH_SIZE      — positions per forward batch (default 32)
+#   CONFIG          — yaml for cache path / default positions (default configs/default.yaml; scale-1: configs/scale1.yaml)
+#   CACHE_DIR       — override the config's cache (e.g. cache_v2 for WikiText OOD with an S1 VAE)
+#   SPLIT           — val (default) | train (the cache's train slice)
+#   LDM_CKPT        — LDM checkpoint: adds dit_b / dit_stack / dit_stack_open (VAE = the LDM's; CKPT ignored)
+#   LDM_STEPS, LDM_CFG_W — DiT sampler steps (50) and CFG weight (1.0)
 #
 # Outputs under ${SCRATCH}/specdec_af/outputs/substitution/${RUN_NAME}/:
 #   metrics.json, summary.txt, per_position.npz, block_means.pt,
@@ -32,6 +37,9 @@
 #   RUN_NAME=rev7B_optd N_POSITIONS=64 OUT_DIR=/scratch/biggs.s/specdec_af/outputs/substitution/rev7B_optd_smoke \
 #     sbatch scripts/slurm/submit_substitution.sh   # smoke
 #   RUN_NAME=rev7B_optd DUMP_RESIDUALS=1 sbatch scripts/slurm/submit_substitution.sh
+#   RUN_NAME=S1-vae256 CONFIG=configs/scale1.yaml SPLIT=train OUT_DIR=.../substitution/S1-vae256_train sbatch ...
+#   LDM_CKPT=${SCRATCH}/specdec_af/outputs/ldm/S1-ldm256-mu/checkpoints/final.pt CONFIG=configs/scale1.yaml \
+#     OUT_DIR=${SCRATCH}/specdec_af/outputs/substitution/S1-ldm256-mu sbatch scripts/slurm/submit_substitution.sh
 
 set -euo pipefail
 
@@ -52,8 +60,10 @@ export SCRATCH
 if command -v module &>/dev/null; then
   module load anaconda3 || module load miniconda3 || true
 fi
-# shellcheck disable=SC1091
-source activate "$ENV_PREFIX"
+# Env python directly: `source activate` can leave base py3.12 active in batch jobs.
+PY="${ENV_PREFIX}/bin/python"
+export PYTHONNOUSERSITE=1
+CONFIG="${CONFIG:-configs/default.yaml}"
 
 cd "$REPO_DIR"
 
@@ -63,6 +73,7 @@ nvidia-smi -L || true
 echo "git=$(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
 echo "RUN_NAME=$RUN_NAME  CKPT=$CKPT  OUT_DIR=$OUT_DIR"
 echo "N_POSITIONS=${N_POSITIONS:-(config)}  CONDITIONS=${CONDITIONS:-(all)}  DUMP_RESIDUALS=${DUMP_RESIDUALS:-0}"
+echo "CONFIG=$CONFIG  CACHE_DIR=${CACHE_DIR:-(config)}  SPLIT=${SPLIT:-val}  LDM_CKPT=${LDM_CKPT:-(none)}"
 echo "====================="
 
 if [[ -e "$OUT_DIR/metrics.json" ]]; then
@@ -76,10 +87,16 @@ if [[ -n "${N_POSITIONS:-}" ]]; then EXTRA_ARGS+=(--n-positions "$N_POSITIONS");
 if [[ -n "${CONDITIONS:-}" ]]; then EXTRA_ARGS+=(--conditions ${CONDITIONS}); fi
 if [[ "${DUMP_RESIDUALS:-0}" == "1" ]]; then EXTRA_ARGS+=(--dump-residuals); fi
 if [[ -n "${BATCH_SIZE:-}" ]]; then EXTRA_ARGS+=(--batch-size "$BATCH_SIZE"); fi
+if [[ -n "${CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--cache-dir "$CACHE_DIR"); fi
+if [[ -n "${SPLIT:-}" ]]; then EXTRA_ARGS+=(--split "$SPLIT"); fi
+if [[ -n "${LDM_CKPT:-}" ]]; then
+  EXTRA_ARGS+=(--ldm-checkpoint "$LDM_CKPT" --ldm-steps "${LDM_STEPS:-50}" --ldm-cfg-w "${LDM_CFG_W:-1.0}")
+else
+  EXTRA_ARGS+=(--checkpoint "$CKPT")
+fi
 
-python -m specdec_af.analysis.substitution \
-  --checkpoint "$CKPT" \
-  --config configs/default.yaml \
+"$PY" -m specdec_af.analysis.substitution \
+  --config "$CONFIG" \
   --out "$OUT_DIR" \
   "${EXTRA_ARGS[@]}"
 
