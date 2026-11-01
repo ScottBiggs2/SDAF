@@ -680,6 +680,8 @@ def main() -> int:
                    help="scale-2: constant | cosine (default: ldm.training.lr_schedule)")
     p.add_argument("--dit-size", choices=sorted(DIT_SIZES), default=None,
                    help="scale-2: DiT preset (S = rev-8 default, B = 768-d / 12 heads); overrides ldm.dit dims")
+    p.add_argument("--terminal-logit-kl", type=float, default=None,
+                   help="scale-2: λ of the decode-through-head KL (overrides ldm.loss_weights; 0 = off, e.g. regress)")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -698,6 +700,8 @@ def main() -> int:
     )
     if args.dit_size:
         cfg.dit = {**cfg.dit, **DIT_SIZES[args.dit_size]}
+    if args.terminal_logit_kl is not None:
+        cfg.loss_weights = {**(cfg.loss_weights or {}), "terminal_logit_kl": args.terminal_logit_kl}
     cfg.condition = {**cfg.condition, **CONDITION_PRESETS[args.condition_preset]}
     if args.self_attn_mask:
         cfg.dit = {**cfg.dit, "self_attn_mask": args.self_attn_mask}

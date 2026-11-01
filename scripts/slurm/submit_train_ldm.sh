@@ -34,6 +34,7 @@
 #   OBJECTIVE         — scale-2: flow | regress (deterministic μ baseline) (default: config ldm.objective)
 #   LR_SCHEDULE       — scale-2: constant | cosine (default: config)
 #   DIT_SIZE          — scale-2: S | B preset (default: config ldm.dit)
+#   TERMINAL_LOGIT_KL — scale-2: λ of the decode-through-head KL (0 = off; required for OBJECTIVE=regress with scale2.yaml)
 #   WANDB_RUN_GROUP / WANDB_TAGS (comma-sep) / WANDB_JOB_TYPE — scale-1: W&B run organisation (read by WandbLogger)
 #   GPU type: override the #SBATCH line, e.g. sbatch --gres=gpu:h200:1 (or a100) ...
 #
@@ -113,6 +114,7 @@ if [[ -n "${VAE_CHECKPOINT:-}" ]]; then EXTRA_ARGS+=(--vae-checkpoint "$VAE_CHEC
 if [[ -n "${OBJECTIVE:-}" ]]; then EXTRA_ARGS+=(--objective "$OBJECTIVE"); fi
 if [[ -n "${LR_SCHEDULE:-}" ]]; then EXTRA_ARGS+=(--lr-schedule "$LR_SCHEDULE"); fi
 if [[ -n "${DIT_SIZE:-}" ]]; then EXTRA_ARGS+=(--dit-size "$DIT_SIZE"); fi
+if [[ -n "${TERMINAL_LOGIT_KL:-}" ]]; then EXTRA_ARGS+=(--terminal-logit-kl "$TERMINAL_LOGIT_KL"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
 if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 
