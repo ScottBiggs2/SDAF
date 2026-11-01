@@ -25,6 +25,7 @@
 #                 LATENTS_DIR=$SCRATCH/specdec_af/outputs/latents/S1-vae128_wt CACHE_DIR=$SCRATCH/specdec_af/cache_v2 TAG=ood
 #
 #   RUN_NAME=rev8_mu sbatch scripts/slurm/submit_eval_ldm.sh
+#   SPLIT       — val (default) | train (first export train rows; pair with TAG=train)
 #   python -m specdec_af.ldm.evaluate_ldm compare <run_dir>/eval_step50000 <other>/eval_step50000
 
 set -euo pipefail
@@ -68,6 +69,7 @@ if [[ -n "${OUT:-}" ]]; then EXTRA_ARGS+=(--out "$OUT"); fi
 if [[ -n "${LATENTS_DIR:-}" ]]; then EXTRA_ARGS+=(--latents-dir "$LATENTS_DIR"); fi
 if [[ -n "${CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--cache-dir "$CACHE_DIR"); fi
 if [[ -n "${TAG:-}" ]]; then EXTRA_ARGS+=(--tag "$TAG"); fi
+if [[ -n "${SPLIT:-}" ]]; then EXTRA_ARGS+=(--split "$SPLIT"); fi
 
 "$PY" -m specdec_af.ldm.evaluate_ldm suite --checkpoint "$CKPT" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
