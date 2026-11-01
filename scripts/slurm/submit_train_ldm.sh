@@ -31,6 +31,9 @@
 #   CONFIG            — scale-1: yaml (default configs/default.yaml; scale-1 runs use configs/scale1.yaml)
 #   PRECISION         — scale-1: fp32 | bf16 train forward (default: config)
 #   INFLIGHT_EVERY_STEPS — scale-1: in-flight eval cadence → inflight/* in W&B + inflight.jsonl (default: config, 0 = off)
+#   OBJECTIVE         — scale-2: flow | regress (deterministic μ baseline) (default: config ldm.objective)
+#   LR_SCHEDULE       — scale-2: constant | cosine (default: config)
+#   DIT_SIZE          — scale-2: S | B preset (default: config ldm.dit)
 #   WANDB_RUN_GROUP / WANDB_TAGS (comma-sep) / WANDB_JOB_TYPE — scale-1: W&B run organisation (read by WandbLogger)
 #   GPU type: override the #SBATCH line, e.g. sbatch --gres=gpu:h200:1 (or a100) ...
 #
@@ -107,6 +110,9 @@ if [[ -n "${PRECISION:-}" ]]; then EXTRA_ARGS+=(--precision "$PRECISION"); fi
 if [[ -n "${INFLIGHT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--inflight-every-steps "$INFLIGHT_EVERY_STEPS"); fi
 if [[ -n "${LATENTS_DIR:-}" ]]; then EXTRA_ARGS+=(--latents-dir "$LATENTS_DIR"); fi
 if [[ -n "${VAE_CHECKPOINT:-}" ]]; then EXTRA_ARGS+=(--vae-checkpoint "$VAE_CHECKPOINT"); fi
+if [[ -n "${OBJECTIVE:-}" ]]; then EXTRA_ARGS+=(--objective "$OBJECTIVE"); fi
+if [[ -n "${LR_SCHEDULE:-}" ]]; then EXTRA_ARGS+=(--lr-schedule "$LR_SCHEDULE"); fi
+if [[ -n "${DIT_SIZE:-}" ]]; then EXTRA_ARGS+=(--dit-size "$DIT_SIZE"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
 if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 

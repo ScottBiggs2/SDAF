@@ -52,9 +52,19 @@ def logit_normal_t(B: int, n_tok: int, *, generator: torch.Generator, mean: floa
     return torch.sigmoid(mean + std * u).expand(B, n_tok).contiguous()
 
 
-def rf_loss(v_pred: Tensor, z0: Tensor, eps: Tensor) -> Tensor:
-    """Per-sample MSE over all tokens × dims ``[B]``."""
-    return (v_pred - velocity_target(z0, eps)).pow(2).flatten(1).mean(1)
+def mse_per_sample(pred: Tensor, target: Tensor, weights: Tensor | None = None) -> Tensor:
+    """Per-sample MSE over all tokens × dims ``[B]``. ``weights`` (``[n, d]``, broadcast over the batch;
+    scale-2 per-block weights × live-dim mask) gives the weighted mean ``Σ w·err² / Σ w``."""
+    sq = (pred - target).pow(2)
+    if weights is None:
+        return sq.flatten(1).mean(1)
+    w = weights.to(sq.dtype).expand_as(sq)
+    return (sq * w).flatten(1).sum(1) / w.flatten(1).sum(1).clamp_min(1e-12)
+
+
+def rf_loss(v_pred: Tensor, z0: Tensor, eps: Tensor, weights: Tensor | None = None) -> Tensor:
+    """Rectified-flow loss per sample ``[B]``: MSE of v against ε − z₀ (optionally weighted)."""
+    return mse_per_sample(v_pred, velocity_target(z0, eps), weights)
 
 
 def cfg_combine(v_cond: Tensor, v_null: Tensor, w: float) -> Tensor:

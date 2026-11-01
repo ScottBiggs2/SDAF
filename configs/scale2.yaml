@@ -15,3 +15,21 @@ training:
   beta_max: 0.003           # S1-vae256 (β 0.01) left ~900/3,072 dims at the 0.1-nat floor
   lr_schedule: cosine       # decay to lr_min_ratio · lr at the last step
   lr_min_ratio: 0.1
+
+ldm:                        # DiT v2 on the VAE v2 latents (latents_dir / vae_checkpoint set at submit time)
+  latent_interface:         # specdec_af/ldm/dit.py LatentInterface (fitted from export train rows at start)
+    standardize: true       # per-(block, dim) (μ − mean) / std, the SD latent-scale trick, per dim
+    drop_dead: true         # dims at the free-bits floor → pinned 0 / decoded to their mean
+    fit_rows: 100000
+  loss_weights:
+    block: {11: 4.0}        # the readout block; block 0 stays ×1 unless the dit_0 substitution says otherwise
+    terminal_logit_kl: 0.1  # decode-through-head KL vs the VAE floor's readout, weighted (1 − t)^head_t_power
+    head_t_power: 2.0
+  encoder:
+    n_blocks: 2             # MDLM blocks 0–1
+    trainable: true
+    lr_mult: 0.1            # encoder LR = 0.1 × DiT LR
+  training:
+    lr_schedule: cosine
+    lr_min_ratio: 0.1
+    precision: bf16         # A100 bench 11505158: DiT-B bf16 0.13 s/step (V100 fp32 DiT-S 0.43); GPT-2 producer stays fp32

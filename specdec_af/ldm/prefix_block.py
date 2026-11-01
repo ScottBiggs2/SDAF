@@ -200,21 +200,26 @@ def constant_condition(sd: dict[str, Tensor], cond_dim: int) -> Tensor:
 # ----------------------------------------------------------------------
 
 class MDLMBlock0Encoder(nn.Module):
-    """``ids [B, W]`` (GPT-2 ids, [MASK] = 50257) → block-0 states ``[B, W, hidden_dim]``.
+    """``ids [B, W]`` (GPT-2 ids, [MASK] = 50257) → MDLM states after ``n_blocks`` DDiT blocks
+    ``[B, W, hidden_dim]`` (block 0 by default; scale-2 uses blocks 0–1, trainable).
 
     Frozen and in eval mode unless ``trainable``. ``init="random"`` builds the
     same architecture with random weights (tests / ablations; MDLM itself
     zero-inits adaLN, which would make the block an identity, so random init
-    draws N(0, 0.02) for it).
+    draws N(0, 0.02) for it). Block 0 stays at ``block`` (checkpoint keys unchanged);
+    blocks 1.. live in ``extra``. Every block gets the same RoPE, constant ``c`` and key mask.
     """
 
     def __init__(self, *, vocab_size: int = MDLM_CONFIG["vocab_size"], hidden_dim: int = MDLM_CONFIG["hidden_dim"],
                  n_heads: int = MDLM_CONFIG["n_heads"], cond_dim: int = MDLM_CONFIG["cond_dim"],
-                 trainable: bool = False) -> None:
+                 trainable: bool = False, n_blocks: int = 1) -> None:
         super().__init__()
-        self.hidden_dim, self.n_heads, self.cond_dim = hidden_dim, n_heads, cond_dim
+        if not 1 <= n_blocks <= MDLM_CONFIG["n_blocks"]:
+            raise ValueError(f"n_blocks must be in [1, {MDLM_CONFIG['n_blocks']}], got {n_blocks}")
+        self.hidden_dim, self.n_heads, self.cond_dim, self.n_blocks = hidden_dim, n_heads, cond_dim, n_blocks
         self.vocab_embed = EmbeddingLayer(hidden_dim, vocab_size)
         self.block = DDiTBlock(hidden_dim, n_heads, cond_dim)
+        self.extra = nn.ModuleList(DDiTBlock(hidden_dim, n_heads, cond_dim) for _ in range(n_blocks - 1))
         self.register_buffer("c", torch.zeros(cond_dim))
         self.trainable = trainable
         self.source: dict = {"init": "random"}
@@ -236,8 +241,9 @@ class MDLMBlock0Encoder(nn.Module):
         with torch.no_grad():
             for p in enc.parameters():
                 p.copy_(torch.randn(p.shape, generator=g) * 0.02)
-            enc.block.norm1.weight.fill_(1.0)
-            enc.block.norm2.weight.fill_(1.0)
+            for blk in (enc.block, *enc.extra):
+                blk.norm1.weight.fill_(1.0)
+                blk.norm2.weight.fill_(1.0)
             enc.c.copy_(torch.randn(enc.cond_dim, generator=g))
         enc.source = {"init": "random", "seed": seed}
         return enc
@@ -245,22 +251,27 @@ class MDLMBlock0Encoder(nn.Module):
     @classmethod
     def from_pretrained(cls, repo: str = MDLM_REPO, revision: str = MDLM_REVISION, *,
                         path: Path | str | None = None, trainable: bool = False,
-                        n_heads: int = MDLM_CONFIG["n_heads"]) -> "MDLMBlock0Encoder":
+                        n_heads: int = MDLM_CONFIG["n_heads"], n_blocks: int = 1) -> "MDLMBlock0Encoder":
         sd = load_mdlm_state(repo, revision, path=path)
         vocab_size, hidden_dim = sd["vocab_embed.embedding"].shape
         enc = cls(vocab_size=vocab_size, hidden_dim=hidden_dim, n_heads=n_heads,
-                  cond_dim=sd["sigma_map.mlp.0.weight"].shape[0], trainable=trainable)
+                  cond_dim=sd["sigma_map.mlp.0.weight"].shape[0], trainable=trainable, n_blocks=n_blocks)
         enc.vocab_embed.embedding.data.copy_(sd["vocab_embed.embedding"])
         enc.block.load_state_dict(_sub(sd, "blocks.0."))
+        for i, blk in enumerate(enc.extra, start=1):
+            blk.load_state_dict(_sub(sd, f"blocks.{i}."))
         enc.c.copy_(constant_condition(sd, enc.cond_dim))
-        enc.source = {"init": "pretrained", "repo": repo, "revision": revision}
+        enc.source = {"init": "pretrained", "repo": repo, "revision": revision, "n_blocks": n_blocks}
         enc._freeze()
         return enc
 
     def forward(self, ids: Tensor, key_mask: Tensor | None = None) -> Tensor:
         """``key_mask [B, W]`` bool drops absent (pre-start) slots from the attention keys (D18)."""
         cos, sin = rotary_cos_sin(ids.shape[1], self.hidden_dim // self.n_heads, device=ids.device)
-        return self.block(self.vocab_embed(ids), cos, sin, self.c, key_mask)
+        h = self.block(self.vocab_embed(ids), cos, sin, self.c, key_mask)
+        for blk in self.extra:
+            h = blk(h, cos, sin, self.c, key_mask)
+        return h
 
 
 class MDLMFull(nn.Module):

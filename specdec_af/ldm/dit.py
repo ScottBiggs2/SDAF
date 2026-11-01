@@ -34,6 +34,13 @@ deltas). SDPA otherwise.
 
 :class:`LatentLDM` pairs the frozen prefix encoder with the DiT and samples
 (Euler ODE + CFG with the exact training null).
+
+Scale-2 :class:`LatentInterface` (identity by default, so older checkpoints are
+unchanged): the DiT models ``(μ − mean) / std`` per block and dim, with dims the
+VAE left at the free-bits floor ("dead", posterior ≈ prior) pinned to 0 and
+decoded back to their mean — standardizing those would hand the DiT amplified
+noise. ``objective="regress"`` is the deterministic baseline: one forward at
+t = 1 from a zero input predicts the standardized μ directly.
 """
 from __future__ import annotations
 
@@ -253,9 +260,12 @@ class LatentLDM(nn.Module):
     """Frozen prefix encoder + :class:`LatentDiT`. ``cond`` = the dict from
     :func:`specdec_af.ldm.data.condition_batch` (``ids``, ``visible``, ``T``)."""
 
-    def __init__(self, encoder: nn.Module, dit: LatentDiT, *, mask_id: int = 50257) -> None:
+    def __init__(self, encoder: nn.Module, dit: LatentDiT, *, mask_id: int = 50257, objective: str = "flow") -> None:
         super().__init__()
-        self.encoder, self.dit, self.mask_id = encoder, dit, mask_id
+        if objective not in ("flow", "regress"):
+            raise ValueError(f"objective must be 'flow' or 'regress', got {objective!r}")
+        self.encoder, self.dit, self.mask_id, self.objective = encoder, dit, mask_id, objective
+        self.latents = LatentInterface(dit.cfg.n_tokens, dit.cfg.d_latent)
 
     def encode(self, cond: dict) -> Tensor:
         """Encoder states for ``cond``; pre-start slots are masked out of its attention (D18)."""
@@ -278,17 +288,64 @@ class LatentLDM(nn.Module):
     @torch.no_grad()
     def sample(self, cond: dict, noise: Tensor, *, steps: int = 50, cfg_w: float = 1.0,
                dit: LatentDiT | None = None) -> Tensor:
-        """Euler ODE t = 1 → 0 from ``noise`` (fixed noise gives paired comparisons).
-        ``cfg_w = 1`` is the plain conditional model; ``dit`` overrides (e.g. EMA weights)."""
+        """Euler ODE t = 1 → 0 from ``noise`` (fixed noise gives paired comparisons), returned in raw
+        VAE coordinates (through :class:`LatentInterface`). ``cfg_w = 1`` is the plain conditional
+        model; ``dit`` overrides (e.g. EMA weights). ``objective="regress"``: one forward at t = 1 from
+        zeros (``noise`` only sets the shape; CFG combines the two predictions the same way)."""
         ctx = self.encode(cond)
-        if cfg_w == 1.0:
-            return euler_sample(lambda x, t: self(x, t, cond, ctx=ctx, dit=dit), noise, steps=steps)
-        nc = self.null_cond(cond)
-        ctx_null = self.encode(nc)
+        nc = self.null_cond(cond) if cfg_w != 1.0 else None
+        ctx_null = self.encode(nc) if nc is not None else None
 
         def v(x, t):
-            return cfg_combine(self(x, t, cond, ctx=ctx, dit=dit), self(x, t, nc, ctx=ctx_null, dit=dit), cfg_w)
-        return euler_sample(v, noise, steps=steps)
+            out = self(x, t, cond, ctx=ctx, dit=dit)
+            return out if nc is None else cfg_combine(out, self(x, t, nc, ctx=ctx_null, dit=dit), cfg_w)
+        if self.objective == "regress":
+            x = v(torch.zeros_like(noise), torch.ones(noise.shape[:2], device=noise.device))
+        else:
+            x = euler_sample(v, noise, steps=steps)
+        return self.latents.decode(x)
+
+
+class LatentInterface(nn.Module):
+    """Raw VAE coordinates ↔ DiT coordinates: per-(block, dim) standardization; dead dims → 0.
+
+    Buffers ``mean``, ``std`` ``[n, d]`` and ``keep`` ``[n, d]`` bool; the default is the identity.
+    """
+
+    def __init__(self, n_tok: int, d_latent: int) -> None:
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(n_tok, d_latent))
+        self.register_buffer("std", torch.ones(n_tok, d_latent))
+        self.register_buffer("keep", torch.ones(n_tok, d_latent, dtype=torch.bool))
+
+    @property
+    def is_identity(self) -> bool:
+        return bool(self.keep.all() and (self.mean == 0).all() and (self.std == 1).all())
+
+    def encode(self, z: Tensor) -> Tensor:
+        return torch.where(self.keep, (z - self.mean) / self.std, torch.zeros_like(z))
+
+    def decode(self, x: Tensor) -> Tensor:
+        return torch.where(self.keep, x * self.std + self.mean, self.mean.expand_as(x))
+
+    @torch.no_grad()
+    def fit(self, mu: Tensor, logvar: Tensor, *, standardize: bool = True, drop_dead: bool = True,
+            dead_kl: float = 0.11) -> dict:
+        """From export rows ``mu``, ``logvar`` ``[N, n, d]``: mean KL per dim ≤ ``dead_kl`` → dead (the
+        free-bits floor + a margin); ``std`` from μ, clamped. Returns a summary."""
+        mu, logvar = mu.double(), logvar.double()
+        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).mean(0)
+        keep = kl > dead_kl if drop_dead else torch.ones_like(kl, dtype=torch.bool)
+        if standardize:
+            self.mean.copy_(mu.mean(0).float())
+            self.std.copy_(mu.std(0).clamp_min(1e-3).float())
+        else:
+            self.mean.copy_(torch.where(keep, 0.0, mu.mean(0)).float())
+            self.std.fill_(1.0)
+        self.keep.copy_(keep)
+        return {"n_rows": int(mu.shape[0]), "live_dims": int(keep.sum()), "dead_dims": int((~keep).sum()),
+                "live_per_block": keep.sum(1).tolist(), "dead_kl": dead_kl, "standardize": standardize,
+                "std_live_median": float(self.std[keep].median()) if keep.any() else float("nan")}
 
 
 def count_params(m: nn.Module, trainable_only: bool = False) -> int:

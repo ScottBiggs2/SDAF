@@ -45,6 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from specdec_af.ldm.data import (
     HOLES,
@@ -60,8 +61,9 @@ from specdec_af.ldm.data import (
     resolve_window,
 )
 from specdec_af.ldm.dit import DiTConfig, LatentDiT, LatentLDM, count_params
-from specdec_af.ldm.flow import interpolate, logit_normal_t, rf_loss, velocity_target
+from specdec_af.ldm.flow import interpolate, logit_normal_t, mse_per_sample, rf_loss, velocity_target, x0_hat
 from specdec_af.ldm.prefix_block import MDLM_REPO, MDLM_REVISION, MDLMBlock0Encoder
+from specdec_af.training.schedule import LR_SCHEDULES, lr_factor
 from specdec_af.training.train import (
     CSVLogger,
     WandbLogger,
@@ -75,6 +77,7 @@ from specdec_af.utils.precision import PRECISIONS, autocast
 FORMAT = "ldm_v1"
 _TAG_NOISE, _TAG_VAL = 20, 21
 T_BUCKETS = ((0.0, 0.1), (0.1, 0.3), (0.3, 0.7), (0.7, 1.0001))
+DIT_SIZES = {"S": {"depth": 12, "d_model": 384, "n_heads": 6}, "B": {"depth": 12, "d_model": 768, "n_heads": 12}}
 CONDITION_PRESETS = {
     "default": {},
     "full": {"p_null": 0.0, "p_suffix": 1.0, "p_holes": 0.0, "m_mixture": [[-1, -1, 1.0]]},  # overfit smoke
@@ -116,6 +119,11 @@ class LDMTrainConfig:
     inflight_positions: int = 512          # fixed val subset for the in-flight m-curve
     inflight_sampler_steps: int = 25       # Euler steps for in-flight samples (post-hoc suite uses sampler.steps)
     inflight_weights: str = "ema"          # "ema" (what the suite scores; lags early at decay 0.9999) | "raw"
+    objective: str = "flow"                # scale-2: "flow" (rectified flow) | "regress" (deterministic μ baseline)
+    latent_interface: dict = field(default_factory=dict)  # scale-2: {standardize, drop_dead, dead_kl, fit_rows}
+    loss_weights: dict = field(default_factory=dict)      # scale-2: {block: {11: 4}, terminal_logit_kl: λ, head_t_power}
+    lr_schedule: str = "constant"          # scale-2: "constant" | "cosine" (to lr_min_ratio · lr at n_steps)
+    lr_min_ratio: float = 0.1
 
     @classmethod
     def from_raw(cls, raw_cfg: dict, **over) -> "LDMTrainConfig":
@@ -123,7 +131,7 @@ class LDMTrainConfig:
         ldm = raw_cfg.get("ldm", {})
         kw = {k: ldm[k] for k in ("latents_dir", "vae_checkpoint", "data_source", "z_source", "train_half",
                                   "max_train_rows", "val_positions", "condition", "encoder", "dit", "flow",
-                                  "sampler") if k in ldm}
+                                  "sampler", "objective", "latent_interface", "loss_weights") if k in ldm}
         kw.update({k: v for k, v in (ldm.get("training") or {}).items() if k in cls.__dataclass_fields__})
         for k in ("latents_dir", "vae_checkpoint"):
             if kw.get(k):
@@ -137,10 +145,12 @@ class LDMTrainConfig:
 # ----------------------------------------------------------------------
 
 def build_encoder(enc_cfg: dict) -> MDLMBlock0Encoder:
+    n_blocks = int(enc_cfg.get("n_blocks", 1))
     if enc_cfg.get("init", "pretrained") == "pretrained":
         return MDLMBlock0Encoder.from_pretrained(enc_cfg.get("repo", MDLM_REPO), enc_cfg.get("revision", MDLM_REVISION),
-                                                 trainable=bool(enc_cfg.get("trainable", False)))
+                                                 trainable=bool(enc_cfg.get("trainable", False)), n_blocks=n_blocks)
     dims = {k: enc_cfg[k] for k in ("vocab_size", "hidden_dim", "n_heads", "cond_dim") if k in enc_cfg}
+    dims["n_blocks"] = n_blocks
     enc = MDLMBlock0Encoder.random(seed=int(enc_cfg.get("seed", 0)), **dims)
     if enc_cfg.get("trainable", False):
         enc.trainable = True
@@ -153,7 +163,83 @@ def build_ldm(cfg: LDMTrainConfig, *, d_latent: int, n_positions: int) -> Latent
     ccfg = ConditionConfig.from_dict(cfg.condition)
     dit = LatentDiT(DiTConfig.from_dict(cfg.dit, d_latent=d_latent, d_cond=enc.hidden_dim, n_positions=n_positions,
                                         ctx_len=ccfg.W))
-    return LatentLDM(enc, dit, mask_id=ccfg.mask_id)
+    return LatentLDM(enc, dit, mask_id=ccfg.mask_id, objective=cfg.objective)
+
+
+def flow_weights(cfg: LDMTrainConfig, ldm: LatentLDM) -> torch.Tensor | None:
+    """``[12, d]`` per-element weights of the flow (or regression) loss: per-block multipliers
+    (``loss_weights.block``, normalized to mean 1 over blocks) × the latent interface's live-dim mask.
+    ``None`` when both are trivial (the plain mean)."""
+    lat = ldm.latents
+    n = lat.keep.shape[0]
+    spec = (cfg.loss_weights or {}).get("block") or {}
+    blk = torch.ones(n)
+    for k, v in (spec.items() if isinstance(spec, dict) else enumerate(spec)):
+        if not 0 <= int(k) < n:
+            raise ValueError(f"loss_weights.block: block {k} outside [0, {n})")
+        blk[int(k)] = float(v)
+    blk = blk / blk.mean()
+    if bool((blk == 1).all()) and bool(lat.keep.all()):
+        return None
+    return blk[:, None].to(lat.keep.device) * lat.keep.float()
+
+
+def fit_latent_interface(cfg: LDMTrainConfig, ldm: LatentLDM, table: LatentTable) -> dict | None:
+    """Fit :class:`LatentInterface` from the export's train rows (``latent_interface`` config); dead =
+    mean KL ≤ the VAE's free-bits floor + 0.01 unless ``dead_kl`` is given."""
+    li = cfg.latent_interface or {}
+    if not (li.get("standardize") or li.get("drop_dead")):
+        return None
+    rows = table.train_rows()
+    rng = np.random.default_rng(cfg.seed)
+    n = min(int(li.get("fit_rows", 100_000)), len(rows))
+    rows = np.sort(rng.choice(rows, size=n, replace=False))
+    mu = torch.from_numpy(np.asarray(table.mu[rows], dtype=np.float32))
+    lv = torch.from_numpy(np.asarray(table.logvar[rows], dtype=np.float32))
+    dead_kl = li.get("dead_kl")
+    if dead_kl is None:
+        fb = 0.0
+        if cfg.vae_checkpoint:
+            from specdec_af.training.checkpoint import load_vae_checkpoint
+            fb = float(load_vae_checkpoint(cfg.vae_checkpoint)["training_config"].get("free_bits", 0.0) or 0.0)
+        dead_kl = fb + 0.01
+    summ = ldm.latents.fit(mu, lv, standardize=bool(li.get("standardize", False)),
+                           drop_dead=bool(li.get("drop_dead", False)), dead_kl=float(dead_kl))
+    print(f"latent interface: {summ}", flush=True)
+    return summ
+
+
+class HeadLoss:
+    """Scale-2 decode-through-head auxiliary loss on block 11: the x₀ estimate ``z_t − t·v`` (decoded to
+    raw VAE coordinates) → frozen VAE decoder → ``lm_head`` on the terminal slot; KL against the VAE
+    floor's readout ``lm_head(decode(μ₁₁))`` (the DiT's own ceiling), weighted per item by
+    ``(1 − t)^head_t_power`` so near-pure-noise estimates count little."""
+
+    def __init__(self, vae, chunk_norm, mode: str, lm_head, *, t_power: float = 2.0) -> None:
+        self.vae, self.chunk_norm, self.mode, self.lm_head, self.t_power = vae, chunk_norm, mode, lm_head, t_power
+        for m in (vae, lm_head):
+            for p in m.parameters():
+                p.requires_grad_(False)
+
+    def _logits(self, z11: torch.Tensor) -> torch.Tensor:
+        from specdec_af.models.chunk_index import SLOT_OFFSETS, TERMINAL_BLOCK
+        bid = torch.full((z11.shape[0],), TERMINAL_BLOCK, dtype=torch.long, device=z11.device)
+        rec = self.vae.decode(z11, bid)
+        if self.mode == "option_4":
+            rec = self.chunk_norm.invert_per_item(rec, bid)
+        s, e = SLOT_OFFSETS["boundary_out"]
+        return self.lm_head(rec[:, s:e]).float()
+
+    def __call__(self, ldm: LatentLDM, z_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor,
+                 z0_raw: torch.Tensor) -> torch.Tensor:
+        from specdec_af.models.chunk_index import TERMINAL_BLOCK
+        x0 = ldm.latents.decode(x0_hat(z_t, t, v.float()))[:, TERMINAL_BLOCK]
+        lq = F.log_softmax(self._logits(x0), -1)
+        with torch.no_grad():
+            lp = F.log_softmax(self._logits(z0_raw[:, TERMINAL_BLOCK]), -1)
+        kl = (lp.exp() * (lp - lq)).sum(-1)
+        w = (1.0 - t[:, TERMINAL_BLOCK]).clamp(min=0.0).pow(self.t_power)
+        return (w * kl).sum() / w.sum().clamp_min(1e-8)
 
 
 def _bucket_m(m: torch.Tensor, regime: torch.Tensor, W: int) -> list[str]:
@@ -198,12 +284,20 @@ class Validator:
         self.n = len(rows)
 
     @torch.no_grad()
-    def __call__(self, ldm: LatentLDM, dit: LatentDiT) -> dict:
+    def __call__(self, ldm: LatentLDM, dit: LatentDiT, weights: torch.Tensor | None = None) -> dict:
+        """Loss in DiT coordinates (through ``ldm.latents``); ``weights`` = :func:`flow_weights`. For
+        ``objective="regress"`` the loss is the MSE of the t = 1 prediction (t buckets are then moot)."""
         losses, ts, buckets, per_block = [], [], [], []
         for b in self.batches:
-            v = ldm(interpolate(b["z0"], b["eps"], b["t"]), b["t"], b, dit=dit)
-            losses.append(rf_loss(v, b["z0"], b["eps"]).cpu())
-            per_block.append((v - velocity_target(b["z0"], b["eps"])).pow(2).mean(-1).cpu())  # [B, 12]
+            z0 = ldm.latents.encode(b["z0"])
+            if ldm.objective == "regress":
+                v = ldm(torch.zeros_like(z0), torch.ones_like(b["t"]), b, dit=dit)
+                losses.append(mse_per_sample(v, z0, weights).cpu())
+                per_block.append((v - z0).pow(2).mean(-1).cpu())
+            else:
+                v = ldm(interpolate(z0, b["eps"], b["t"]), b["t"], b, dit=dit)
+                losses.append(rf_loss(v, z0, b["eps"], weights).cpu())
+                per_block.append((v - velocity_target(z0, b["eps"])).pow(2).mean(-1).cpu())  # [B, 12]
             ts.append(b["t"][:, 0].cpu())
             buckets += b["bucket"]
         loss, t = torch.cat(losses), torch.cat(ts)
@@ -235,6 +329,7 @@ def save_ldm_checkpoint(path: Path, *, ldm: LatentLDM, ema: LatentDiT, step: int
         "dit": ldm.dit.state_dict(), "ema": ema.state_dict(),
         "encoder_source": ldm.encoder.source,
         "encoder": ldm.encoder.state_dict() if ldm.encoder.trainable else None,
+        "latents": ldm.latents.state_dict(),
         **meta,
     }
     if train_state is not None:
@@ -259,7 +354,10 @@ def load_ldm_checkpoint(path: Path | str, *, device="cpu") -> dict:
     dit, ema = LatentDiT(dcfg), LatentDiT(dcfg)
     dit.load_state_dict(state["dit"])
     ema.load_state_dict(state["ema"])
-    ldm = LatentLDM(enc, dit, mask_id=ConditionConfig.from_dict(cfg.condition).mask_id).to(device).eval()
+    ldm = LatentLDM(enc, dit, mask_id=ConditionConfig.from_dict(cfg.condition).mask_id, objective=cfg.objective)
+    if state.get("latents") is not None:  # scale-2 latent interface; absent = identity (older checkpoints)
+        ldm.latents.load_state_dict(state["latents"])
+    ldm = ldm.to(device).eval()
     return {"ldm": ldm, "ema": ema.to(device).eval().requires_grad_(False), "step": int(state["step"]),
             "config": cfg, "train_state": state.get("train_state"), "raw": state}
 
@@ -313,10 +411,19 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
     params = [p for p in ldm.parameters() if p.requires_grad]
     n_params = count_params(ldm.dit)
     print(f"DiT params: {n_params:,}  encoder: {count_params(ldm.encoder):,} "
-          f"({'trainable' if ldm.encoder.trainable else 'frozen'}, {ldm.encoder.source})", flush=True)
-    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+          f"({'trainable' if ldm.encoder.trainable else 'frozen'}, {ldm.encoder.source})  "
+          f"objective={cfg.objective}", flush=True)
+    # A trainable encoder gets its own LR (encoder.lr_mult × lr, scale-2: 0.1); the schedule scales both.
+    enc_params = [p for p in ldm.encoder.parameters() if p.requires_grad]
+    dit_params = [p for p in ldm.dit.parameters() if p.requires_grad]
+    groups = [{"params": dit_params, "lr": cfg.lr}]
+    if enc_params:
+        groups.append({"params": enc_params, "lr": cfg.lr * float(cfg.encoder.get("lr_mult", 1.0))})
+    opt = torch.optim.AdamW(groups, lr=cfg.lr, weight_decay=cfg.weight_decay)
     warm = max(1, cfg.lr_warmup_steps)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: min(1.0, (s + 1) / warm))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        opt, lr_lambda=lambda s: lr_factor(s, warmup=warm, total=cfg.n_steps, schedule=cfg.lr_schedule,
+                                           min_ratio=cfg.lr_min_ratio))
 
     step, epoch, batch_in_epoch = 0, 0, 0
     val_history: list[dict] = []
@@ -327,10 +434,12 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
         ts = ck["train_state"]
         if ts is None:
             raise ValueError(f"{resume_path} has no train_state; cannot resume from it")
-        for k in ("data_source", "z_source", "train_half", "max_train_rows", "batch_size", "seed"):
+        for k in ("data_source", "z_source", "train_half", "max_train_rows", "batch_size", "seed", "objective",
+                  "latent_interface", "loss_weights", "lr_schedule"):
             if getattr(ck["config"], k) != getattr(cfg, k):
                 raise ValueError(f"resume {k} mismatch: ckpt={getattr(ck['config'], k)} cfg={getattr(cfg, k)}")
         ldm.dit.load_state_dict(ck["ldm"].dit.state_dict())
+        ldm.latents.load_state_dict(ck["ldm"].latents.state_dict())
         if ldm.encoder.trainable:
             ldm.encoder.load_state_dict(ck["ldm"].encoder.state_dict())
         ema.load_state_dict(ck["ema"].state_dict())
@@ -344,6 +453,26 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
         print(f"resumed from {resume_path}: step={step} epoch={epoch} batch_in_epoch={batch_in_epoch}", flush=True)
     else:
         meta["vae_sha256"] = file_sha256(cfg.vae_checkpoint)
+        fit = fit_latent_interface(cfg, ldm, table)
+        if fit is not None:
+            meta["latent_interface_fit"] = fit
+    fw = flow_weights(cfg, ldm)
+    lam = float((cfg.loss_weights or {}).get("terminal_logit_kl", 0.0) or 0.0)
+    head = None
+    if lam > 0:
+        if cfg.objective != "flow":
+            raise ValueError("terminal_logit_kl needs objective='flow' (it uses the x₀ estimate)")
+        from specdec_af.training.checkpoint import load_vae_checkpoint
+        if producer is not None:
+            head_lm = producer.model.lm_head
+        else:
+            from specdec_af.training.overfit_sweep import load_lm_head_only
+            head_lm = load_lm_head_only(device=device)
+        hv = load_vae_checkpoint(cfg.vae_checkpoint, device=device)
+        head = HeadLoss(hv["vae"].eval(), hv["chunk_norm"].to(device), hv["mode"], head_lm,
+                        t_power=float(cfg.loss_weights.get("head_t_power", 2.0)))
+    print(f"loss: objective={cfg.objective}  block/dim weights={'on' if fw is not None else 'off'}  "
+          f"terminal_logit_kl={lam}  lr_schedule={cfg.lr_schedule}", flush=True)
     ldm.dit.train()
 
     t0 = time.time()
@@ -358,8 +487,8 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
 
     def _validate() -> dict:
         ldm.dit.eval()
-        v = {"step": step, **{f"ema_{k}": x for k, x in validator(ldm, ema).items()},
-             **{f"raw_{k}": x for k, x in validator(ldm, ldm.dit).items()}}
+        v = {"step": step, **{f"ema_{k}": x for k, x in validator(ldm, ema, fw).items()},
+             **{f"raw_{k}": x for k, x in validator(ldm, ldm.dit, fw).items()}}
         ldm.dit.train()
         val_history.append(v)
         (output_dir / "val_history.json").write_text(json.dumps(val_history, indent=2))
@@ -369,6 +498,8 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
         return v
 
     fields = ["step", "epoch", "lr", "loss", "loss_null", "loss_suffix", "loss_holes", "loss_spans", "grad_norm", "per_token_t"]
+    if head is not None:
+        fields.append("head_kl")
     csv_logger = CSVLogger(output_dir / "training_log.csv", fields,
                            resume_step=step if resume_path is not None else None)
     wb = WandbLogger(cfg.wandb_project, entity=cfg.wandb_entity, run_dir=output_dir, run_name=output_dir.name,
@@ -413,15 +544,25 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
             idx = step
             b = condition_batch(raw, sampler, z_source=cfg.z_source, seed=cfg.seed, epoch=epoch,
                                 batch_in_epoch=batch_in_epoch)
-            z0 = b["z0"]
+            z0 = ldm.latents.encode(b["z0"])  # DiT coordinates (identity unless latent_interface is fitted)
             g = batch_generator(cfg.seed, _TAG_NOISE, idx)
             t = logit_normal_t(z0.shape[0], z0.shape[1], generator=g, mean=fl.get("t_logit_mean", 0.0),
                                std=fl.get("t_logit_std", 1.0), p_token_t=fl.get("p_token_t", 0.0)).to(device)
             eps = torch.randn(z0.shape, generator=g).to(device)
-            with autocast(cfg.precision, device):
-                v = ldm(interpolate(z0, eps, t), t, b)
-            per = rf_loss(v.float(), z0, eps)
+            head_kl = None
+            if cfg.objective == "regress":
+                with autocast(cfg.precision, device):
+                    v = ldm(torch.zeros_like(z0), torch.ones_like(t), b)
+                per = mse_per_sample(v.float(), z0, fw)
+            else:
+                z_t = interpolate(z0, eps, t)
+                with autocast(cfg.precision, device):
+                    v = ldm(z_t, t, b)
+                per = rf_loss(v.float(), z0, eps, fw)
             loss = per.mean()
+            if head is not None:
+                head_kl = head(ldm, z_t, t, v, b["z0"])
+                loss = loss + lam * head_kl
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -443,6 +584,8 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
                        "loss_spans": rl["spans"],
                        "grad_norm": float(gn) if gn is not None else float("nan"),
                        "per_token_t": int(bool((t != t[:, :1]).any()))}
+                if head_kl is not None:
+                    row["head_kl"] = head_kl.item()
                 csv_logger.log(row)
                 wb.log({f"train/{k}": x for k, x in row.items() if k != "step" and x == x}, step=idx)
                 if idx % (cfg.log_every * 10) == 0:
@@ -531,6 +674,12 @@ def main() -> int:
                    help="scale-1: in-flight m-curve eval cadence (default: ldm.training.inflight_every_steps, 0 = off)")
     p.add_argument("--precision", choices=PRECISIONS, default=None,
                    help="scale-1: train-forward precision (default: ldm.training.precision, else fp32)")
+    p.add_argument("--objective", choices=["flow", "regress"], default=None,
+                   help="scale-2: rectified flow, or the deterministic μ-regression baseline (default: ldm.objective)")
+    p.add_argument("--lr-schedule", choices=LR_SCHEDULES, default=None,
+                   help="scale-2: constant | cosine (default: ldm.training.lr_schedule)")
+    p.add_argument("--dit-size", choices=sorted(DIT_SIZES), default=None,
+                   help="scale-2: DiT preset (S = rev-8 default, B = 768-d / 12 heads); overrides ldm.dit dims")
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -545,8 +694,10 @@ def main() -> int:
         max_wall_seconds=args.max_wall_minutes * 60 if args.max_wall_minutes else None,
         wandb_project=None if not wandb_project or str(wandb_project).lower() == "none" else wandb_project,
         wandb_entity=args.wandb_entity or raw.get("logging", {}).get("wandb_entity"), precision=args.precision,
-        inflight_every_steps=args.inflight_every_steps,
+        inflight_every_steps=args.inflight_every_steps, objective=args.objective, lr_schedule=args.lr_schedule,
     )
+    if args.dit_size:
+        cfg.dit = {**cfg.dit, **DIT_SIZES[args.dit_size]}
     cfg.condition = {**cfg.condition, **CONDITION_PRESETS[args.condition_preset]}
     if args.self_attn_mask:
         cfg.dit = {**cfg.dit, "self_attn_mask": args.self_attn_mask}
