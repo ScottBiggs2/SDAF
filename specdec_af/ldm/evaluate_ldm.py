@@ -41,6 +41,7 @@ import torch
 import torch.nn.functional as F
 
 from specdec_af.analysis.consistency import GPT2Weights, summarize_consistency, trace_consistency
+from specdec_af.analysis.stats import bootstrap_ci
 from specdec_af.data.dataset import list_shards
 from specdec_af.evaluate import _downstream_metrics, decode_traces, to_raw
 from specdec_af.ldm.data import ConditionConfig, ConditionSampler, LatentTable, batch_generator
@@ -196,6 +197,10 @@ class SuiteConfig:
     diversity_k: int = 4
     cfg_positions: int = 1000
     cfg_ws: tuple = (1.0, 1.5, 2.0, 3.0)
+    sweep_steps: tuple = (25, 50, 100)   # sampler-steps sweep at mfull (w = cfg_w), on cfg_positions
+    sweep_ks: tuple = (1, 4, 8)          # K-sample readout: mean of the K decoded next-token distributions
+    sweep_k_ws: tuple = (1.0, 2.0)
+    split: str = "val"                   # "val" (the VAE report's fixed val set) | "train" (first export train rows)
     mem_train_rows: int = 100_000
     loss_gap_positions: int = 2048
     kid_subset: int = 1000
@@ -279,10 +284,20 @@ def add_true_text(acc: _Acc, logits: torch.Tensor, target: torch.Tensor) -> None
     acc.add(true_top1=(logits.argmax(-1) == t).float()[ok], nll=F.cross_entropy(logits.float(), t, reduction="none")[ok])
 
 
-def true_text_summary(acc: _Acc) -> dict:
-    """``{true_top1, nll, ppl}``; ppl = exp(mean NLL) over positions with a next token."""
-    nll = float(acc.cat("nll").double().mean())
-    return {"true_top1": float(acc.cat("true_top1").mean()), "nll": nll, "ppl": math.exp(nll)}
+def true_text_summary(acc: _Acc, *, seed: int = 0) -> dict:
+    """``{true_top1, nll, ppl, ci}``; ppl = exp(mean NLL) over positions with a next token; 95% bootstrap
+    CIs on top-1 and NLL (ppl's CI is exp of NLL's)."""
+    nll_t, t1 = acc.cat("nll"), acc.cat("true_top1")
+    nll = float(nll_t.double().mean())
+    ci_nll = bootstrap_ci(nll_t, seed=seed)
+    return {"true_top1": float(t1.mean()), "nll": nll, "ppl": math.exp(nll),
+            "ci": {"true_top1": bootstrap_ci(t1, seed=seed), "nll": ci_nll, "ppl": [math.exp(x) for x in ci_nll]}}
+
+
+def _vs_teacher(c: dict, teacher: dict) -> dict:
+    """Δppl and ppl ratio against GPT-2 on the same positions."""
+    return {"dppl": c["ppl"] - teacher["ppl"], "ppl_ratio": c["ppl"] / teacher["ppl"],
+            "dnll": c["nll"] - teacher["nll"]}
 
 
 def _cons_summary(parts: list[dict]) -> dict:
@@ -357,7 +372,12 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
     table = LatentTable(latents_dir or cfg.latents_dir, cache_dir)  # override: e.g. the WikiText OOD export
     sampler = ConditionSampler(ConditionConfig.from_dict(cfg.condition))
     W = sampler.cfg.W
-    rows = table.eval_rows(sc.n_positions)
+    if sc.split == "val":
+        rows = table.eval_rows(sc.n_positions)
+    elif sc.split == "train":
+        rows = table.train_rows()[:sc.n_positions]
+    else:
+        raise ValueError(f"split must be val or train, got {sc.split!r}")
     conds = eval_conditions(W)
 
     loaded = load_vae_checkpoint(cfg.vae_checkpoint, device=device)
@@ -370,14 +390,18 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
     accs, floor, real_acc, ref = score_conditions(ldm, dit, table, sampler, dec, rows, conds, sc, device)
 
     mu_val, z_post = ref.cat("mu"), ref.cat("z_post")
+    teacher = true_text_summary(real_acc, seed=sc.seed)
     floor_res = {"top1": float(floor.cat("top1").mean()), "top5": float(floor.cat("top5").mean()),
                  "kl": float(floor.cat("kl").mean()), "recon_cos_block": floor.cat("recon_cos").mean(0).tolist(),
-                 "acceptance": float(floor.cat("acceptance").mean()), **true_text_summary(floor),
+                 "acceptance": float(floor.cat("acceptance").mean()), **true_text_summary(floor, seed=sc.seed),
                  "consistency": _cons_summary(floor.cons), "real_consistency": _cons_summary(real_acc.cons)}
+    floor_res.update(_vs_teacher(floor_res, teacher))
+    floor_res["ci"].update(top1=bootstrap_ci(floor.cat("top1"), seed=sc.seed),
+                           acceptance=bootstrap_ci(floor.cat("acceptance"), seed=sc.seed))
     res: dict = {"format": "ldm_eval_v1", "checkpoint": str(checkpoint), "step": ck["step"],
-                 "z_source": cfg.z_source, "suite": asdict(sc), "W": W, "n_positions": int(len(rows)),
-                 "latents_dir": str(table.latents_dir),
-                 "cache_dir": str(cache_dir), "floor": floor_res, "teacher": true_text_summary(real_acc),
+                 "z_source": cfg.z_source, "suite": asdict(sc), "split": sc.split, "W": W,
+                 "n_positions": int(len(rows)), "latents_dir": str(table.latents_dir),
+                 "cache_dir": str(cache_dir), "floor": floor_res, "teacher": teacher,
                  "conditions": {}}
 
     # Distribution floors.
@@ -396,13 +420,16 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
         top1, kl, rc = float(a.cat("top1").mean()), float(a.cat("kl").mean()), a.cat("recon_cos").mean(0)
         c = {"latent_cos_block": a.cat("lat_cos").mean(0).tolist(), "latent_mse_block": a.cat("lat_mse").mean(0).tolist(),
              "top1": top1, "top5": float(a.cat("top5").mean()), "kl": kl, "recon_cos_block": rc.tolist(),
-             "acceptance": float(a.cat("acceptance").mean()), **true_text_summary(a),
+             "acceptance": float(a.cat("acceptance").mean()), **true_text_summary(a, seed=sc.seed),
              "gap_top1": top1 - floor_res["top1"], "gap_kl": kl - floor_res["kl"],
              "gap_recon_cos_block": (rc - torch.tensor(floor_res["recon_cos_block"])).tolist(),
              **{f"consistency_{k}": v for k, v in _cons_summary(a.cons).items()},
              "dist_z": _dist(z, mu_val, sc, device), "dist_resid": _dist(a.cat("resid").float(), real_resid, sc, device)}
         if cfg.z_source == "sample":
             c["dist_z_vs_posterior_samples"] = _dist(z, z_post, sc, device)
+        c.update(_vs_teacher(c, teacher))
+        c["ci"].update(top1=bootstrap_ci(a.cat("top1"), seed=sc.seed),
+                       acceptance=bootstrap_ci(a.cat("acceptance"), seed=sc.seed))
         res["conditions"][name] = c
         print(f"  {name:<9} true_top1={c['true_top1']:.4f}  ppl={c['ppl']:.2f}  top1={top1:.4f} (gap {c['gap_top1']:+.4f})  kl={kl:.4f}  "
               f"kid_joint={c['dist_z']['kid_joint']['mean']:.4g}  cons_cross={c['consistency_cross_median']:.4g}", flush=True)
@@ -413,6 +440,7 @@ def evaluate_suite(checkpoint: Path | str, *, device, sc: SuiteConfig | None = N
                                 for k in ("top1", "kl", "true_top1", "ppl")},
         "cfg_sweep": _cfg_sweep(ldm, dit, table, sampler, dec, rows[:sc.cfg_positions], sc, device),
     }
+    res["sampler_sweep"] = _sampler_sweep(ldm, dit, table, sampler, dec, rows[:sc.cfg_positions], sc, device)
     # Memorization is judged against the rows this run could have trained on (respects
     # max_train_rows / train_half); the data floor above uses the whole train split.
     seen = table.train_rows(half=cfg.train_half, max_rows=cfg.max_train_rows)
@@ -439,12 +467,35 @@ def _diversity(ldm, dit, table, sampler, dec, rows, conds, sc, device) -> dict:
     return out
 
 
+def _readout_metrics(logits: torch.Tensor | None, teacher: torch.Tensor, target: torch.Tensor, *,
+                     probs: torch.Tensor | None = None) -> dict:
+    """Teacher agreement + true next-token metrics of one readout. ``probs`` (a mixture over K samples)
+    overrides ``softmax(logits)`` for the true-text NLL and the argmax."""
+    p = F.softmax(logits.float(), -1) if probs is None else probs
+    mm = _downstream_metrics(p.clamp_min(1e-30).log(), teacher)
+    ok = target >= 0
+    t = target.clamp(min=0)
+    nll = -p.gather(1, t[:, None]).squeeze(1).clamp_min(1e-30).log()[ok]
+    nll_m = float(nll.double().mean())
+    return {"top1": float(mm["top1"].mean()), "kl": float(mm["kl"].mean()), "acceptance": float(mm["acceptance"].mean()),
+            "true_top1": float((p.argmax(-1) == t).float()[ok].mean()), "nll": nll_m, "ppl": math.exp(nll_m)}
+
+
+def _batched_sample(ldm, dit, cond: dict, noise: torch.Tensor, *, steps: int, cfg_w: float, batch: int) -> torch.Tensor:
+    out = []
+    for s in range(0, noise.shape[0], batch):
+        c = {k: v[s:s + batch] for k, v in cond.items()}
+        out.append(ldm.sample(c, noise[s:s + batch], steps=steps, cfg_w=cfg_w, dit=dit))
+    return torch.cat(out)
+
+
 @torch.no_grad()
 def _cfg_sweep(ldm, dit, table, sampler, dec, rows, sc, device) -> dict:
     W = sampler.cfg.W
     raw = table.raw_batch(rows, device)
     real = cached_chunks(table, rows).to(device)
     teacher = dec.logits(real)
+    target = next_tokens(raw)
     noise = torch.randn(raw["mu"].shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, 8_000)).to(device)
     out = {}
     for m in sorted({min(2, W - 1), W - 1}):
@@ -452,10 +503,36 @@ def _cfg_sweep(ldm, dit, table, sampler, dec, rows, sc, device) -> dict:
                               regime="suffix", m=m)
         out[f"m{m}"] = {}
         for w in sc.cfg_ws:
-            z = ldm.sample(cond, noise, steps=sc.steps, cfg_w=w, dit=dit)
-            mm = _downstream_metrics(dec.logits(dec.traces(z)), teacher)
+            z = _batched_sample(ldm, dit, cond, noise, steps=sc.steps, cfg_w=w, batch=sc.batch)
             out[f"m{m}"][str(w)] = {"latent_cos": float(F.cosine_similarity(z, raw["mu"], dim=-1).mean()),
-                                    "top1": float(mm["top1"].mean()), "kl": float(mm["kl"].mean())}
+                                    **_readout_metrics(dec.logits(dec.traces(z)), teacher, target)}
+    return out
+
+
+@torch.no_grad()
+def _sampler_sweep(ldm, dit, table, sampler, dec, rows, sc, device) -> dict:
+    """Free inference knobs at mfull on ``rows``: Euler steps (at ``cfg_w``) and the K-sample readout
+    (mean of K decoded next-token distributions; K draws share the first K noises) per CFG weight."""
+    W = sampler.cfg.W
+    raw = table.raw_batch(rows, device)
+    teacher = dec.logits(cached_chunks(table, rows).to(device))
+    target = next_tokens(raw)
+    cond = sampler.sample(raw["seq_tokens"], raw["pos"], generator=batch_generator(sc.seed, _TAG_EVAL_COND, 9_000),
+                          regime="suffix", m=W - 1)
+    noises = [torch.randn(raw["mu"].shape, generator=batch_generator(sc.seed, _TAG_EVAL_NOISE, 9_000, k)).to(device)
+              for k in range(max(sc.sweep_ks))]
+    out: dict = {"steps": {}, "k_samples": {}}
+    for st in sc.sweep_steps:
+        z = _batched_sample(ldm, dit, cond, noises[0], steps=st, cfg_w=sc.cfg_w, batch=sc.batch)
+        out["steps"][str(st)] = _readout_metrics(dec.logits(dec.traces(z)), teacher, target)
+    for w in sc.sweep_k_ws:
+        probs, out["k_samples"][str(w)] = None, {}
+        for k in range(max(sc.sweep_ks)):
+            z = _batched_sample(ldm, dit, cond, noises[k], steps=sc.steps, cfg_w=w, batch=sc.batch)
+            p = F.softmax(dec.logits(dec.traces(z)).float(), -1)
+            probs = p if probs is None else probs + p
+            if k + 1 in sc.sweep_ks:
+                out["k_samples"][str(w)][str(k + 1)] = _readout_metrics(None, teacher, target, probs=probs / (k + 1))
     return out
 
 
@@ -554,6 +631,7 @@ def write_suite_report(res: dict, out_dir: Path) -> None:
                                              for k, v in res["diversity"].items()),
               f"conditioning: shuffled − full: {res['conditioning']['shuffled_minus_full']}",
               "cfg sweep: " + json.dumps(res["conditioning"]["cfg_sweep"]),
+              *_sweep_lines(res.get("sampler_sweep")),
               f"memorization: nn_ratio={res['memorization']['nn_ratio']:.3f}  "
               f"loss gap (val − train) = {res['memorization']['loss_gap_val_minus_train'].get('loss', float('nan')):.4g}"]
     (out_dir / "summary.txt").write_text("\n".join(lines) + "\n")
@@ -592,6 +670,16 @@ def write_suite_report(res: dict, out_dir: Path) -> None:
     ax.axhline(fl["real_consistency"]["cross_median"], color="k", ls=":", label="fp16 floor")
     ax.set(yscale="log", title="cross-block consistency (median rel. err)"); ax.tick_params(axis="x", rotation=45)
     ax.legend(fontsize=7); fig.tight_layout(); fig.savefig(out_dir / "consistency.png", dpi=120); plt.close(fig)
+
+
+def _sweep_lines(sw: dict | None) -> list[str]:
+    if not sw:
+        return []
+    f = lambda m: f"true_top1={m['true_top1']:.4f} ppl={m['ppl']:.1f} top1={m['top1']:.4f}"  # noqa: E731
+    out = ["sampler steps @mfull: " + "  ".join(f"{k}: {f(v)}" for k, v in sw["steps"].items())]
+    for w, ks in sw["k_samples"].items():
+        out.append(f"K-sample readout @mfull w={w}: " + "  ".join(f"K={k}: {f(v)}" for k, v in ks.items()))
+    return out
 
 
 def compare_runs(paths: list[Path]) -> str:
@@ -633,6 +721,8 @@ def main() -> int:
     su.add_argument("--weights", choices=["ema", "raw"], default="ema")
     su.add_argument("--batch", type=int, default=250)
     su.add_argument("--seed", type=int, default=0)
+    su.add_argument("--split", choices=["val", "train"], default="val",
+                    help="train = the first export train rows (train-vs-val check)")
     su.add_argument("--out", default=None, help="default: <run_dir>/eval_step<step>[_<tag>]")
     su.add_argument("--latents-dir", default=None, help="eval on another export (e.g. the WikiText OOD one)")
     su.add_argument("--cache-dir", default=None, help="the cache that export was made from")
@@ -650,7 +740,7 @@ def main() -> int:
     device = pick_device(force_cpu=args.cpu)
     if args.cmd == "suite":
         sc = SuiteConfig(n_positions=args.n_positions, steps=args.steps, cfg_w=args.cfg_w, weights=args.weights,
-                         batch=args.batch, seed=args.seed)
+                         batch=args.batch, seed=args.seed, split=args.split)
         res = evaluate_suite(args.checkpoint, device=device, sc=sc, latents_dir=args.latents_dir,
                              cache_dir=args.cache_dir)
         res["tag"] = args.tag

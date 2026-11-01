@@ -8,9 +8,11 @@ same quantities on a smaller fixed set:
     ``n_positions`` val positions (and an optional OOD cache, e.g. WikiText-103 rev-7 val): teacher
     top-1 / top-5 / KL / acceptance, per-block recon cosine, KL per block, active units, and the number
     of latent dims whose mean KL sits at or below the free-bits floor (the d128-vs-d256 confound check).
+    The same teacher metrics on the cache's train slice (``train/*``) give the train-vs-val gap.
   - :class:`LDMInflight` — :func:`specdec_af.ldm.evaluate_ldm.score_conditions` on a fixed val subset
     with fewer sampler steps: decoded top-1 (and gap to the VAE floor), KL and latent cosine per
-    condition (the m-curve), K-sample diversity, and null-sample KID against val μ.
+    condition (the m-curve), K-sample diversity, and null-sample KID against val μ; plus decoded and
+    true-text top-1 at mfull on the export's first train rows (``train/*``).
 
 Each call returns a flat ``{name: float}`` dict; the trainers prefix ``inflight/`` and append it
 (with ``step``) to ``<run_dir>/inflight.jsonl`` for the dossier.
@@ -46,10 +48,14 @@ class VAEInflight:
 
     def __init__(self, cache_dir: Path | str, *, lm_head, mode: str, device, free_bits: float,
                  n_positions: int = 2000, val_shards: int | None = None,
-                 ood_cache_dir: Path | str | None = None, ood_positions: int = 1000) -> None:
+                 ood_cache_dir: Path | str | None = None, ood_positions: int = 1000,
+                 train_positions: int = 1000) -> None:
         from specdec_af.data.dataset import PositionSet, read_split
         self.lm_head, self.mode, self.device, self.free_bits = lm_head, mode, device, float(free_bits)
-        self.sets = {"val": PositionSet(read_split(cache_dir, val_shards)[1], max_positions=n_positions)}
+        train_shards, val = read_split(cache_dir, val_shards)
+        self.sets = {"val": PositionSet(val, max_positions=n_positions)}
+        if train_positions > 0 and train_shards:
+            self.sets["train"] = PositionSet(train_shards, max_positions=train_positions)
         if ood_cache_dir:
             self.sets["ood"] = PositionSet(read_split(ood_cache_dir)[1], max_positions=ood_positions)
 
@@ -91,10 +97,12 @@ class LDMInflight:
     """m-curve, diversity and null-sample KID of the live DiT on a fixed val subset."""
 
     def __init__(self, table, sampler, *, vae, chunk_norm, mode: str, lm_head, device, n_positions: int = 512,
-                 steps: int = 25, diversity_positions: int = 128, diversity_k: int = 4, seed: int = 0) -> None:
+                 steps: int = 25, diversity_positions: int = 128, diversity_k: int = 4, seed: int = 0,
+                 train_positions: int = 256) -> None:
         from specdec_af.ldm.evaluate_ldm import SuiteConfig, _Decoded, eval_conditions
         self.table, self.sampler, self.device = table, sampler, device
         self.rows = table.eval_rows(n_positions)
+        self.train_rows = table.train_rows()[:train_positions] if train_positions > 0 else np.array([], dtype=np.int64)
         self.dec = _Decoded(vae, chunk_norm, mode, lm_head, None)
         n = len(self.rows)
         self.sc = SuiteConfig(n_positions=n, batch=min(256, n), steps=steps, seed=seed,
@@ -126,6 +134,14 @@ class LDMInflight:
                 t = true_text_summary(a)
                 out[f"true_top1/{name}"], out[f"ppl/{name}"] = t["true_top1"], t["ppl"]
             out["shuffled_minus_full/top1"] = out["top1/shuffled"] - out["top1/mfull"]
+            if len(self.train_rows):
+                mfull = [c for c in self.conds if c[0] == "mfull"]
+                tr, tr_floor, _, _ = score_conditions(ldm, dit, self.table, self.sampler, self.dec, self.train_rows,
+                                                      mfull, self.sc, self.device, verbose=False)
+                t = true_text_summary(tr["mfull"])
+                out["train/top1/mfull"] = float(tr["mfull"].cat("top1").mean())
+                out["train/true_top1/mfull"], out["train/ppl/mfull"] = t["true_top1"], t["ppl"]
+                out["train/floor/top1"] = float(tr_floor.cat("top1").mean())
             d = _dist(accs["null"].cat("z"), ref.cat("mu"), self.sc, self.device)
             out["null/kid_joint"] = float(d["kid_joint"]["mean"]) if "kid_joint" in d else float("nan")
             out["null/kid_block_mean"] = float(np.mean(d["kid_block"]))

@@ -117,7 +117,8 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
                          dit=dict(depth=2, d_model=32, n_heads=4))
     train_ldm(cfg, trained_run["cache_dir"], tmp_path / "run", device=torch.device("cpu"))
     sc = SuiteConfig(n_positions=16, batch=8, steps=3, diversity_positions=6, diversity_k=3, cfg_positions=6,
-                     cfg_ws=(1.0, 2.0), mem_train_rows=20, loss_gap_positions=8, kid_subset=8, kid_subsets=3)
+                     cfg_ws=(1.0, 2.0), mem_train_rows=20, loss_gap_positions=8, kid_subset=8, kid_subsets=3,
+                     sweep_steps=(2, 3), sweep_ks=(1, 2), sweep_k_ws=(1.0, 2.0))
     res = evaluate_suite(tmp_path / "run" / "checkpoints" / "final.pt", device=torch.device("cpu"), sc=sc, gpt2=gpt2)
     assert res["n_positions"] == 16 and set(res["conditions"]) == {n for n, _ in eval_conditions(res["W"])}
     c = res["conditions"]["mfull"]
@@ -133,6 +134,14 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     assert set(res["dist_floors"]) == {"z_data", "z_prior", "resid_vae"}
     assert "shuffled" not in res["diversity"] and set(res["diversity"]["null"]) == {"latent_dist", "top1_agreement"}
     assert set(res["conditioning"]["cfg_sweep"]) == {"m2", f"m{res['W'] - 1}"}
+    assert {"true_top1", "ppl", "acceptance"} <= set(res["conditioning"]["cfg_sweep"]["m2"]["2.0"])
+    sw = res["sampler_sweep"]
+    assert set(sw["steps"]) == {"2", "3"} and set(sw["k_samples"]) == {"1.0", "2.0"}
+    assert set(sw["k_samples"]["2.0"]) == {"1", "2"} and np.isfinite(sw["k_samples"]["1.0"]["2"]["ppl"])
+    for m in (c, res["floor"]):  # CIs and Δppl vs GPT-2 on the same positions
+        lo, hi = m["ci"]["true_top1"]
+        assert lo <= m["true_top1"] + 1e-9 <= hi + 2e-9 and "acceptance" in m["ci"]
+        assert m["dppl"] == pytest.approx(m["ppl"] - res["teacher"]["ppl"])
     mem = res["memorization"]
     assert mem["n_train_ref"] == 12  # the rows this run trained on, not the whole train split
     assert mem["nn_ratio"] > 0 and {"train", "val"} == set(mem["loss"]) and "loss" in mem["loss_gap_val_minus_train"]
@@ -143,3 +152,15 @@ def test_suite_end_to_end(ldm_latents, trained_run, gpt2, tmp_path):
     assert json.loads((tmp_path / "eval" / "metrics.json").read_text())["format"] == "ldm_eval_v1"
     table = compare_runs([tmp_path / "eval", tmp_path / "eval"])
     assert "mfull" in table and "nn_ratio" in table
+
+
+def test_suite_train_split_and_block_val_loss(tiny_ldm, gpt2):
+    sc = SuiteConfig(n_positions=8, batch=8, steps=2, diversity_positions=4, diversity_k=2, cfg_positions=4,
+                     cfg_ws=(1.0,), mem_train_rows=8, loss_gap_positions=4, kid_subset=4, kid_subsets=2,
+                     sweep_steps=(2,), sweep_ks=(1,), sweep_k_ws=(1.0,), split="train")
+    res = evaluate_suite(tiny_ldm["checkpoint"], device=torch.device("cpu"), sc=sc, gpt2=gpt2)
+    assert res["split"] == "train" and res["n_positions"] == 8
+    table = LatentTable(tiny_ldm["latents_dir"], res["cache_dir"])
+    assert not table.is_val[table.train_rows()[:8]].any()
+    vh = json.loads((tiny_ldm["run_dir"] / "val_history.json").read_text())
+    assert all(f"ema_loss_block/b{j:02d}" in vh[-1] for j in range(12))  # per-block flow loss

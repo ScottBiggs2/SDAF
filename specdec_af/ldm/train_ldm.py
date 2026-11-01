@@ -60,7 +60,7 @@ from specdec_af.ldm.data import (
     resolve_window,
 )
 from specdec_af.ldm.dit import DiTConfig, LatentDiT, LatentLDM, count_params
-from specdec_af.ldm.flow import interpolate, logit_normal_t, rf_loss
+from specdec_af.ldm.flow import interpolate, logit_normal_t, rf_loss, velocity_target
 from specdec_af.ldm.prefix_block import MDLM_REPO, MDLM_REVISION, MDLMBlock0Encoder
 from specdec_af.training.train import (
     CSVLogger,
@@ -179,7 +179,7 @@ def _bucket_m(m: torch.Tensor, regime: torch.Tensor, W: int) -> list[str]:
 
 
 class Validator:
-    """Fixed val batches (conditions, t, ε drawn once) → loss by t-bucket and regime / m-bucket."""
+    """Fixed val batches (conditions, t, ε drawn once) → loss by t-bucket, regime / m-bucket and block."""
 
     def __init__(self, table: LatentTable, rows: np.ndarray, sampler: ConditionSampler, cfg: LDMTrainConfig,
                  device) -> None:
@@ -199,14 +199,16 @@ class Validator:
 
     @torch.no_grad()
     def __call__(self, ldm: LatentLDM, dit: LatentDiT) -> dict:
-        losses, ts, buckets = [], [], []
+        losses, ts, buckets, per_block = [], [], [], []
         for b in self.batches:
             v = ldm(interpolate(b["z0"], b["eps"], b["t"]), b["t"], b, dit=dit)
             losses.append(rf_loss(v, b["z0"], b["eps"]).cpu())
+            per_block.append((v - velocity_target(b["z0"], b["eps"])).pow(2).mean(-1).cpu())  # [B, 12]
             ts.append(b["t"][:, 0].cpu())
             buckets += b["bucket"]
         loss, t = torch.cat(losses), torch.cat(ts)
         out = {"loss": float(loss.mean())}
+        out.update({f"loss_block/b{j:02d}": float(x) for j, x in enumerate(torch.cat(per_block).mean(0))})
         for lo, hi in T_BUCKETS:
             sel = (t >= lo) & (t < hi)
             out[f"loss_t{lo:.1f}-{min(hi, 1.0):.1f}"] = float(loss[sel].mean()) if sel.any() else float("nan")
@@ -363,7 +365,7 @@ def train_ldm(cfg: LDMTrainConfig, cache_dir: Path, output_dir: Path, *, device:
         (output_dir / "val_history.json").write_text(json.dumps(val_history, indent=2))
         wb.log({f"val/{k}": x for k, x in v.items() if k != "step"}, step=step - 1)
         print(f"    [val @ step {step}] ema={v['ema_loss']:.4f}  raw={v['raw_loss']:.4f}  "
-              + "  ".join(f"{k[4:]}={x:.3f}" for k, x in v.items() if k.startswith("ema_loss_")), flush=True)
+              + "  ".join(f"{k[4:]}={x:.3f}" for k, x in v.items() if k.startswith("ema_loss_") and "block" not in k), flush=True)
         return v
 
     fields = ["step", "epoch", "lr", "loss", "loss_null", "loss_suffix", "loss_holes", "loss_spans", "grad_norm", "per_token_t"]

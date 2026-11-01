@@ -62,6 +62,7 @@ def test_vae_inflight(v2_cache, tmp_path, fake_wandb, monkeypatch):
     assert [r["step"] for r in rows] == [3, 6]
     r = rows[-1]
     assert 0.0 <= r["val/top1_agreement"] <= 1.0 and "ood/top1_agreement" in r
+    assert 0.0 <= r["train/top1_agreement"] <= 1.0  # train slice: the train-vs-val gap
     assert 0 <= r["latent/dims_at_free_bits_floor"] <= 12 * 128 and r["latent/kl_total"] > 0
     (run,) = fake_wandb
     assert run.kw["group"] == "scale1" and run.kw["job_type"] == "vae" and run.kw["tags"] == ["d128", "test"]
@@ -83,6 +84,7 @@ def test_ldm_inflight(ldm_latents, trained_run, tmp_path, fake_wandb):
     assert xs[0] == "null" and xs[-1] == "mfull" and all(0.0 <= y <= 1.0 for y in ys)
     assert np.isfinite(r["shuffled_minus_full/top1"]) and "diversity/m0" in r and "null/kid_block_mean" in r
     assert 0.0 <= r["true_top1/mfull"] <= 1.0 and np.isfinite(r["ppl/mfull"]) and np.isfinite(r["teacher/ppl"])
+    assert 0.0 <= r["train/true_top1/mfull"] <= 1.0 and np.isfinite(r["train/ppl/mfull"])
     (run,) = fake_wandb
     lines = [d["inflight/mcurve"] for _, d in run.logged if "inflight/mcurve" in d]
     assert lines and lines[0][0] == "line"
