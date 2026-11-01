@@ -47,3 +47,9 @@ H200 gres `gpu:h200:1` (4 nodes × 8); `short` limit 2 days.
 | 10-31 | 11514802 / 11514806 | S1-ldm128-mu / S1-ldm256-mu: DiT-S 100k steps, μ, fp32, V100, 8 h / 465 min, in-flight /10k with true-text acc + ppl (2f064dc) | submitted |
 | 10-31 | 11514803 / 11514807 | continuations (afterany, RESUME=auto) | submitted |
 | 10-31 | 11514804 / 11514808 | WikiText latent exports S1-vae{128,256}_wt (cache_v2, CONFIG=default) → LDM OOD suite | submitted |
+| 10-31 | 11514802+03 / 11514806+07 | DiT-S 100k (two chained jobs each) | COMPLETED (7:46 + 6:28 / 7:46 + 6:56) |
+| 10-31 | 11534079 / 11534088 | LDM suite S1 val, 5k pos, EMA, 50 steps, w=1 | COMPLETED — true top-1 @mfull d128 0.1531 / d256 0.1432 (Δ 0.99 pp, inside tie band); ppl 299 / 381; floor 0.264 / 0.270 (ppl 73 / 67); GPT-2 0.397 (ppl 26.3). Teacher top-1 @mfull 0.273 / 0.248. CFG w=2 @full: teacher top-1 +2.8 / +1.4 pp (1k pos) |
+| 10-31 | 11534087 / 11534089 | LDM suite WikiText OOD (TAG=ood) | COMPLETED — true top-1 @mfull d128 0.0993 / d256 0.0947; ppl 955 / 1159; GPT-2 0.354 (ppl 36.3) |
+| 10-30 | 11505158 | A100 bench + bf16 parity | COMPLETED — bf16 GPT-2 teacher top-1 agreement 0.9937 (keep fp32 GPT-2); A100 bf16 DiT-S bs256 0.086 s/step, DiT-B 0.130 s/step (vs V100 fp32 DiT-S 0.43); producer fp32 7.6k pos/s @ micro_bs 64 |
+
+**Width verdict (rule as amended 10-31): d256.** On the primary the arms tie: Δ 0.99 pp is inside the ±1 pp band, and ppl would prefer d128. But d128 fails the null-KID guard: 0.0148 vs 0.0114 = 1.31×, over the 1.2× limit. That leaves d256 as the only eligible arm, which matches Scott's call to build on d256. Next: scale-2 plan (VAE v2 → DiT v2; plan file approved 11-01).
