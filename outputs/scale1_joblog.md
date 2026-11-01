@@ -53,3 +53,19 @@ H200 gres `gpu:h200:1` (4 nodes × 8); `short` limit 2 days.
 | 10-30 | 11505158 | A100 bench + bf16 parity | COMPLETED — bf16 GPT-2 teacher top-1 agreement 0.9937 (keep fp32 GPT-2); A100 bf16 DiT-S bs256 0.086 s/step, DiT-B 0.130 s/step (vs V100 fp32 DiT-S 0.43); producer fp32 7.6k pos/s @ micro_bs 64 |
 
 **Width verdict (rule as amended 10-31): d256.** On the primary the arms tie: Δ 0.99 pp is inside the ±1 pp band, and ppl would prefer d128. But d128 fails the null-KID guard: 0.0148 vs 0.0114 = 1.31×, over the 1.2× limit. That leaves d256 as the only eligible arm, which matches Scott's call to build on d256. Next: scale-2 plan (VAE v2 → DiT v2; plan file approved 11-01).
+
+## Scale-2 Phase A (plan rewritten 11-01 from `halloween_todos.md`; eval upgrades, no training)
+
+Code: 3d2a0f3 (substitution dit mode / train split / per-slot loss / lens ΔCE / CIs), 31ce2d0 (LDM suite train split,
+CIs, Δppl, sampler sweeps; in-flight train slice; per-block val loss), 19208d1 (conditioner probe), 6f69aec (benchmarks).
+Phase B/C code (not launched; needs Scott's go): 0771d65 (VAE loss weights, logit-KL, cosine LR, scale2.yaml), dee7faa (DiT v2).
+
+| date | job | purpose | result |
+|---|---|---|---|
+| 11-01 | 11550348 | substitution S1-ldm128-mu, val, 5k pos (vae_* + dit_* conditions) | pending |
+| 11-01 | 11550349 | substitution S1-ldm128-mu, train split | CANCELLED (low value after the d256 verdict; freed a slot) |
+| 11-01 | 11550350 / 11550352 | substitution S1-ldm256-mu, val / train split | pending |
+| 11-01 | 11550353 | substitution S1-ldm256-mu, WikiText OOD (CACHE_DIR=cache_v2) | pending |
+| 11-01 | 11550855 | conditioner probe (MDLM embed / block0 / block01 / block0_pool → next token; 200k train, 10k val, 20 epochs) | pending |
+| 11-01 | 11550856 | benchmarks S1-ldm256-mu: LAMBADA (5,153) + HellaSwag (1k), readers gpt2 / floor / dit | pending |
+| 11-01 | 11550857 / 11550858 | LDM suite S1-ldm256-mu re-run: TAG=v2 (val; CIs + sampler sweeps) / TAG=train (SPLIT=train) | pending |
