@@ -22,7 +22,7 @@ ldm:                        # DiT v2 on the VAE v2 latents (latents_dir / vae_ch
     drop_dead: true         # dims at the free-bits floor → pinned 0 / decoded to their mean
     fit_rows: 100000
   loss_weights:
-    block: {11: 4.0}        # the readout block; block 0 stays ×1 unless the dit_0 substitution says otherwise
+    block: {0: 4.0, 11: 4.0}  # dit_0 is the costliest DiT splice on S1-ldm256 (ΔCE 0.29, 2× vae_0's 0.14; dit_11 0.25)
     terminal_logit_kl: 0.1  # decode-through-head KL vs the VAE floor's readout, weighted (1 − t)^head_t_power
     head_t_power: 2.0
   encoder:
