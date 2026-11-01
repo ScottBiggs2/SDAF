@@ -94,3 +94,94 @@ def test_kl_divergence_free_bits_gradient_flows_above_floor():
     # All dims above floor → gradient should be (1/d_latent) * d/dmu[(1/2)(mu^2 - log...)] = mu/d_latent
     # = 2.0 / 64 per element averaged over batch ≈ 2.0/64 / 4 batch ... let's just verify nonzero
     assert mu.grad.abs().mean() > 0, "gradient should flow when above floor"
+
+
+# ----------------------------------------------------------------------
+# Scale-2 loss weights, terminal logit-KL, LR schedule
+# ----------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from specdec_af.models.chunk_index import D_CHUNK, SLOT_OFFSETS, TERMINAL_BLOCK  # noqa: E402
+from specdec_af.models.chunk_norm import ChunkNorm, build_mask  # noqa: E402
+from specdec_af.training.losses import chunk_recon_loss, resolve_loss_weights, terminal_logit_kl  # noqa: E402
+from specdec_af.training.schedule import lr_factor  # noqa: E402
+
+
+def _batch(seed: int = 0, B: int = 24):
+    g = torch.Generator().manual_seed(seed)
+    cn = ChunkNorm()
+    cn.std.copy_(0.5 + torch.rand(cn.std.shape, generator=g))
+    raw = torch.randn(B, D_CHUNK, generator=g)
+    rec = raw + 0.3 * torch.randn(B, D_CHUNK, generator=g)
+    bid = torch.arange(B) % 12
+    return cn, raw, rec, bid
+
+
+def test_loss_weights_default_is_unweighted():
+    assert resolve_loss_weights(None)[0] is None
+    assert resolve_loss_weights({"block": {0: 1.0}, "slot": {}, "terminal_logit_kl": 0.1})[0] is None
+    cn, raw, rec, bid = _batch()
+    ones = build_mask().float()
+    for mode in ("option_d", "option_4"):
+        a = chunk_recon_loss(rec, raw, bid, cn, mode=mode)
+        assert torch.equal(a, chunk_recon_loss(rec, raw, bid, cn, mode=mode, weights=ones))
+
+
+def test_loss_weights_grid_normalized_and_relative():
+    grid, summ = resolve_loss_weights({"block": {0: 4, 11: 4}, "slot": {"c_fc_out": 0.5}})
+    mask = build_mask()
+    assert grid.shape == mask.shape and grid[~mask].abs().max() == 0
+    assert float(grid[mask].mean()) == pytest.approx(1.0, rel=1e-6)
+    s, e = SLOT_OFFSETS["ln_1_out"]
+    sf, ef = SLOT_OFFSETS["c_fc_out"]
+    assert float(grid[0, s] / grid[5, s]) == pytest.approx(4.0)
+    assert float(grid[5, sf] / grid[5, s]) == pytest.approx(0.5)
+    assert summ["block"][11] == 4.0 and summ["norm_factor"] > 1.0
+    raw_grid, _ = resolve_loss_weights({"block": [2.0] * 12, "normalize": False})
+    assert float(raw_grid[mask].mean()) == pytest.approx(2.0)
+    with pytest.raises(ValueError):
+        resolve_loss_weights({"block": {12: 2.0}})
+    with pytest.raises(ValueError):
+        resolve_loss_weights({"slot": {"nope": 2.0}})
+    with pytest.raises(ValueError):
+        resolve_loss_weights({"bogus": 1})
+
+
+def test_weighted_loss_upweights_block():
+    cn, raw, rec, bid = _batch()
+    grid, _ = resolve_loss_weights({"block": {11: 4}, "normalize": False})
+    a = chunk_recon_loss(rec, raw, bid, cn, mode="option_d")
+    b = chunk_recon_loss(rec, raw, bid, cn, mode="option_d", weights=grid)
+    t = bid == TERMINAL_BLOCK
+    lw = cn.loss_weight_per_item(bid)
+    per = ((rec - raw).pow(2) * lw).sum(1)
+    denom = (lw > 0).float().sum()
+    assert float(b - a) == pytest.approx(float(3 * per[t].sum() / denom), rel=1e-5)
+
+
+def test_terminal_logit_kl():
+    cn, raw, rec, bid = _batch(B=24)
+    head = torch.nn.Linear(768, 50, bias=False)
+    head.weight.requires_grad_(False)
+    assert float(terminal_logit_kl(raw, raw, bid, cn, head, mode="option_d")) == pytest.approx(0.0, abs=1e-6)
+    rec = rec.clone().requires_grad_(True)
+    kl = terminal_logit_kl(rec, raw, bid, cn, head, mode="option_d")
+    assert float(kl) > 0
+    kl.backward()
+    s, e = SLOT_OFFSETS["boundary_out"]
+    t = bid == TERMINAL_BLOCK
+    assert rec.grad[t, s:e].abs().sum() > 0 and rec.grad[~t].abs().sum() == 0
+    none = terminal_logit_kl(rec[:5], raw[:5], torch.zeros(5, dtype=torch.long), cn, head, mode="option_d")
+    assert float(none) == 0.0
+
+
+def test_lr_factor():
+    assert lr_factor(0, warmup=10, total=100) == pytest.approx(0.1)
+    assert lr_factor(50, warmup=10, total=100) == 1.0
+    assert lr_factor(9, warmup=10, total=100, schedule="cosine") == pytest.approx(1.0)
+    assert lr_factor(100, warmup=10, total=100, schedule="cosine", min_ratio=0.1) == pytest.approx(0.1)
+    mid = lr_factor(55, warmup=10, total=100, schedule="cosine", min_ratio=0.0)
+    assert mid == pytest.approx(0.5, abs=1e-9)
+    with pytest.raises(ValueError):
+        lr_factor(0, warmup=0, total=1, schedule="linear")

@@ -42,6 +42,9 @@
 #   PRECISION         — scale-1: fp32 | bf16 train forward (default: config)
 #   INFLIGHT_EVERY_STEPS — scale-1: in-flight eval cadence → inflight/* in W&B + inflight.jsonl (default: config, 0 = off)
 #   WANDB_RUN_GROUP / WANDB_TAGS (comma-sep) / WANDB_JOB_TYPE — scale-1: W&B run organisation (read by WandbLogger)
+#   BLOCK_WEIGHT / SLOT_WEIGHT — scale-2: recon multipliers, e.g. BLOCK_WEIGHT=0=4,11=4 (default: config vae.loss_weights)
+#   TERMINAL_LOGIT_KL — scale-2: λ on the terminal-readout KL (default: config)
+#   LR_SCHEDULE       — scale-2: constant | cosine (default: config training.lr_schedule)
 #   GPU type: override the #SBATCH line, e.g. sbatch --gres=gpu:h200:1 (or a100) ...
 #
 # Example (scale-1 d256 arm; see scripts/slurm/README.md):
@@ -130,6 +133,10 @@ if [[ -n "${BATCH_SIZE:-}" ]]; then EXTRA_ARGS+=(--batch-size "$BATCH_SIZE"); fi
 if [[ -n "${PRECISION:-}" ]]; then EXTRA_ARGS+=(--precision "$PRECISION"); fi
 if [[ -n "${INFLIGHT_EVERY_STEPS:-}" ]]; then EXTRA_ARGS+=(--inflight-every-steps "$INFLIGHT_EVERY_STEPS"); fi
 if [[ -n "${OOD_CACHE_DIR:-}" ]]; then EXTRA_ARGS+=(--ood-cache-dir "$OOD_CACHE_DIR"); fi
+if [[ -n "${BLOCK_WEIGHT:-}" ]]; then EXTRA_ARGS+=(--block-weight "$BLOCK_WEIGHT"); fi
+if [[ -n "${SLOT_WEIGHT:-}" ]]; then EXTRA_ARGS+=(--slot-weight "$SLOT_WEIGHT"); fi
+if [[ -n "${TERMINAL_LOGIT_KL:-}" ]]; then EXTRA_ARGS+=(--terminal-logit-kl "$TERMINAL_LOGIT_KL"); fi
+if [[ -n "${LR_SCHEDULE:-}" ]]; then EXTRA_ARGS+=(--lr-schedule "$LR_SCHEDULE"); fi
 EXTRA_ARGS+=(--wandb-project "$WANDB_PROJECT")
 if [[ -n "${WANDB_ENTITY:-}" ]]; then EXTRA_ARGS+=(--wandb-entity "$WANDB_ENTITY"); fi
 

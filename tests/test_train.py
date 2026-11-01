@@ -358,3 +358,27 @@ def test_wandb_backfill_replays_csv(cache_dir_with_stats, tmp_path, monkeypatch)
     assert run.summary["complete"] is True and "final_val/recon" in run.summary
     with pytest.raises(FileExistsError):
         backfill_run(run_dir, "p")
+
+
+def test_train_loss_weights_logit_kl_cosine(cache_dir_with_stats, tmp_path):
+    """Scale-2: block weights + terminal logit-KL + cosine LR run; weights are stored and guard resume."""
+    import json
+    lw = {"block": {0: 4.0, 11: 4.0}, "terminal_logit_kl": 0.1}
+    cfg = TrainConfig(mode="option_d", batch_size=24, lr=1e-3, n_epochs=5, beta_max=0.01, beta_anneal_epochs=1,
+                      free_bits=0.1, log_every=1, val_every_steps=4, checkpoint_every_steps=4, val_max_batches=2,
+                      n_steps_override=8, seed=0, num_workers=0, pin_memory=False, grad_clip_norm=1.0,
+                      lr_warmup_steps=2, loss_weights=lw, lr_schedule="cosine", lr_min_ratio=0.1)
+    summary = train(cache_dir_with_stats, tmp_path / "run", cfg, device=torch.device("cpu"))
+    with open(summary["training_log_csv"]) as fh:
+        lrs = [float(r["lr"]) for r in csv.DictReader(fh)]
+    assert lrs[-1] == pytest.approx(1e-4, rel=1e-6) and max(lrs) <= 1e-3 + 1e-12
+    fv = summary["final_val"]
+    assert {"val_recon", "val_recon_weighted", "val_logit_kl"} <= set(fv) and fv["val_logit_kl"] >= 0
+    assert summary["loss_weights_resolved"]["block"][11] == 4.0
+    ck = load_vae_checkpoint(Path(summary["checkpoint_dir"]) / "final.pt")
+    assert ck["training_config"]["loss_weights"] == lw
+    json.dumps(summary)  # serializable
+    cfg2 = TrainConfig(**{**cfg.__dict__, "loss_weights": None, "n_steps_override": 10})
+    with pytest.raises(ValueError, match="loss_weights"):
+        train(cache_dir_with_stats, tmp_path / "run", cfg2, device=torch.device("cpu"),
+              resume_from=Path(summary["checkpoint_dir"]) / "step_000004.pt")

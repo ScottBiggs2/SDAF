@@ -1,0 +1,17 @@
+# Scale-2: VAE v2 → DiT v2 on the scale-1 corpus (plan rewritten 11-01 from halloween_todos.md).
+# Only overrides live here; everything else comes from scale1.yaml → default.yaml (deep-merged).
+# Control = S1-vae256 (same data, schedule and width; β 0.01, unweighted loss, constant LR).
+base: scale1.yaml
+
+vae:
+  d_latent: 256
+  loss_weights:             # specdec_af/training/losses.py resolve_loss_weights (all loss-only)
+    block: {0: 4.0, 11: 4.0}  # input + output blocks: the costly single-block substitutions at rev7B
+    slot: {}                  # e.g. {c_attn_out: 0.5, c_fc_out: 0.5}
+    normalize: true           # weight grid rescaled to mean 1 over active elements → β keeps its meaning
+    terminal_logit_kl: 0.1    # λ · KL(teacher ‖ lm_head(recon terminal slot)); check its share at ~5k steps
+
+training:
+  beta_max: 0.003           # S1-vae256 (β 0.01) left ~900/3,072 dims at the 0.1-nat floor
+  lr_schedule: cosine       # decay to lr_min_ratio · lr at the last step
+  lr_min_ratio: 0.1

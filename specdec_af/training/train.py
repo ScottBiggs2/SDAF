@@ -65,19 +65,23 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 from specdec_af.data.dataset import make_trace_split
-from specdec_af.models.chunk_index import N_LAYERS_DEFAULT
+from specdec_af.models.chunk_index import N_LAYERS_DEFAULT, TERMINAL_BLOCK
 from specdec_af.models.chunk_norm import ChunkNorm
 from specdec_af.models.vae import TraceVAE
 from specdec_af.training.checkpoint import load_vae_checkpoint, save_vae_checkpoint
+from specdec_af.training.schedule import LR_SCHEDULES, make_scheduler
 from specdec_af.utils.config import expand_env, load_config, pick_device  # noqa: F401 (re-exported)
 from specdec_af.utils.precision import PRECISIONS, autocast
 from specdec_af.training.losses import (
     Mode,
     chunk_recon_loss,
     kl_divergence,
+    resolve_loss_weights,
+    terminal_logit_kl,
     per_block_diagnostics,
     unnormalized_terminal_mse,
 )
@@ -321,12 +325,17 @@ def run_validation(
     mode: Mode,
     device: torch.device,
     max_batches: int | None = None,
+    weights: Tensor | None = None,
+    lm_head=None,
 ) -> dict:
-    """Mean recon + KL + unnormalized terminal MSE across val_loader (z = mu)."""
+    """Mean recon + KL + unnormalized terminal MSE across val_loader (z = mu). ``val_recon`` is always
+    the unweighted loss (comparable across loss-weight configs); with ``weights`` also
+    ``val_recon_weighted``, with ``lm_head`` also ``val_logit_kl`` (terminal readout KL)."""
     was_training = vae.training
     vae.eval()
 
-    sums = {"recon": 0.0, "kl": 0.0, "terminal_mse": 0.0, "n_batches": 0}
+    sums = {"recon": 0.0, "kl": 0.0, "terminal_mse": 0.0, "n_batches": 0, "recon_weighted": 0.0,
+            "logit_kl": 0.0, "n_logit": 0}
     for b_idx, batch in enumerate(val_loader):
         if max_batches is not None and b_idx >= max_batches:
             break
@@ -337,6 +346,12 @@ def run_validation(
         mu, logvar = vae.encode(chunk_norm_input)
         recon = vae.decode(mu, block_ids)  # deterministic for eval
         sums["recon"] += chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
+        if weights is not None:
+            sums["recon_weighted"] += chunk_recon_loss(recon, chunk_raw, block_ids, chunk_norm, mode=mode,
+                                                       weights=weights).item()
+        if lm_head is not None and (block_ids == TERMINAL_BLOCK).any():
+            sums["logit_kl"] += terminal_logit_kl(recon, chunk_raw, block_ids, chunk_norm, lm_head, mode=mode).item()
+            sums["n_logit"] += 1
         sums["kl"] += kl_divergence(mu, logvar).item()
         tmse = unnormalized_terminal_mse(recon, chunk_raw, block_ids, chunk_norm, mode=mode).item()
         if tmse == tmse:  # not NaN
@@ -347,12 +362,17 @@ def run_validation(
         vae.train()
 
     n = max(1, sums["n_batches"])
-    return {
+    out = {
         "val_recon": sums["recon"] / n,
         "val_kl": sums["kl"] / n,
         "val_terminal_mse_unnorm": sums["terminal_mse"] / n,
         "val_n_batches": sums["n_batches"],
     }
+    if weights is not None:
+        out["val_recon_weighted"] = sums["recon_weighted"] / n
+    if lm_head is not None:
+        out["val_logit_kl"] = sums["logit_kl"] / max(1, sums["n_logit"])
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -391,6 +411,35 @@ class TrainConfig:
     inflight_every_steps: int = 0          # scale-1: VAEInflight cadence (0 = off) → inflight/* + inflight.jsonl
     inflight_positions: int = 2000         # fixed val positions for the in-flight teacher metrics
     ood_cache_dir: str | None = None       # optional OOD cache (e.g. rev-7 WikiText cache_v2) for inflight/ood/*
+    loss_weights: dict | None = None       # scale-2: vae.loss_weights {block, slot, normalize, terminal_logit_kl}
+    lr_schedule: str = "constant"          # scale-2: "constant" | "cosine" (decay to lr_min_ratio·lr at the last step)
+    lr_min_ratio: float = 0.1
+
+
+def _parse_kv(text: str) -> dict[str, float]:
+    """``'0=4,11=4'`` → ``{'0': 4.0, '11': 4.0}``."""
+    out = {}
+    for part in filter(None, (x.strip() for x in text.split(","))):
+        k, _, v = part.partition("=")
+        if not v:
+            raise ValueError(f"expected key=value, got {part!r}")
+        out[k.strip()] = float(v)
+    return out
+
+
+def loss_weights_from(base: dict | None, *, block: str | None = None, slot: str | None = None,
+                      terminal_logit_kl: float | None = None, normalize: bool | None = None) -> dict | None:
+    """``vae.loss_weights`` from the config with CLI overrides (each replaces its key). ``None`` if empty."""
+    lw = dict(base or {})
+    if block is not None:
+        lw["block"] = _parse_kv(block)
+    if slot is not None:
+        lw["slot"] = _parse_kv(slot)
+    if terminal_logit_kl is not None:
+        lw["terminal_logit_kl"] = terminal_logit_kl
+    if normalize is not None:
+        lw["normalize"] = normalize
+    return lw or None
 
 
 def build_vae(mode: Mode, chunk_norm: ChunkNorm, *, device: torch.device, d_latent: int = 128) -> TraceVAE:
@@ -486,14 +535,14 @@ def train(
     print(f"trainable params: {n_params:,}  (decoder {n_dec:,})", flush=True)
 
     opt = torch.optim.Adam(trainable, lr=cfg.lr)
-    # Optional linear warmup: step 0 gets 1/warmup_steps; step >= warmup_steps gets 1.0.
-    if cfg.lr_warmup_steps > 0:
-        warmup_steps = cfg.lr_warmup_steps
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            opt, lr_lambda=lambda s: min(1.0, (s + 1) / warmup_steps),
-        )
-    else:
-        scheduler = None
+
+    # Loss weights (scale-2): None = the unweighted rev-7 loss.
+    loss_w, loss_w_summary = resolve_loss_weights(cfg.loss_weights, N_LAYERS_DEFAULT)
+    if loss_w is not None:
+        loss_w = loss_w.to(device)
+    lam = loss_w_summary["terminal_logit_kl"]
+    print(f"loss weights: block={loss_w_summary['block']}  slot={loss_w_summary['slot']}  "
+          f"norm_factor={loss_w_summary['norm_factor']:.4g}  terminal_logit_kl={lam}", flush=True)
 
     # Step budget + β ramp length (rev-7: in optimizer steps).
     total_steps_uncapped = steps_per_epoch * cfg.n_epochs
@@ -504,6 +553,9 @@ def train(
                     else steps_per_epoch * cfg.beta_anneal_epochs)
     print(f"total steps: {total_steps}  ({cfg.n_epochs} epochs × {steps_per_epoch} steps; "
           f"override={cfg.n_steps_override})  beta_anneal_steps={anneal_steps}", flush=True)
+    # Linear warmup, then constant or cosine decay (scale-2) over the step budget.
+    scheduler = make_scheduler(opt, warmup=cfg.lr_warmup_steps, total=total_steps, schedule=cfg.lr_schedule,
+                               min_ratio=cfg.lr_min_ratio)
 
     # State (fresh or resumed). ``step`` counts completed optimizer steps.
     step = 0
@@ -521,6 +573,9 @@ def train(
         ck_src = loaded["training_config"].get("data_source", "cache")
         if ck_src != cfg.data_source:
             raise ValueError(f"resume data_source mismatch: ckpt={ck_src} cfg={cfg.data_source}")
+        ck_lw = loaded["training_config"].get("loss_weights")
+        if ck_lw != cfg.loss_weights:
+            raise ValueError(f"resume loss_weights mismatch: ckpt={ck_lw} cfg={cfg.loss_weights}")
         vae.load_state_dict(loaded["vae"].state_dict())
         opt.load_state_dict(ts["optimizer"])
         if scheduler is not None and ts.get("scheduler") is not None:
@@ -561,16 +616,21 @@ def train(
                      config={**cfg.__dict__, "steps_per_epoch": steps_per_epoch,
                              "total_steps": total_steps, "beta_anneal_steps_eff": anneal_steps,
                              "n_params": n_params, "train_items": train_ds.n_items,
-                             "val_positions": val_ds.n_positions, "cache_dir": str(cache_dir)})
+                             "val_positions": val_ds.n_positions, "cache_dir": str(cache_dir),
+                             "loss_weights_resolved": loss_w_summary})
 
-    inflight = None
-    if cfg.inflight_every_steps > 0:
-        from specdec_af.inflight import VAEInflight
+    lm_head = None
+    if cfg.inflight_every_steps > 0 or lam > 0:
         if streaming:
             lm_head = producer.model.lm_head
         else:
             from specdec_af.training.overfit_sweep import load_lm_head_only
             lm_head = load_lm_head_only(device=device)
+        for p in lm_head.parameters():
+            p.requires_grad_(False)
+    inflight = None
+    if cfg.inflight_every_steps > 0:
+        from specdec_af.inflight import VAEInflight
         inflight = VAEInflight(cache_dir, lm_head=lm_head, mode=cfg.mode, device=device, free_bits=cfg.free_bits,
                                n_positions=cfg.inflight_positions, val_shards=val_shards,
                                ood_cache_dir=cfg.ood_cache_dir)
@@ -602,10 +662,15 @@ def train(
                 out = vae(chunk_norm_input, block_ids)
             out = {k: v.float() for k, v in out.items()}
 
-            recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode)
+            recon_loss = chunk_recon_loss(out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode,
+                                          weights=loss_w)
             kl = kl_divergence(out["mu"], out["logvar"], free_bits=cfg.free_bits)
             beta = beta_schedule(idx, cfg.beta_max, anneal_steps)
             loss = recon_loss + beta * kl
+            logit_kl = None
+            if lam > 0:
+                logit_kl = terminal_logit_kl(out["recon"], chunk_raw, block_ids, chunk_norm, lm_head, mode=cfg.mode)
+                loss = loss + lam * logit_kl
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -633,6 +698,12 @@ def train(
                 wb_row = {"train/recon": row["recon_loss"], "train/kl": row["kl_loss"],
                           "train/total": row["total_loss"], "train/beta": beta,
                           "train/lr": effective_lr, "train/epoch": epoch}
+                if loss_w is not None:  # the CSV's recon_loss is the weighted training loss
+                    with torch.no_grad():
+                        wb_row["train/recon_unweighted"] = chunk_recon_loss(
+                            out["recon"], chunk_raw, block_ids, chunk_norm, mode=cfg.mode).item()
+                if logit_kl is not None:
+                    wb_row["train/logit_kl"] = logit_kl.item()
                 if grad_norm is not None:
                     wb_row["train/grad_norm_preclip"] = float(grad_norm)
                 for pfx in ("recon", "kl", "mu_norm", "logvar_mean"):
@@ -652,6 +723,7 @@ def train(
                 vmetrics = run_validation(
                     vae, chunk_norm, val_loader,
                     mode=cfg.mode, device=device, max_batches=cfg.val_max_batches,
+                    weights=loss_w, lm_head=lm_head if lam > 0 else None,
                 )
                 vmetrics["step"] = step
                 val_history.append(vmetrics)
@@ -699,11 +771,13 @@ def train(
         final_val = run_validation(
             vae, chunk_norm, val_loader,
             mode=cfg.mode, device=device, max_batches=cfg.val_max_batches,
+            weights=loss_w, lm_head=lm_head if lam > 0 else None,
         )
         final_val["step"] = step
 
     summary = {
         "mode": cfg.mode,
+        "loss_weights_resolved": loss_w_summary,
         "complete": complete,
         "n_steps_completed": step,
         "n_steps_total": total_steps,
@@ -800,6 +874,17 @@ def main() -> int:
     p.add_argument("--inflight-positions", type=int, default=None)
     p.add_argument("--ood-cache-dir", type=str, default=None,
                    help="scale-1: OOD val cache for inflight/ood/* (default: training.ood_cache_dir)")
+    p.add_argument("--block-weight", type=str, default=None,
+                   help="scale-2: per-block recon multipliers, e.g. '0=4,11=4' (overrides vae.loss_weights.block)")
+    p.add_argument("--slot-weight", type=str, default=None,
+                   help="scale-2: per-slot multipliers, e.g. 'c_attn_out=0.5,c_fc_out=0.5'")
+    p.add_argument("--terminal-logit-kl", type=float, default=None,
+                   help="scale-2: λ on the terminal-readout KL (overrides vae.loss_weights.terminal_logit_kl)")
+    p.add_argument("--no-normalize-weights", action="store_true",
+                   help="scale-2: do not rescale the weight grid to mean 1 over active elements")
+    p.add_argument("--lr-schedule", choices=LR_SCHEDULES, default=None,
+                   help="scale-2: constant | cosine (default: training.lr_schedule, else constant)")
+    p.add_argument("--lr-min-ratio", type=float, default=None)
     p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
 
@@ -851,13 +936,19 @@ def main() -> int:
     if tcfg.data_source == "stream":
         from specdec_af.data.stream import stream_cfg_from
         tcfg.stream = stream_cfg_from(raw_cfg)
+    tcfg.loss_weights = loss_weights_from(raw_cfg["vae"].get("loss_weights"), block=args.block_weight,
+                                          slot=args.slot_weight, terminal_logit_kl=args.terminal_logit_kl,
+                                          normalize=False if args.no_normalize_weights else None)
+    tcfg.lr_schedule = args.lr_schedule or tr.get("lr_schedule", "constant")
+    tcfg.lr_min_ratio = args.lr_min_ratio if args.lr_min_ratio is not None else float(tr.get("lr_min_ratio", 0.1))
 
     device = pick_device(force_cpu=args.cpu)
     print(f"device={device.type}  mode={tcfg.mode}  run={args.run_name}", flush=True)
     print(f"beta_max={tcfg.beta_max}  beta_anneal_epochs={tcfg.beta_anneal_epochs}  "
           f"beta_anneal_steps={tcfg.beta_anneal_steps}  free_bits={tcfg.free_bits}", flush=True)
-    print(f"grad_clip_norm={tcfg.grad_clip_norm}  lr={tcfg.lr}  "
-          f"lr_warmup_steps={tcfg.lr_warmup_steps}  n_steps={tcfg.n_steps_override}", flush=True)
+    print(f"grad_clip_norm={tcfg.grad_clip_norm}  lr={tcfg.lr}  lr_schedule={tcfg.lr_schedule}  "
+          f"lr_warmup_steps={tcfg.lr_warmup_steps}  n_steps={tcfg.n_steps_override}  "
+          f"loss_weights={tcfg.loss_weights}", flush=True)
     print(f"cache_dir={cache_dir}  data_source={tcfg.data_source}", flush=True)
     if tcfg.stream:
         print(f"stream={tcfg.stream}", flush=True)
