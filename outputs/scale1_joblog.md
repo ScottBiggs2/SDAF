@@ -69,3 +69,14 @@ Phase B/C code (not launched; needs Scott's go): 0771d65 (VAE loss weights, logi
 | 11-01 | 11550855 | conditioner probe (MDLM embed / block0 / block01 / block0_pool → next token; 200k train, 10k val, 20 epochs) | pending |
 | 11-01 | 11550856 | benchmarks S1-ldm256-mu: LAMBADA (5,153) + HellaSwag (1k), readers gpt2 / floor / dit | pending |
 | 11-01 | 11550857 / 11550858 | LDM suite S1-ldm256-mu re-run: TAG=v2 (val; CIs + sampler sweeps) / TAG=train (SPLIT=train) | pending |
+
+### Scale-2 Phase B/C chain (Scott's go, 11-01)
+| date | job | what | result |
+|---|---|---|---|
+| 11-01 | 11553974 | DiT-B v2 smoke (200 steps on S1 latents; bf16, HeadLoss, 2-block trainable encoder, latent interface) | COMPLETED 4:37 — no crash |
+| 11-01 | 11553958 / 11553959 | S2-vae256 (scale2.yaml: blocks 0/11 ×4, logit-KL 0.1, β 0.003, cosine) / continuation | COMPLETED 5:49 — in-flight val top-1 0.7335 (S1 0.519); final val recon 0.523 (S1 0.404); terminal MSE 5.61 (S1 1.26); floor dims 1,280 (S1 889); KL 4,157 |
+| 11-01 | 11553960 | export latents S2-vae256 | COMPLETED 2:18 — 30k positions |
+| 11-01 | 11553961 / 11553962 | S2-ldm256-B (DiT-B v2) / continuation | pending (A100 priority) |
+| 11-01 | 11553963 | S2-ldm256-B-regress (μ-regressor baseline, TERMINAL_LOGIT_KL=0) | pending (A100 priority) |
+| 11-01 | 11559923 | substitution S2-vae256, val, 5k pos (vae_* conditions) | pending |
+| 11-01 | 11559924 | benchmarks S2-vae256, reader floor (LAMBADA + HellaSwag 1k) | pending |
