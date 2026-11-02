@@ -76,7 +76,7 @@ Phase B/C code (not launched; needs Scott's go): 0771d65 (VAE loss weights, logi
 | 11-01 | 11553974 | DiT-B v2 smoke (200 steps on S1 latents; bf16, HeadLoss, 2-block trainable encoder, latent interface) | COMPLETED 4:37 — no crash |
 | 11-01 | 11553958 / 11553959 | S2-vae256 (scale2.yaml: blocks 0/11 ×4, logit-KL 0.1, β 0.003, cosine) / continuation | COMPLETED 5:49 — in-flight val top-1 0.7335 (S1 0.519); final val recon 0.523 (S1 0.404); terminal MSE 5.61 (S1 1.26); floor dims 1,280 (S1 889); KL 4,157 |
 | 11-01 | 11553960 | export latents S2-vae256 | COMPLETED 2:18 — 30k positions |
-| 11-01 | 11553961 / 11553962 | S2-ldm256-B (DiT-B v2) / continuation | pending (A100 priority) |
-| 11-01 | 11553963 | S2-ldm256-B-regress (μ-regressor baseline, TERMINAL_LOGIT_KL=0) | pending (A100 priority) |
-| 11-01 | 11559923 | substitution S2-vae256, val, 5k pos (vae_* conditions) | pending |
-| 11-01 | 11559924 | benchmarks S2-vae256, reader floor (LAMBADA + HellaSwag 1k) | pending |
+| 11-01 | 11553961 / 11553962 | S2-ldm256-B (DiT-B v2) / continuation | 21 h pending on gpu/A100; 11-02 retargeted via scontrol to multigpu + h200:1 (test-only est. start ~1 h vs ~17 h on gpu) |
+| 11-01 | 11553963 | S2-ldm256-B-regress (μ-regressor baseline, TERMINAL_LOGIT_KL=0) | retargeted to multigpu + h200:1 (11-02) |
+| 11-01 | 11559923 | substitution S2-vae256, val, 5k pos (vae_* conditions) | COMPLETED 29:19 — readout true top1 0.355 (S1 0.270), ppl 41 (S1 67); splice worse: vae_0 ΔCE 0.174 (S1 0.139), stack_closed 3.20 (2.71), stack_open 1.99 (1.66); vae_11 0.177 (0.189) |
+| 11-01 | 11559924 | benchmarks S2-vae256, reader floor (LAMBADA + HellaSwag 1k) | COMPLETED 1:45 — LAMBADA floor acc 0.074 (S1 0.016), ppl 210 (672); HellaSwag agree 0.883 (0.835) |
