@@ -28,9 +28,19 @@ if [[ -f "$FINAL" ]]; then
   exit 0
 fi
 if (( CHAIN_LEFT > 1 )); then
-  next=$(CHAIN_LEFT=$((CHAIN_LEFT - 1)) sbatch --parsable --export=ALL -J "${SLURM_JOB_NAME}" \
-    --dependency=afterany:"${SLURM_JOB_ID}" "${REPO_DIR}/scripts/slurm/chain_train_ldm.sh")
-  echo "chain: queued successor $next (CHAIN_LEFT=$((CHAIN_LEFT - 1)))"
+  # slurmctld intermittently answers "Unexpected message received": retry, and never let a
+  # failed submit stop this job from training (the run still resumes if resubmitted by hand).
+  next=""
+  for attempt in 1 2 3 4 5 6; do
+    if next=$(CHAIN_LEFT=$((CHAIN_LEFT - 1)) sbatch --parsable --export=ALL -J "${SLURM_JOB_NAME}" \
+        --dependency=afterany:"${SLURM_JOB_ID}" "${REPO_DIR}/scripts/slurm/chain_train_ldm.sh" 2>&1); then
+      break
+    fi
+    echo "chain: submit attempt $attempt failed: $next"
+    next=""
+    sleep 30
+  done
+  echo "chain: queued successor ${next:-NONE} (CHAIN_LEFT=$((CHAIN_LEFT - 1)))"
 else
   echo "chain: CHAIN_LEFT exhausted; no successor"
 fi
