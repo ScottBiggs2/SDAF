@@ -698,6 +698,31 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
     plt.close(fig)
     paths.append(p)
 
+    # Lens Δppl = exp(lens CE) − exp(clean lens CE) per cell (symlog: single blocks ~1, stacks ~10³).
+    # Early-block lens ppl is huge even when clean, so the last column is the one to read.
+    ppl_clean = np.exp(np.array(res["conditions"]["clean"]["lens_ce"], dtype=float))
+    grids = {mode: _grid(res, "lens_ce", mode) for mode in modes}
+    grids = {m: (np.exp(g) - ppl_clean, lab) if g.size else (g, lab) for m, (g, lab) in grids.items()}
+    vmax = max([float(np.nanmax(np.abs(g))) for g, _ in grids.values() if g.size and np.isfinite(g).any()] or [1.0])
+    norm = matplotlib.colors.SymLogNorm(linthresh=1.0, vmin=-vmax, vmax=vmax, base=10)
+    fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
+    for ax, mode in zip(axes, modes):
+        g, labels = grids[mode]
+        if g.size == 0:
+            ax.axis("off")
+            continue
+        im = ax.imshow(g, aspect="auto", cmap="RdBu_r", norm=norm)
+        ax.set_yticks(range(len(labels)), labels, fontsize=8)
+        ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
+        ax.set_xlabel("measured at output of block (logit lens)")
+        ax.set_title(f"{mode}: lens Δppl vs clean (symlog)")
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    p = out_dir / "grid_lens_dppl.png"
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # Replacement loss by block × component (σ-weighted MSE of the substituted chunk).
     rs_modes = [m for m in ("vae", "dit") if f"{m}_0" in res["conditions"]
                 and "recon_slot" in res["conditions"][f"{m}_0"]]
@@ -718,11 +743,12 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
         paths.append(p)
 
     C = res["conditions"]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    fig, axes = plt.subplots(1, 4, figsize=(21, 4.5))
     x = np.arange(J)
     for ax, key, title, log in ((axes[0], "final_kl", "final KL vs clean", True),
                                 (axes[1], "acceptance", "acceptance α", False),
-                                (axes[2], "fraction_recovered", "fraction of loss recovered", False)):
+                                (axes[2], "fraction_recovered", "fraction of loss recovered", False),
+                                (axes[3], "dppl", "Δppl vs clean (symlog)", "symlog")):
         bars = [("vae", "tab:green"), ("noise", "tab:gray"), ("meanabl", "tab:red")]
         if "dit_0" in C:
             bars.append(("dit", "tab:purple"))
@@ -737,7 +763,9 @@ def plot_all(res: dict, out_dir: Path) -> list[Path]:
                 ax.axhline(C[c][key], color="tab:blue", ls=ls, label=c)
         ax.set_xticks(x, [f"b{b}" for b in range(J)])
         ax.set_title(title)
-        if log:
+        if log == "symlog":
+            ax.set_yscale("symlog", linthresh=1.0)
+        elif log:
             ax.set_yscale("log")
         ax.legend(fontsize=7)
     fig.tight_layout()
@@ -780,7 +808,14 @@ def main() -> int:
     ap.add_argument("--ldm-cfg-w", type=float, default=1.0)
     ap.add_argument("--ldm-weights", choices=["ema", "raw"], default="ema")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--replot", action="store_true", help="redraw summary + plots from <out>/metrics.json; no GPU run")
     a = ap.parse_args()
+    if a.replot:
+        res = json.loads((a.out / "metrics.json").read_text())
+        write_summary(res, a.out)
+        for p in plot_all(res, a.out):
+            print("  plot:", p)
+        return 0
     cfg = load_config(a.config)
     cache_dir = a.cache_dir or Path(expand_env(cfg["paths"]["cache_dir"]))
     n_pos = a.n_positions or int(cfg["cache_v2"]["val_positions"])

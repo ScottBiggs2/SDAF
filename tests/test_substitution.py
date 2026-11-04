@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from specdec_af.analysis.substitution import (
     J,
     SubstitutionHooks,
+    _json_safe,
     all_conditions,
     parse_condition,
     plot_all,
@@ -191,7 +192,9 @@ def test_run_substitution_dit_and_train_split(tiny_ldm, trained_run, gpt2, tmp_p
         assert np.isfinite(np.array(C[c]["recon_slot"], dtype=float)[:, 1:7]).all()
     write_summary(res, out)
     paths = {p.name for p in plot_all(res, out)}
-    assert {"grid_lens_dce.png", "recon_slot.png", "grid_resid_rel.png"} <= paths
+    assert {"grid_lens_dce.png", "grid_lens_dppl.png", "recon_slot.png", "grid_resid_rel.png"} <= paths
+    replot = json.loads(json.dumps(_json_safe(res)))  # --replot path: NaN → None round trip
+    assert {"grid_lens_dppl.png", "per_block_final.png"} <= {p.name for p in plot_all(replot, out)}
 
     tr = run_substitution(trained_run["checkpoint"], trained_run["cache_dir"], tmp_path / "sub_train",
                           n_positions=4, device=torch.device("cpu"), conditions=["clean", "vae_3"],
