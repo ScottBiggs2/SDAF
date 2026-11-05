@@ -38,7 +38,7 @@ the final logits KL, top-1, top-5, acceptance α = Σ min(p, q), true next-token
 CE on the real next token, ΔCE, perplexity ``exp(mean CE)`` and Δppl / ppl ratio vs
 clean. Substituted blocks also report the σ-weighted MSE per slot of the replacement
 chunk vs the live chunk (``recon_slot``, the VAE loss by block and component).
-``fraction_recovered`` per block b = (CE_meanabl_b − CE_x_b) / (CE_meanabl_b − CE_clean).
+``fraction_recovered`` per block b = (CE_meanabl_b − CE_x_b) / (CE_meanabl_b − CE_clean) (summary only).
 Headline scalars carry 95% bootstrap CIs (``ci``). ``--split train`` runs the same
 study on the cache's train slice.
 
@@ -629,161 +629,194 @@ def write_summary(res: dict, out_dir: Path) -> Path:
 
 
 _STACKS = {"vae": ("stack_closed", "stack_open"), "dit": ("dit_stack", "dit_stack_open")}
+_STACK_LABELS = {"stack_closed": "closed: VAE at every block",
+                 "stack_open": "open: decoded trace",
+                 "dit_stack": "DiT writes, real embedding",
+                 "dit_stack_open": "open: DiT trace"}
+_STACK_NOTE = ("Bottom row, all 12 blocks substituted (own colour scale). closed: each block runs on the already-perturbed "
+               "residual and its live chunk is round-tripped again, so errors compound. open: no GPT-2 compute; residual = "
+               "decoded embedding + Σ decoded attn/mlp writes. DiT writes, real embedding: the same sum on the real embedding.")
 
 
-def _grid(res: dict, key: str, mode: str = "vae") -> tuple[np.ndarray, list[str]]:
+def _split_grid(res: dict, key: str, mode: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Single-block substitutions as a J×J upper-triangular grid (row b = substituted block,
+    column l = measured block; l < b is exactly clean and left blank), and the all-block
+    conditions as separate rows."""
     C = res["conditions"]
-    rows, labels = [], []
+    sq = np.full((J, J), np.nan)
     for b in range(J):
-        c = f"{mode}_{b}"
-        if c in C:
-            rows.append(C[c][key])
-            labels.append(f"sub b{b}")
-    for c in _STACKS.get(mode, ()):
-        if c in C:
-            rows.append(C[c][key])
-            labels.append(c)
-    return np.array(rows, dtype=float), labels
+        if f"{mode}_{b}" in C:
+            sq[b] = np.array(C[f"{mode}_{b}"][key], dtype=float)
+    sq[np.tril_indices(J, -1)] = np.nan
+    names = [c for c in _STACKS.get(mode, ()) if c in C]
+    st = np.array([C[c][key] for c in names], dtype=float).reshape(len(names), J)
+    return sq, st, names
 
 
 def _grid_modes(res: dict) -> tuple[str, ...]:
     return ("vae", "noise", "dit") if "dit_0" in res["conditions"] else ("vae", "noise")
 
 
-def plot_all(res: dict, out_dir: Path) -> list[Path]:
-    paths = []
+def _annotate(ax, g: np.ndarray, im, fmt: str, cols=None) -> None:
+    for r in range(g.shape[0]):
+        for c in (range(g.shape[1]) if cols is None else cols):
+            v = g[r, c]
+            if np.isfinite(v):
+                rgb = np.array(im.cmap(im.norm(v))[:3])
+                ax.text(c, r, fmt.format(v), ha="center", va="center", fontsize=6.5,
+                        color="black" if rgb @ [0.299, 0.587, 0.114] > 0.5 else "white")
+
+
+def _finite(arrs) -> np.ndarray:
+    v = np.concatenate([a[np.isfinite(a)].ravel() for a in arrs] or [np.array([])])
+    return v if v.size else np.array([0.0, 1.0])
+
+
+def _plot_split(res: dict, out_dir: Path, key: str, fname: str, title: str, *, transform, norm, cmap: str,
+                fmt: str) -> Path:
+    """Square single-block grids (shared scale across modes) above the all-block rows (their own
+    shared scale), so the compounding stack conditions don't wash out the single-block signal."""
     modes = _grid_modes(res)
-    for key, title in (("resid_rel", "residual-stream relative error"), ("lens_kl", "logit-lens KL vs clean")):
-        fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
-        grids = {mode: _grid(res, key, mode) for mode in modes}
-        logs = [np.log10(np.clip(g, 1e-6, None)) for g, _ in grids.values() if g.size]
-        finite = np.concatenate([x[np.isfinite(x) & (x > -6)] for x in logs]) if logs else np.array([0.0])
-        vmin, vmax = float(finite.min()), float(finite.max())  # shared scale: panels are comparable
-        for ax, mode in zip(axes, modes):
-            g, labels = grids[mode]
-            if g.size == 0:
-                ax.axis("off")
-                continue
-            im = ax.imshow(np.ma.masked_less_equal(np.log10(np.clip(g, 1e-6, None)), -6), aspect="auto",
-                           cmap="magma", vmin=vmin, vmax=vmax)
-            ax.set_yticks(range(len(labels)), labels, fontsize=8)
-            ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
-            ax.set_xlabel("measured at output of block")
-            ax.set_title(f"{mode}: log10 {title}")
-            fig.colorbar(im, ax=ax)
-        fig.tight_layout()
-        p = out_dir / f"grid_{key}.png"
-        fig.savefig(p, dpi=110)
-        plt.close(fig)
-        paths.append(p)
-
-    # Lens ΔCE on the real next token (signed, linear): where the loss appears downstream.
-    fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
-    grids = {mode: _grid(res, "lens_dce", mode) for mode in modes}
-    vmax = max([float(np.nanmax(np.abs(g))) for g, _ in grids.values() if g.size and np.isfinite(g).any()] or [1.0])
-    for ax, mode in zip(axes, modes):
-        g, labels = grids[mode]
-        if g.size == 0:
-            ax.axis("off")
+    data = {m: _split_grid(res, key, m) for m in modes}
+    data = {m: (transform(sq), transform(st), n) for m, (sq, st, n) in data.items()}
+    n_sq = norm(_finite([d[0] for d in data.values()]))
+    st_all = [d[1] for d in data.values() if d[1].size]
+    n_st = norm(_finite(st_all)) if st_all else None
+    fig = plt.figure(figsize=(6.0 * len(modes) + 1.2, 9.6))
+    gs = fig.add_gridspec(2, len(modes) + 1, height_ratios=[J, 2.4], width_ratios=[1] * len(modes) + [0.04],
+                          hspace=0.28, wspace=0.3)
+    im_sq = im_st = None
+    for i, m in enumerate(modes):
+        sq, st, names = data[m]
+        ax = fig.add_subplot(gs[0, i])
+        im_sq = ax.imshow(sq, cmap=cmap, norm=n_sq, aspect="auto")
+        _annotate(ax, sq, im_sq, fmt, cols=[J - 1])
+        ax.set_xticks(range(J), [str(l) for l in range(J)], fontsize=8)
+        ax.set_yticks(range(J), [f"{m}_{b}" for b in range(J)], fontsize=8)
+        ax.set_title(f"{m}: block b substituted alone", fontsize=10)
+        ax.set_xlabel("measured at output of block")
+        ax2 = fig.add_subplot(gs[1, i])
+        if not st.size:
+            ax2.axis("off")
             continue
-        im = ax.imshow(g, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-        ax.set_yticks(range(len(labels)), labels, fontsize=8)
-        ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
-        ax.set_xlabel("measured at output of block (logit lens)")
-        ax.set_title(f"{mode}: lens ΔCE vs clean (nats)")
-        fig.colorbar(im, ax=ax)
-    fig.tight_layout()
-    p = out_dir / "grid_lens_dce.png"
-    fig.savefig(p, dpi=110)
+        im_st = ax2.imshow(st, cmap=cmap, norm=n_st, aspect="auto")
+        _annotate(ax2, st, im_st, fmt)
+        ax2.set_xticks(range(J), [str(l) for l in range(J)], fontsize=8)
+        ax2.set_yticks(range(len(names)), [_STACK_LABELS.get(c, c) for c in names], fontsize=8)
+        ax2.set_title(f"{m}: all 12 blocks substituted", fontsize=10)
+    fig.colorbar(im_sq, cax=fig.add_subplot(gs[0, -1]))
+    if im_st is not None:
+        fig.colorbar(im_st, cax=fig.add_subplot(gs[1, -1]))
+    fig.suptitle(title + "   (labelled column = final block)", x=0.01, ha="left", fontweight="bold")
+    fig.text(0.01, 0.005, _STACK_NOTE, fontsize=8, wrap=True)
+    p = out_dir / fname
+    fig.savefig(p, dpi=110, bbox_inches="tight")
     plt.close(fig)
-    paths.append(p)
+    return p
 
-    # Lens Δppl = exp(lens CE) − exp(clean lens CE) per cell (symlog: single blocks ~1, stacks ~10³).
-    # Early-block lens ppl is huge even when clean, so the last column is the one to read.
-    ppl_clean = np.exp(np.array(res["conditions"]["clean"]["lens_ce"], dtype=float))
-    grids = {mode: _grid(res, "lens_ce", mode) for mode in modes}
-    grids = {m: (np.exp(g) - ppl_clean, lab) if g.size else (g, lab) for m, (g, lab) in grids.items()}
-    vmax = max([float(np.nanmax(np.abs(g))) for g, _ in grids.values() if g.size and np.isfinite(g).any()] or [1.0])
-    norm = matplotlib.colors.SymLogNorm(linthresh=1.0, vmin=-vmax, vmax=vmax, base=10)
-    fig, axes = plt.subplots(1, len(modes), figsize=(7 * len(modes), 6))
-    for ax, mode in zip(axes, modes):
-        g, labels = grids[mode]
-        if g.size == 0:
-            ax.axis("off")
-            continue
-        im = ax.imshow(g, aspect="auto", cmap="RdBu_r", norm=norm)
-        ax.set_yticks(range(len(labels)), labels, fontsize=8)
-        ax.set_xticks(range(J), [f"b{l}" for l in range(J)], fontsize=8)
-        ax.set_xlabel("measured at output of block (logit lens)")
-        ax.set_title(f"{mode}: lens Δppl vs clean (symlog)")
-        fig.colorbar(im, ax=ax)
-    fig.tight_layout()
-    p = out_dir / "grid_lens_dppl.png"
-    fig.savefig(p, dpi=110)
-    plt.close(fig)
-    paths.append(p)
 
-    # Replacement loss by block × component (σ-weighted MSE of the substituted chunk).
-    rs_modes = [m for m in ("vae", "dit") if f"{m}_0" in res["conditions"]
-                and "recon_slot" in res["conditions"][f"{m}_0"]]
+def _log10(g: np.ndarray) -> np.ndarray:
+    return np.where(g > 1e-6, np.log10(np.clip(g, 1e-6, None)), np.nan)
+
+
+def _sym(v: np.ndarray) -> float:
+    return float(np.nanmax(np.abs(v))) or 1.0
+
+
+def plot_all(res: dict, out_dir: Path) -> list[Path]:
+    C = res["conditions"]
+    lin = matplotlib.colors.Normalize
+    paths = [
+        _plot_split(res, out_dir, "resid_rel", "grid_resid_rel.png", "log10 residual-stream relative error vs clean",
+                    transform=_log10, norm=lambda v: lin(v.min(), v.max()), cmap="magma", fmt="{:.1f}"),
+        _plot_split(res, out_dir, "lens_kl", "grid_lens_kl.png", "log10 logit-lens KL vs clean",
+                    transform=_log10, norm=lambda v: lin(v.min(), v.max()), cmap="magma", fmt="{:.1f}"),
+        # Lens ΔCE on the real next token (signed): where the loss appears downstream.
+        _plot_split(res, out_dir, "lens_dce", "grid_lens_dce.png", "logit-lens ΔCE on the true token vs clean (nats)",
+                    transform=lambda g: g, norm=lambda v: lin(-_sym(v), _sym(v)), cmap="RdBu_r", fmt="{:.2f}"),
+    ]
+    # Lens Δppl = exp(lens CE) − exp(clean lens CE). Early-block lens ppl is huge even when clean,
+    # so the last column is the one to read.
+    ppl_clean = np.exp(np.array(C["clean"]["lens_ce"], dtype=float))
+    paths.append(_plot_split(
+        res, out_dir, "lens_ce", "grid_lens_dppl.png", "logit-lens Δppl on the true token vs clean (symlog)",
+        transform=lambda g: np.exp(g) - ppl_clean if g.size else g,
+        norm=lambda v: matplotlib.colors.SymLogNorm(linthresh=1.0, vmin=-_sym(v), vmax=_sym(v), base=10),
+        cmap="RdBu_r", fmt="{:.0f}"))
+
+    # Reconstruction error of the substituted chunk itself, by block × component.
+    rs_modes = [m for m in ("vae", "dit") if f"{m}_0" in C and "recon_slot" in C[f"{m}_0"]]
     if rs_modes:
-        fig, axes = plt.subplots(1, len(rs_modes), figsize=(8 * len(rs_modes), 6), squeeze=False)
-        for ax, mode in zip(axes[0], rs_modes):
-            g = np.array([res["conditions"][f"{mode}_{b}"]["recon_slot"][b] if f"{mode}_{b}" in res["conditions"]
-                          else [np.nan] * len(SLOT_NAMES) for b in range(J)], dtype=float)
-            im = ax.imshow(np.log10(np.clip(g, 1e-6, None)), aspect="auto", cmap="viridis")
+        g = {m: np.array([C[f"{m}_{b}"]["recon_slot"][b] if f"{m}_{b}" in C else [np.nan] * len(SLOT_NAMES)
+                          for b in range(J)], dtype=float) for m in rs_modes}
+        panels = [(m, g[m], f"{m}_b: substituted chunk vs real chunk") for m in rs_modes]
+        if len(rs_modes) == 2:
+            panels.append(("diff", g["dit"] - g["vae"], "dit − vae: error the generator adds"))
+        fig, axes = plt.subplots(1, len(panels), figsize=(6.4 * len(panels), 6.4), squeeze=False)
+        vmax = float(np.nanmax(np.concatenate([x.ravel() for x in g.values()])))
+        for ax, (m, x, ttl) in zip(axes[0], panels):
+            if m == "diff":
+                im = ax.imshow(x, aspect="auto", cmap="RdBu_r", norm=lin(-_sym(x), _sym(x)))
+                _annotate(ax, x, im, "{:+.2f}")
+            else:
+                im = ax.imshow(x, aspect="auto", cmap="viridis", norm=lin(0, vmax))
+                _annotate(ax, x, im, "{:.2f}")
             ax.set_xticks(range(len(SLOT_NAMES)), SLOT_NAMES, rotation=40, ha="right", fontsize=8)
-            ax.set_yticks(range(J), [f"b{l}" for l in range(J)])
-            ax.set_title(f"{mode}_b: log10 σ-weighted MSE per slot (block b substituted)")
-            fig.colorbar(im, ax=ax)
+            ax.set_yticks(range(J), [f"block {l}" for l in range(J)], fontsize=8)
+            ax.set_title(ttl, fontsize=10)
+            fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.suptitle("Reconstruction loss by block and component (σ-weighted MSE, the VAE training loss; "
+                     "blank = slot not in that block)", x=0.01, ha="left", fontweight="bold")
         fig.tight_layout()
         p = out_dir / "recon_slot.png"
         fig.savefig(p, dpi=110)
         plt.close(fig)
         paths.append(p)
 
-    C = res["conditions"]
-    fig, axes = plt.subplots(1, 4, figsize=(21, 4.5))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
     x = np.arange(J)
-    for ax, key, title, log in ((axes[0], "final_kl", "final KL vs clean", True),
-                                (axes[1], "acceptance", "acceptance α", False),
-                                (axes[2], "fraction_recovered", "fraction of loss recovered", False),
-                                (axes[3], "dppl", "Δppl vs clean (symlog)", "symlog")):
+    for ax, key, title, scale in ((axes[0], "dce", "ΔCE on the true token vs clean (nats)", ("symlog", 0.01)),
+                                  (axes[1], "dppl", "Δppl vs clean", ("symlog", 1.0)),
+                                  (axes[2], "acceptance", "acceptance α = Σ min(p, q)", None)):
         bars = [("vae", "tab:green"), ("noise", "tab:gray"), ("meanabl", "tab:red")]
         if "dit_0" in C:
             bars.append(("dit", "tab:purple"))
         w = 0.8 / len(bars)
         for k, (mode, col) in enumerate(bars):
             v = [C.get(f"{mode}_{b}", {}).get(key, np.nan) for b in range(J)]
-            if mode == "meanabl" and key == "fraction_recovered":
-                continue
-            ax.bar(x + (k - (len(bars) - 1) / 2) * w, v, width=w, color=col, label=mode)
-        for c, ls in (("stack_closed", "--"), ("stack_open", ":"), ("dit_stack", "-."), ("dit_stack_open", (0, (1, 3)))):
-            if c in C and key in C[c]:
-                ax.axhline(C[c][key], color="tab:blue", ls=ls, label=c)
+            ax.bar(x + (k - (len(bars) - 1) / 2) * w, v, width=w, color=col, label=f"{mode}_b")
         ax.set_xticks(x, [f"b{b}" for b in range(J)])
+        ax.set_xlabel("substituted block")
         ax.set_title(title)
-        if log == "symlog":
-            ax.set_yscale("symlog", linthresh=1.0)
-        elif log:
-            ax.set_yscale("log")
+        if scale:
+            ax.set_yscale(scale[0], linthresh=scale[1])
         ax.legend(fontsize=7)
+    fig.suptitle("Final-output cost of substituting one block (meanabl = per-block mean, the lower anchor; "
+                 "noise = real writes + noise of the VAE error's norm)", x=0.01, ha="left", fontweight="bold")
     fig.tight_layout()
     p = out_dir / "per_block_final.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
 
-    if "stack_closed" in C:
-        g = np.array(C["stack_closed"]["slot_rel"], dtype=float)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        im = ax.imshow(g, aspect="auto", cmap="viridis")
-        ax.set_xticks(range(len(SLOT_NAMES)), SLOT_NAMES, rotation=40, ha="right", fontsize=8)
-        ax.set_yticks(range(J), [f"b{l}" for l in range(J)])
-        ax.set_title("stack_closed: per-slot relative error vs clean")
-        fig.colorbar(im, ax=ax)
+    # Under the all-block conditions GPT-2 still computes each block's attn/mlp on the perturbed
+    # residual: how far do its own activations drift from clean?
+    drift = [c for c in ("stack_closed", "dit_stack") if c in C]
+    if drift:
+        g = {c: np.array(C[c]["slot_rel"], dtype=float) for c in drift}
+        vmax = float(np.nanmax(np.concatenate([x.ravel() for x in g.values()])))
+        fig, axes = plt.subplots(1, len(drift), figsize=(6.4 * len(drift), 6.4), squeeze=False)
+        for ax, c in zip(axes[0], drift):
+            im = ax.imshow(g[c], aspect="auto", cmap="viridis", norm=lin(0, vmax))
+            _annotate(ax, g[c], im, "{:.2f}")
+            ax.set_xticks(range(len(SLOT_NAMES)), SLOT_NAMES, rotation=40, ha="right", fontsize=8)
+            ax.set_yticks(range(J), [f"block {l}" for l in range(J)], fontsize=8)
+            ax.set_title(_STACK_LABELS[c], fontsize=10)
+            fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.suptitle("Drift of GPT-2's own activations with every block substituted: ‖live − clean‖ / ‖clean‖ "
+                     "per component (block 0 sees the clean embedding)", x=0.01, ha="left", fontweight="bold")
         fig.tight_layout()
-        p = out_dir / "stack_closed_slots.png"
+        p = out_dir / "stack_drift_slots.png"
         fig.savefig(p, dpi=110)
         plt.close(fig)
         paths.append(p)
