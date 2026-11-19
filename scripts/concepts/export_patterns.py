@@ -50,12 +50,13 @@ def main() -> int:
     p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--words", nargs="*", default=None, help="override the cell vocabulary")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
     t0 = time.time()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    words = CELL_WORDS if not args.smoke else [" Monday", " the"]
+    words = args.words or (CELL_WORDS if not args.smoke else [" Monday", " the"])
     tok = load_gpt2_tokenizer("openai-community/gpt2")
     ids = pt.single_token_ids(tok, words)
     cols = list(range(max(0, args.T0 - args.band), min(255, args.T0 + args.band) + 1))

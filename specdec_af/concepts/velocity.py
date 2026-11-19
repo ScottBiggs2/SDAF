@@ -129,3 +129,9 @@ class CondVelocity:
             t = torch.full((len(ci),), float(u), device=xl.device)
             out[cs] = self.live.to_live(self.full(xx, t, ci)).view(len(cs), B, -1)
         return out
+
+
+def cond_velocity(ldm: LatentLDM, dit: LatentDiT, tokens, T, **kw) -> CondVelocity:
+    """:class:`CondVelocity` over suffix conditions built with the checkpoint's own window W."""
+    dev = ldm.latents.keep.device
+    return CondVelocity(ldm, dit, token_cond(tokens, T, W=dit.cfg.ctx_len, device=dev), **kw)
