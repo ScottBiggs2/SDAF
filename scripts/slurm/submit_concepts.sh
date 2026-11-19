@@ -16,7 +16,8 @@
 #   SCRIPT=e7_constraints ARGS="--smoke" sbatch -J cx-e7-smoke scripts/slurm/submit_concepts.sh
 set -euo pipefail
 
-ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
+# specdec_af_cx: rebuilt 11-19 (the original specdec_af env lost bin/python on 11-04; left untouched)
+ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af_cx}"
 REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 SCRIPT="${SCRIPT:?set SCRIPT (a scripts/concepts/<name>.py stem)}"
