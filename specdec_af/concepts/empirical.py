@@ -19,10 +19,13 @@ from torch import Tensor
 
 
 @torch.no_grad()
-def v_emp(z: Tensor, u: float, ref: Tensor, *, chunk: int = 4096) -> tuple[Tensor, Tensor]:
+def v_emp(z: Tensor, u: float, ref: Tensor, *, chunk: int = 4096, fast: bool = False) -> tuple[Tensor, Tensor]:
     """``z [B, d]``, reference ``ref [N, d]`` (same coordinates, live dims only) → ``(v [B, d], ess [B])``.
 
-    Online log-sum-exp over ``chunk``-sized slices of ``ref``, float64. ESS = (Σw)² / Σw²."""
+    Online log-sum-exp over ``chunk``-sized slices of ``ref``; ESS = (Σw)² / Σw². ``fast``: distances
+    (direct differences, no Gram-matrix shortcut) and the weighted sum in float32, accumulators in
+    float64 — for GPUs with slow float64. The log-weight error is ~1e-6·‖·‖²/(2u²): negligible where
+    the ESS is large (u ≳ 0.1 at d = 1784), where the estimate is trusted anyway."""
     z = z.double()
     B = z.shape[0]
     m = torch.full((B,), -float("inf"), dtype=torch.float64, device=z.device)
@@ -30,14 +33,19 @@ def v_emp(z: Tensor, u: float, ref: Tensor, *, chunk: int = 4096) -> tuple[Tenso
     sq = torch.zeros_like(den)
     num = torch.zeros_like(z)
     for s in range(0, ref.shape[0], chunk):
-        r = ref[s:s + chunk].to(device=z.device, dtype=torch.float64)
-        logw = -torch.cdist(z, (1 - u) * r).pow(2) / (2 * u * u)
+        if fast:
+            r = ref[s:s + chunk].to(device=z.device, dtype=torch.float32)
+            d2 = torch.cdist(z.float(), (1 - u) * r, compute_mode="donot_use_mm_for_euclid_dist").pow(2)
+            logw = (-d2 / (2 * u * u)).double()
+        else:
+            r = ref[s:s + chunk].to(device=z.device, dtype=torch.float64)
+            logw = -torch.cdist(z, (1 - u) * r).pow(2) / (2 * u * u)
         new = torch.maximum(m, logw.max(1).values)
         scale = (m - new).exp()
         e = (logw - new[:, None]).exp()
         den = den * scale + e.sum(1)
         sq = sq * scale.pow(2) + e.pow(2).sum(1)
-        num = num * scale[:, None] + e @ r
+        num = num * scale[:, None] + (e.to(r.dtype) @ r).double()
         m = new
     zhat = num / den[:, None]
     return (z - zhat) / u, den.pow(2) / sq
@@ -52,7 +60,7 @@ def u_grid(t_lo: float = 1e-3, n: int = 48, t_hi: float = 0.999) -> Tensor:
 @torch.no_grad()
 def excess_flow_loss(v_model: Callable[[Tensor, float], Tensor], ref_a1: Tensor, ref_a2: Tensor,
                      pts_b: Tensor, us: Tensor, *, block_of: Tensor | None = None,
-                     generator: torch.Generator, chunk: int = 4096) -> dict:
+                     generator: torch.Generator, chunk: int = 4096, fast: bool = False) -> dict:
     """ε̂_c(u) on ``us`` for one condition.
 
     ``v_model(x [B, d], u) -> [B, d]``: the learned velocity in the same live-dim coordinates.
@@ -69,8 +77,8 @@ def excess_flow_loss(v_model: Callable[[Tensor, float], Tensor], ref_a1: Tensor,
     for u in us.tolist():
         e = torch.randn(pts_b.shape, generator=generator, dtype=torch.float64).to(dev)
         x = (1 - u) * pts_b.double() + u * e
-        v1, ess1 = v_emp(x, u, ref_a1, chunk=chunk)
-        v2, ess2 = v_emp(x, u, ref_a2, chunk=chunk)
+        v1, ess1 = v_emp(x, u, ref_a1, chunk=chunk, fast=fast)
+        v2, ess2 = v_emp(x, u, ref_a2, chunk=chunk, fast=fast)
         vt = v_model(x, u).double()
         cross = (vt - v1) * (vt - v2)                                          # [B, d]
         per_pt = cross.sum(1)

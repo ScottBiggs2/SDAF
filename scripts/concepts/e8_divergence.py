@@ -35,23 +35,28 @@ DELTAS = (0.1, 1.0, 10.0)
 
 
 @torch.no_grad()
-def full_null_kl(cells: list[torch.Tensor], ts: np.ndarray, dev) -> np.ndarray:
-    """``[n_t, C, C]`` KL(N_i^t ‖ N_j^t) for per-cell Ledoit–Wolf fits, float64 on ``dev``."""
-    fits = [ledoit_wolf(c.to(dev)) for c in cells]
+def full_null_kl(cells: list[torch.Tensor], ts: np.ndarray) -> np.ndarray:
+    """``[n_t, C, C]`` KL(N_i^t ‖ N_j^t) for per-cell Ledoit–Wolf fits, float64 on CPU (the L40S runs
+    float64 at 1/64 rate). One Cholesky inverse per (cell, t); tr(C_j⁻¹C_i) as an elementwise sum."""
+    fits = [ledoit_wolf(c.cpu()) for c in cells]
     C = len(cells)
-    out = np.zeros((len(ts), C, C))
     d = cells[0].shape[1]
+    out = np.zeros((len(ts), C, C))
     for k, t in enumerate(ts):
         t = float(t)
-        L = [torch.linalg.cholesky(noised_cov(cov, t)) for _, cov in fits]
-        logdet = [2 * l.diagonal().log().sum() for l in L]
+        covs = [noised_cov(cov, t) for _, cov in fits]
+        L = [torch.linalg.cholesky(c) for c in covs]
+        inv = [torch.cholesky_inverse(l) for l in L]
+        logdet = [float(2 * l.diagonal().log().sum()) for l in L]
+        means = [(1 - t) * m for m, _ in fits]
         for j in range(C):
             for i in range(C):
                 if i == j:
                     continue
-                a = torch.linalg.solve_triangular(L[j], L[i], upper=False)
-                dm = torch.linalg.solve_triangular(L[j], ((1 - t) * (fits[j][0] - fits[i][0]))[:, None], upper=False)
-                out[k, i, j] = float(0.5 * (a.pow(2).sum() + dm.pow(2).sum() - d + logdet[j] - logdet[i]))
+                dm = means[j] - means[i]
+                tr = float((inv[j] * covs[i]).sum())
+                maha = float(dm @ inv[j] @ dm)
+                out[k, i, j] = 0.5 * (tr + maha - d + logdet[j] - logdet[i])
     return out
 
 
@@ -119,7 +124,7 @@ def main() -> int:
     us = u_grid(args.t_lo, args.n_u)
     gen_rng = torch.Generator().manual_seed(args.seed + 1000)
     gv = torch.Generator().manual_seed(args.seed + 2000)
-    vall = lambda x, u: cv.live_all(x, u, generator=gv)
+    vall = lambda x, u: cv.live_all(x, u, generator=gv, max_batch=2048)
     halves = []
     for hsel in (slice(0, args.n // 2), slice(args.n // 2, args.n)):
         halves.append(dv.kt_integrand([s[hsel] for s in samples], vall, us, block_of=live.block_of,
@@ -134,8 +139,8 @@ def main() -> int:
     reals = [ex.take(ex.mask(w, exact=None, split=0), n=args.null_max, seed=args.seed) for w in words]
     reals.append(reals[0])  # the T+1 sanity cell shares the T0-band fit
     counts = [int(len(r)) for r in reals]
-    K_full = full_null_kl(reals, ts, dev)
-    shared = SharedCovNull.fit([r.to(dev) for r in reals])
+    K_full = full_null_kl(reals, ts)
+    shared = SharedCovNull.fit([r.cpu() for r in reals])
     K_shared = np.stack([shared.kl(float(t)).cpu().numpy() for t in ts])
     print(f"nulls done  [{time.time() - t0:.0f}s]", flush=True)
 

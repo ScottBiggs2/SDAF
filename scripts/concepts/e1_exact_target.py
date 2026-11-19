@@ -99,7 +99,7 @@ def main() -> int:
         def v_model(x, u):
             return cv.live_at(x.float(), u, torch.zeros(x.shape[0], dtype=torch.long), generator=gv).double()
         r = excess_flow_loss(v_model, A1, A2, B, us, block_of=live.block_of.to(dev),
-                             generator=torch.Generator().manual_seed(args.seed + 2))
+                             generator=torch.Generator().manual_seed(args.seed + 2), fast=dev.type == "cuda")
         r.update({"n_ref_half": int(h), "n_b": int(len(B)), "b_source": b_src})
         trusted = np.array(r["ess_p10"]) >= args.min_ess
         r["trusted_u"] = [float(u) for u, k in zip(r["u"], trusted) if k]

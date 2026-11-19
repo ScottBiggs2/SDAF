@@ -326,3 +326,24 @@ def test_kt_quadrature_unequal_covariances():
             assert float(K[k, i, j].sum()) == pytest.approx(exact, rel=0.05)
     # per-block attribution sums to the total; symmetric blocks carry half each
     assert float(K[0, 0, 1, 0]) == pytest.approx(float(K[0, 0, 1, 1]), rel=0.1)
+
+
+def test_v_emp_fast_path_agrees():
+    ref = torch.randn(3000, 64, generator=_gen(32), dtype=torch.float64)
+    x = 0.5 * ref[:50] + 0.5 * torch.randn(50, 64, generator=_gen(33), dtype=torch.float64)
+    a, ea = v_emp(x, 0.5, ref)
+    b, eb = v_emp(x, 0.5, ref, fast=True)
+    assert torch.allclose(a, b, atol=1e-3) and torch.allclose(ea, eb, rtol=1e-3)
+
+
+def test_full_null_kl_matches_gauss_kl():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("e8", "scripts/concepts/e8_divergence.py")
+    e8 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(e8)
+    g = _gen(34)
+    cells = [torch.randn(500, 6, generator=g, dtype=torch.float64) * (1 + k) + k for k in range(3)]
+    K = e8.full_null_kl(cells, np.array([0.1, 0.5]))
+    m0, c0 = ledoit_wolf(cells[0])
+    m2, c2 = ledoit_wolf(cells[2])
+    assert K[1, 0, 2] == pytest.approx(noised_gauss_kl(m0, c0, m2, c2, 0.5), rel=1e-8)
