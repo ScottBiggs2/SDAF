@@ -105,3 +105,44 @@ def em_sample(velocity: VelocityFn, noise: Tensor, *, steps: int = 50, churn: fl
         z = torch.randn(x.shape, generator=generator).to(x.device)
         x = x + dt * (v - 0.5 * churn**2 * score) + churn * (-dt).sqrt() * z
     return x
+
+
+def ancestral_step(x: Tensor, t: Tensor, s: Tensor, v: Tensor, z: Tensor | None) -> Tensor:
+    """One exact Gaussian-posterior step ``t → s`` (s < t) of the g* reverse SDE.
+
+    Forward: Z_t | Z ~ N((1−t)Z, t²I), so Z_t | Z_s has a = (1−t)/(1−s), b² = t² − a²s². The step
+    draws from q(Z_s | Z_t, Z = x̂₀): mean (a s²/t²)·x + ((1−s) b²/t²)·x̂₀, std s·b/t. Non-singular at
+    t = 1 (it is then N((1−s)x̂₀, s²I)). ``z = None`` returns the posterior mean. ``t``, ``s`` are
+    ``[B, n]``; DDPM ancestral sampling in rectified-flow coordinates, one network call per step.
+    """
+    tt, ss = t[..., None], s[..., None]
+    a = (1 - tt) / (1 - ss)
+    b2 = (tt.pow(2) - a.pow(2) * ss.pow(2)).clamp_min(0)
+    mean = (a * ss.pow(2) / tt.pow(2)) * x + ((1 - ss) * b2 / tt.pow(2)) * x0_hat(x, t, v)
+    return mean if z is None else mean + (ss * b2.sqrt() / tt) * z
+
+
+@torch.no_grad()
+def ancestral_sample(velocity: VelocityFn, noise: Tensor, *, steps: int = 50,
+                     generator: torch.Generator | None = None, ts: Tensor | None = None,
+                     return_path: bool = False):
+    """g* ancestral sampler (concept-algebra brief §5): t = 1 → 0 by :func:`ancestral_step`.
+
+    Its paths have the joint law of the forward chain (at the optimum), unlike the ODE, so snapshots
+    along them carry graded information. ``ts`` overrides the uniform grid (descending, 1 → 0). The
+    last step (s = 0) is deterministic: x̂₀. ``return_path``: also the states ``[steps + 1, B, n, d]``
+    at ``ts`` (CPU).
+    """
+    x = noise
+    B, n = noise.shape[:2]
+    ts = torch.linspace(1.0, 0.0, steps + 1) if ts is None else ts.double().cpu()
+    path = [x.cpu()] if return_path else None
+    for i in range(len(ts) - 1):
+        t = ts[i].float().to(noise.device).expand(B, n)
+        s = ts[i + 1].float().to(noise.device).expand(B, n)
+        v = velocity(x, t)
+        z = torch.randn(x.shape, generator=generator).to(x.device) if float(ts[i + 1]) > 0 else None
+        x = ancestral_step(x, t, s, v, z)
+        if path is not None:
+            path.append(x.cpu())
+    return (x, torch.stack(path)) if return_path else x
