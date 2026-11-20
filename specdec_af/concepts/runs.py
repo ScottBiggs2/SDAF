@@ -30,9 +30,9 @@ class Export:
         return self.words.index(w)
 
     def mask(self, w: str | None = None, *, exact: bool | None = True, split: int | None = 0,
-             suffix: list[int] | None = None) -> np.ndarray:
+             suffix: list[int] | None = None, band: int | None = None) -> np.ndarray:
         """Row mask: token ``w``, at exactly T0 (``exact``; None = whole band), ``split`` (0 train / 1 val /
-        None both), and a suffix pattern ``suffix`` = (x_{T−m}, …, x_T) token ids."""
+        None both), a suffix pattern ``suffix`` = (x_{T−m}, …, x_T) token ids, and |T − T0| ≤ ``band``."""
         m = np.ones(len(self.rows["seq"]), dtype=bool)
         if w is not None:
             m &= self.rows["w"] == self.word(w)
@@ -40,6 +40,8 @@ class Export:
             m &= (self.rows["T"] == self.T0) if exact else (self.rows["T"] != self.T0)
         if split is not None:
             m &= self.rows["split"] == split
+        if band is not None:
+            m &= np.abs(self.rows["T"].astype(np.int64) - self.T0) <= band
         if suffix:
             k = len(suffix)
             m &= (self.rows["suffix"][:, -k:] == np.asarray(suffix)[None]).all(1)

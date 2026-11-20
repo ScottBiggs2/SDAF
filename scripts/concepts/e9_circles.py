@@ -139,7 +139,11 @@ def main() -> int:
             off = ~np.eye(len(idx), dtype=bool)
             share = [float(np.median((dv.symmetrize(kt["K_shared"][k])[np.ix_(idx, idx)] /
                                       dv.symmetrize(Kg[k])[np.ix_(idx, idx)])[off])) for k in range(len(ts))]
+        k0 = int(np.searchsorted(ts, kt.get("t_trusted", 0.8) - 1e-9))
+        blk_tr = [dv.circulant_fit(np.sqrt(np.clip(dv.symmetrize(Kg_b[k0][..., l])[np.ix_(idx, idx)], 0, None)))["r2"]
+                  for l in range(12)]
         res[fam] = {"labels": words, "R0": R0, "R1": R1, "R2": R2, "R2_block_r2_at_t_lo": blk,
+                    "R2_block_r2_at_t_trusted": blk_tr, "t_trusted_index": k0,
                     "mean_term_share_by_t": share, "t": ts.tolist()}
         best0 = max(range(12), key=lambda l: R0[l]["r2"])
         print(f"{fam}: R0 best block {best0} r2={R0[best0]['r2']:.2f} p={R0[best0]['p_value']:.3f}; "

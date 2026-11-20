@@ -8,7 +8,7 @@ log grid on [t_lo, 0.999]; at every noised point the velocity under all C condit
 giving E_{κ_i^u}‖v_i − v_j‖² per block; K_t by the tail quadrature (``concepts/divergence.py``). The
 MC error is estimated from two disjoint halves of the samples.
 
-**Nulls**, fitted to real Ψ of each cell (train rows, T0 band ± 16 pooled, so weekdays have enough):
+**Nulls**, fitted to real Ψ of each cell (train rows, T0 ± ``--null-band`` pooled; E1 allows ± 8):
 * ``full``   — per-cell Ledoit–Wolf Gaussians: closed-form noised KL (float64 Cholesky);
 * ``shared`` — one pooled covariance: the mean term alone; contrast fields exactly constant in z.
 
@@ -94,6 +94,8 @@ def main() -> int:
     p.add_argument("--n", type=int, default=512)
     p.add_argument("--n-u", type=int, default=32)
     p.add_argument("--t-lo", type=float, default=0.02)
+    p.add_argument("--t-trusted", type=float, default=0.8, help="E4: generator marginals faithful for t ≥ this")
+    p.add_argument("--null-band", type=int, default=8, help="E1: T pooling OK within ±8")
     p.add_argument("--null-max", type=int, default=6000, help="real rows per cell for the null fits")
     p.add_argument("--ldm-checkpoint", default=DEFAULT_LDM)
     p.add_argument("--out", default=DEFAULT_OUT)
@@ -121,7 +123,9 @@ def main() -> int:
     samples = [live.to_live(generate(cv, torch.full((args.n,), i, dtype=torch.long), seed=args.seed + i))
                for i in range(C)]
     print(f"sampled {C} cells × {args.n}  [{time.time() - t0:.0f}s]", flush=True)
-    us = u_grid(args.t_lo, args.n_u)
+    # log grid on [t_lo, 0.999] plus a dense linear grid on the trusted range [t_trusted, 0.99]
+    us = torch.unique(torch.cat([u_grid(args.t_lo, args.n_u),
+                                 torch.linspace(args.t_trusted, 0.99, 12, dtype=torch.float64)])).sort().values
     gen_rng = torch.Generator().manual_seed(args.seed + 1000)
     gv = torch.Generator().manual_seed(args.seed + 2000)
     vall = lambda x, u: cv.live_all(x, u, generator=gv, max_batch=2048)
@@ -136,7 +140,8 @@ def main() -> int:
     K_h = [dv.k_from_integrand(us, h).numpy().sum(-1) for h in halves]
     ts = us.numpy()
 
-    reals = [ex.take(ex.mask(w, exact=None, split=0), n=args.null_max, seed=args.seed) for w in words]
+    reals = [ex.take(ex.mask(w, exact=None, split=0, band=args.null_band), n=args.null_max, seed=args.seed)
+             for w in words]
     reals.append(reals[0])  # the T+1 sanity cell shares the T0-band fit
     counts = [int(len(r)) for r in reals]
     K_full = full_null_kl(reals, ts)
@@ -145,6 +150,8 @@ def main() -> int:
     print(f"nulls done  [{time.time() - t0:.0f}s]", flush=True)
 
     res = {"T0": args.T0, "labels": labels, "cell_T": cell_T, "t": ts.tolist(), "n_null_rows": counts,
+           "t_trusted": args.t_trusted, "null_band": args.null_band,
+           "label": "generator laws (E3/E2: m=0 conditionals off vs data; E4: marginals faithful only for t ≥ t_trusted)",
            "split_times": {}, "dendrogram": {}, "excess": {}}
     for name, K in (("gen", K_gen), ("full", K_full), ("shared", K_shared)):
         Ks = dv.symmetrize(K)
@@ -154,6 +161,11 @@ def main() -> int:
             Z, U = dv.single_linkage(tau)
             res["split_times"][name][str(delta)] = tau.tolist()
             res["dendrogram"][name][str(delta)] = Z.tolist()
+            # trusted range only: pairs still below δ at t_trusted get t_trusted ("unresolved in range")
+            k0 = int(np.searchsorted(ts, args.t_trusted - 1e-9))
+            tau_t = dv.split_times(ts[k0:], Ks[k0:], delta)
+            res["split_times"][name][f"{delta}_trusted"] = tau_t.tolist()
+            res["dendrogram"][name][f"{delta}_trusted"] = dv.single_linkage(tau_t)[0].tolist()
     with np.errstate(divide="ignore", invalid="ignore"):
         off = ~np.eye(C, dtype=bool)
         for name, K in (("full", K_full), ("shared", K_shared)):
@@ -166,11 +178,11 @@ def main() -> int:
                               "median_offdiag_by_t": np.median(dv.symmetrize(K_gen)[:, off], 1).tolist()}
     res["block_share_at_t_lo"] = (K_gen_b[0][off].sum(0) / K_gen_b[0][off].sum()).tolist()
     res.update(provenance(sysd, sampler="euler", steps=50, cfg_w=1.0, T=args.T0, m=0, n_per_cell=args.n,
-                          t_range=[args.t_lo, 0.999], n_u=args.n_u, null_T="band ±16, train", smoke=args.smoke))
+                          t_range=[args.t_lo, 0.999], n_u=args.n_u, null_T=f"band ±{args.null_band}, train", smoke=args.smoke))
     d = root / "e8" / f"T{args.T0}"
     write_json(d / "metrics.json", res)
     torch.save({"t": ts, "labels": labels, "K_gen_block": K_gen_b, "K_gen_halves": K_h, "K_full": K_full,
-                "K_shared": K_shared}, d / "kt.pt")
+                "K_shared": K_shared, "t_trusted": args.t_trusted}, d / "kt.pt")
     plot(res, {"gen": K_gen, "full": K_full}, ts, labels, d / "e8_kt.png")
     print(f"E8 done [{time.time() - t0:.0f}s] → {d}")
     return 0
