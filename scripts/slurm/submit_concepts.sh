@@ -16,7 +16,8 @@
 #   SCRIPT=e7_constraints ARGS="--smoke" sbatch -J cx-e7-smoke scripts/slurm/submit_concepts.sh
 set -euo pipefail
 
-# specdec_af_cx: rebuilt 11-19 (the original specdec_af env lost bin/python on 11-04; left untouched)
+# specdec_af_cx: a venv rebuilt 11-19 (the original conda env specdec_af lost bin/python on 11-04 and is
+# left untouched; conda create hung on 11-19, so this one is python -m venv + pip)
 ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af_cx}"
 REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 SCRATCH="${SCRATCH:-/scratch/biggs.s}"
@@ -31,11 +32,13 @@ export HF_DATASETS_CACHE="${SCRATCH}/huggingface_cache/datasets"
 export TRANSFORMERS_CACHE="${SCRATCH}/huggingface_cache/transformers"
 export SCRATCH
 
-if command -v module &>/dev/null; then
-  module load anaconda3 || module load miniconda3 || true
-fi
 # shellcheck disable=SC1091
-source activate "$ENV_PREFIX"
+if [[ -f "$ENV_PREFIX/bin/activate" && ! -d "$ENV_PREFIX/conda-meta" ]]; then
+  source "$ENV_PREFIX/bin/activate"          # venv
+else
+  if command -v module &>/dev/null; then module load anaconda3 || module load miniconda3 || true; fi
+  source activate "$ENV_PREFIX"              # conda env
+fi
 cd "$REPO_DIR"
 
 echo "=== Slurm context ==="
