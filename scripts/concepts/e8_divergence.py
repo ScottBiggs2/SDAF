@@ -101,6 +101,9 @@ def main() -> int:
     p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cells", nargs="*", default=None, help="override the cell words")
+    p.add_argument("--part", type=int, default=None, help="compute only u points part::parts, save, exit")
+    p.add_argument("--parts", type=int, default=1)
+    p.add_argument("--finalize", action="store_true", help="assemble the --parts integrand files and finish")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
     t0 = time.time()
@@ -120,20 +123,37 @@ def main() -> int:
     C = len(cell_tok)
     cv = cond_velocity(ldm, ema, cell_tok, cell_T)
 
-    samples = [live.to_live(generate(cv, torch.full((args.n,), i, dtype=torch.long), seed=args.seed + i))
-               for i in range(C)]
-    print(f"sampled {C} cells × {args.n}  [{time.time() - t0:.0f}s]", flush=True)
     # log grid on [t_lo, 0.999] plus a dense linear grid on the trusted range [t_trusted, 0.99]
     us = torch.unique(torch.cat([u_grid(args.t_lo, args.n_u),
                                  torch.linspace(args.t_trusted, 0.99, 12, dtype=torch.float64)])).sort().values
-    gen_rng = torch.Generator().manual_seed(args.seed + 1000)
-    gv = torch.Generator().manual_seed(args.seed + 2000)
-    vall = lambda x, u: cv.live_all(x, u, generator=gv, max_batch=2048)
-    halves = []
-    for hsel in (slice(0, args.n // 2), slice(args.n // 2, args.n)):
-        halves.append(dv.kt_integrand([s[hsel] for s in samples], vall, us, block_of=live.block_of,
-                                      generator=gen_rng, batch=args.n // 2))
-        print(f"  integrand half done  [{time.time() - t0:.0f}s]", flush=True)
+    d = root / "e8" / f"T{args.T0}"
+    d.mkdir(parents=True, exist_ok=True)
+    if args.finalize:
+        # 1 h walls: the integrand is computed in --parts jobs over interleaved u points (same seeded samples)
+        halves = [torch.zeros(len(us), C, C, 12, dtype=torch.float64) for _ in range(2)]
+        for i in range(args.parts):
+            part = torch.load(d / f"integ_part{i}of{args.parts}.pt", weights_only=False)
+            for h in range(2):
+                halves[h][part["idx"]] = part["halves"][h]
+        print(f"assembled {args.parts} parts  [{time.time() - t0:.0f}s]", flush=True)
+    else:
+        samples = [live.to_live(generate(cv, torch.full((args.n,), i, dtype=torch.long), seed=args.seed + i))
+                   for i in range(C)]
+        print(f"sampled {C} cells × {args.n}  [{time.time() - t0:.0f}s]", flush=True)
+        idx = torch.arange(len(us)) if args.part is None else torch.arange(args.part, len(us), args.parts)
+        tag = 0 if args.part is None else args.part
+        gen_rng = torch.Generator().manual_seed(args.seed + 1000 + tag)
+        gv = torch.Generator().manual_seed(args.seed + 2000 + tag)
+        vall = lambda x, u: cv.live_all(x, u, generator=gv, max_batch=2048)
+        halves = []
+        for hsel in (slice(0, args.n // 2), slice(args.n // 2, args.n)):
+            halves.append(dv.kt_integrand([s[hsel] for s in samples], vall, us[idx], block_of=live.block_of,
+                                          generator=gen_rng, batch=args.n // 2))
+            print(f"  integrand half done  [{time.time() - t0:.0f}s]", flush=True)
+        if args.part is not None:
+            torch.save({"idx": idx, "halves": halves, "us": us}, d / f"integ_part{args.part}of{args.parts}.pt")
+            print(f"E8 part {args.part}/{args.parts} saved ({len(idx)} u points)  [{time.time() - t0:.0f}s]")
+            return 0
     integ = 0.5 * (halves[0] + halves[1])
     K_gen_b = dv.k_from_integrand(us, integ).numpy()                       # [n_u, C, C, 12]
     K_gen = K_gen_b.sum(-1)
@@ -179,7 +199,6 @@ def main() -> int:
     res["block_share_at_t_lo"] = (K_gen_b[0][off].sum(0) / K_gen_b[0][off].sum()).tolist()
     res.update(provenance(sysd, sampler="euler", steps=50, cfg_w=1.0, T=args.T0, m=0, n_per_cell=args.n,
                           t_range=[args.t_lo, 0.999], n_u=args.n_u, null_T=f"band ±{args.null_band}, train", smoke=args.smoke))
-    d = root / "e8" / f"T{args.T0}"
     write_json(d / "metrics.json", res)
     torch.save({"t": ts, "labels": labels, "K_gen_block": K_gen_b, "K_gen_halves": K_h, "K_full": K_full,
                 "K_shared": K_shared, "t_trusted": args.t_trusted}, d / "kt.pt")

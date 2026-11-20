@@ -98,6 +98,12 @@ def test_e8_e9(exported, monkeypatch):
     assert len(m["labels"]) == len(cells) + 1
     tau = np.array(m["split_times"]["gen"]["1.0"])
     assert tau.shape == (len(cells) + 1,) * 2 and np.allclose(tau, tau.T)
+    # the parted path (1 h walls) assembles to the same shapes
+    for i in range(2):
+        _run("e8_divergence", [*_common(exported), "--cells", *cells, "--part", str(i), "--parts", "2"], monkeypatch)
+    _run("e8_divergence", [*_common(exported), "--cells", *cells, "--parts", "2", "--finalize"], monkeypatch)
+    m2 = json.loads((exported["root"] / "e8" / f"T{T0}" / "metrics.json").read_text())
+    assert m2["t"] == m["t"] and np.isfinite(np.array(m2["split_times"]["gen"]["1.0"])).all()
     _run("e9_circles", _common(exported), monkeypatch)
     m9 = json.loads((exported["root"] / "e9" / f"T{T0}" / "metrics.json").read_text())
     assert "weekdays" in m9 and "months" in m9 and len(m9["weekdays"]["R0"]) == 12
