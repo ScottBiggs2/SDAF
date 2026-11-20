@@ -25,6 +25,14 @@ from specdec_af.concepts.system import DEFAULT_LDM, DEFAULT_OUT, expand, load_sy
 from specdec_af.concepts.two_sample import c2st, rbf_mmd2
 from specdec_af.concepts.velocity import CondVelocity, cond_velocity, token_cond
 
+def random_halves(R: torch.Tensor, seed: int):
+    """Disjoint random halves. Row order follows the corpus layout (train.npy is source by source), so an
+    ordered split would compare FineWeb-Edu against OpenWebText (the 11-20 bug: floor AUC 0.72–0.85)."""
+    perm = torch.randperm(len(R), generator=torch.Generator().manual_seed(seed))
+    h = len(R) // 2
+    return R[perm[:h]], R[perm[h:2 * h]]
+
+
 T_CHECK = [0.98, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02]
 
 
@@ -80,7 +88,7 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     vidx = np.sort(rng.choice(vidx, size=min(len(vidx), 2 * args.n), replace=False))
     real_null = live.to_live(ldm.latents.encode(torch.from_numpy(np.asarray(mu[vidx], dtype=np.float32)).to(dev))).cpu()
-    Rn1, Rn2 = real_null[: len(real_null) // 2], real_null[len(real_null) // 2:]
+    Rn1, Rn2 = random_halves(real_null, args.seed)
 
     wid = ex.token_ids[ex.word(args.word)]
     base = ex.mask(args.word, exact=True, split=0)
@@ -91,7 +99,7 @@ def main() -> int:
              "m2": (token_cond([pat2], args.T0, W=ema.cfg.ctx_len, device=dev), None)}
     for name, suf in (("m0", [wid]), ("m2", pat2)):
         R = ex.take(ex.mask(args.word, exact=True, split=0, suffix=suf), n=2 * args.n, seed=args.seed)
-        conds[name] = (conds[name][0], (R[: len(R) // 2], R[len(R) // 2:]))
+        conds[name] = (conds[name][0], random_halves(R, args.seed + 1))
 
     endpoints = {}
     for name, (cond, (R1, R2)) in conds.items():
