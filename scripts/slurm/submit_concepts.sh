@@ -16,15 +16,18 @@
 #   SCRIPT=e7_constraints ARGS="--smoke" sbatch -J cx-e7-smoke scripts/slurm/submit_concepts.sh
 set -euo pipefail
 
-# specdec_af_cx: a venv rebuilt 11-19 (the original conda env specdec_af lost bin/python on 11-04 and is
-# left untouched; conda create hung on 11-19, so this one is python -m venv + pip)
-ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af_cx}"
+# Env (11-19): the conda env specdec_af lost bin/python on 11-04 (left untouched), and installs into
+# /scratch stall: small-file creates took ~5 s each on 11-19. Default ENV_MODE=local builds a venv
+# on the node's local disk per job from the pip cache on scratch (a few large reads, ~5 min); the
+# repo goes on PYTHONPATH (no pip -e, so concurrent jobs never write into the repo).
+# ENV_MODE=prefix uses ENV_PREFIX (a conda env or venv) instead.
+ENV_MODE="${ENV_MODE:-local}"
+ENV_PREFIX="${ENV_PREFIX:-/scratch/biggs.s/conda_envs/specdec_af}"
 REPO_DIR="${REPO_DIR:-/home/biggs.s/sdaf-gpt2/SDAF}"
 SCRATCH="${SCRATCH:-/scratch/biggs.s}"
 SCRIPT="${SCRIPT:?set SCRIPT (a scripts/concepts/<name>.py stem)}"
 ARGS="${ARGS:-}"
 export PYTHONNOUSERSITE=1
-PY="$ENV_PREFIX/bin/python"
 
 mkdir -p "${REPO_DIR}/logs"
 export HF_HOME="${SCRATCH}/huggingface_cache"
@@ -32,12 +35,28 @@ export HF_DATASETS_CACHE="${SCRATCH}/huggingface_cache/datasets"
 export TRANSFORMERS_CACHE="${SCRATCH}/huggingface_cache/transformers"
 export SCRATCH
 
-# shellcheck disable=SC1091
-if [[ -f "$ENV_PREFIX/bin/activate" && ! -d "$ENV_PREFIX/conda-meta" ]]; then
-  source "$ENV_PREFIX/bin/activate"          # venv
+if [[ "$ENV_MODE" == local ]]; then
+  module load anaconda3/2024.06 2>/dev/null || module load anaconda3
+  LOCAL_ENV="${TMPDIR:-/tmp}/cxenv_${SLURM_JOB_ID:-$$}"
+  trap 'rm -rf "$LOCAL_ENV"' EXIT
+  echo "[$(date +%T)] building local env at $LOCAL_ENV"
+  python -m venv "$LOCAL_ENV"
+  PIPI=("$LOCAL_ENV/bin/python" -m pip install -q --progress-bar off --cache-dir "${SCRATCH}/pip_cache")
+  "${PIPI[@]}" torch --index-url https://download.pytorch.org/whl/cu121
+  "${PIPI[@]}" "transformers>=4.40" "datasets>=2.18" "pyyaml>=6.0" "numpy>=1.24" "tqdm>=4.65" \
+    "matplotlib>=3.7" "safetensors>=0.4" "huggingface_hub>=0.23"
+  PY="$LOCAL_ENV/bin/python"
+  export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:$PYTHONPATH}"
+  echo "[$(date +%T)] local env ready: $("$PY" -c 'import torch, transformers; print(torch.__version__, transformers.__version__)')"
 else
-  if command -v module &>/dev/null; then module load anaconda3 || module load miniconda3 || true; fi
-  source activate "$ENV_PREFIX"              # conda env
+  PY="$ENV_PREFIX/bin/python"
+  # shellcheck disable=SC1091
+  if [[ -f "$ENV_PREFIX/bin/activate" && ! -d "$ENV_PREFIX/conda-meta" ]]; then
+    source "$ENV_PREFIX/bin/activate"
+  else
+    if command -v module &>/dev/null; then module load anaconda3 || module load miniconda3 || true; fi
+    source activate "$ENV_PREFIX"
+  fi
 fi
 cd "$REPO_DIR"
 
