@@ -36,18 +36,29 @@ export TRANSFORMERS_CACHE="${SCRATCH}/huggingface_cache/transformers"
 export SCRATCH
 
 if [[ "$ENV_MODE" == local ]]; then
-  module load anaconda3/2024.06 2>/dev/null || module load anaconda3
+  # The env is built once (BUILD_ENV=1, or when the tarball is missing), packed as one compressed tarball
+  # on scratch (a single large write), and unpacked per job (sequential read, ~100 MB/s).
+  ENV_TAR="${ENV_TAR:-${SCRATCH}/cx_envs/cxenv_torch251_cu121.tar.gz}"
   LOCAL_ENV="${TMPDIR:-/tmp}/cxenv_${SLURM_JOB_ID:-$$}"
   trap 'rm -rf "$LOCAL_ENV"' EXIT
-  echo "[$(date +%T)] building local env at $LOCAL_ENV"
-  python -m venv "$LOCAL_ENV"
-  PIPI=("$LOCAL_ENV/bin/python" -m pip install -q --progress-bar off --cache-dir "${SCRATCH}/pip_cache")
-  "${PIPI[@]}" torch --index-url https://download.pytorch.org/whl/cu121
-  "${PIPI[@]}" "transformers>=4.40" "datasets>=2.18" "pyyaml>=6.0" "numpy>=1.24" "tqdm>=4.65" \
-    "matplotlib>=3.7" "safetensors>=0.4" "huggingface_hub>=0.23"
+  module load anaconda3/2024.06 2>/dev/null || module load anaconda3
+  if [[ -f "$ENV_TAR" && "${BUILD_ENV:-0}" != 1 ]]; then
+    echo "[$(date +%T)] unpacking $ENV_TAR → $LOCAL_ENV"
+    mkdir -p "$LOCAL_ENV"
+    tar -xzf "$ENV_TAR" -C "$LOCAL_ENV" --strip-components=1
+  else
+    echo "[$(date +%T)] building local env at $LOCAL_ENV"
+    python -m venv "$LOCAL_ENV"
+    PIPI=("$LOCAL_ENV/bin/python" -m pip install -q --progress-bar off --cache-dir "${SCRATCH}/pip_cache")
+    "${PIPI[@]}" torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+    "${PIPI[@]}" -r "${REPO_DIR}/scripts/slurm/concepts_requirements.txt"
+    echo "[$(date +%T)] packing → $ENV_TAR"
+    mkdir -p "$(dirname "$ENV_TAR")"
+    tar -czf "${ENV_TAR}.tmp" -C "$(dirname "$LOCAL_ENV")" "$(basename "$LOCAL_ENV")" && mv "${ENV_TAR}.tmp" "$ENV_TAR"
+  fi
   PY="$LOCAL_ENV/bin/python"
   export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:$PYTHONPATH}"
-  echo "[$(date +%T)] local env ready: $("$PY" -c 'import torch, transformers; print(torch.__version__, transformers.__version__)')"
+  echo "[$(date +%T)] local env ready: $("$PY" -c 'import torch, transformers; print(torch.__version__, transformers.__version__, torch.cuda.is_available())')"
 else
   PY="$ENV_PREFIX/bin/python"
   # shellcheck disable=SC1091

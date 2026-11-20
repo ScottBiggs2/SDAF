@@ -1,0 +1,11 @@
+# Pinned env for scripts/slurm/submit_concepts.sh (ENV_MODE=local). torch comes from the cu121 index
+# (max 2.5.1), so transformers is pinned below 5 (5.x needs torch >= 2.6). Matches the local dev env
+# except torch.
+transformers==4.57.1
+huggingface_hub==0.36.2
+safetensors==0.8.0
+datasets==5.0.1
+numpy==2.2.6
+pyyaml>=6.0
+tqdm>=4.65
+matplotlib>=3.7
